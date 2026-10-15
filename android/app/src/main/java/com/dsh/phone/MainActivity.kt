@@ -209,7 +209,6 @@ fun AppRoot(
     val recentAt by vm.recentAt.collectAsState()
     val term by vm.term.collectAsState()
     val termFollowTail by vm.termFollowTail.collectAsState()
-    val termDraft by vm.termDraft.collectAsState()
     val queue by vm.queue.collectAsState()
     val liveRunning by vm.liveRunning.collectAsState()
     val catalog by vm.models.collectAsState()
@@ -305,8 +304,6 @@ fun AppRoot(
         TerminalScreen(
             term = term,
             followTail = termFollowTail,
-            draft = termDraft,
-            onDraftChange = { vm.setTermDraft(it) },
             onFollowTailChange = { vm.setTermFollowTail(it) },
             onEnsure = { cols, rows -> vm.ensureTerminal(cols, rows) },
             onSend = { vm.sendTerm(it) },

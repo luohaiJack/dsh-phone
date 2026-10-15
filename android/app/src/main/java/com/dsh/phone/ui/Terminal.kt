@@ -90,13 +90,17 @@ private val TermTextStyle = TextStyle(
 /**
  * 手机上的电脑终端。
  *
- * 两套输入方式，按电脑那边"是不是在跑全屏程序"自动切：
+ * **只有一种输入方式：逐键直通。**
  *
- * | | 命令行模式（默认） | 全屏模式（vim / htop / less） |
- * | --- | --- | --- |
- * | 输入 | 输入框写好一行再发送 | **逐键直通**：敲一个字就进 vim |
- * | 理由 | 输入法要能组词、联想、纠错 | 全屏程序要的是按键本身 |
- * | 按键条 | 粘贴 / 粘贴并跑 / Ctrl-C / Tab / 方向键 | 再加 Esc / ⏎ / ⌫ / Ctrl 锁存 |
+ * 早先分了两套（命令行模式"写好一行再发送" + 全屏模式"逐键直通"），
+ * 结果是两个毛病同源：
+ *   - 输入框得有个发送按钮（那个小飞机）；
+ *   - **Tab 补全根本不可能** —— `vim test` 还躺在输入框里，shell 没看见，
+ *     拿什么补全？
+ * 真终端就是逐键直通：敲一个字发一个字，shell 自己回显、自己补全。
+ * 中文照样没问题：输入法在挂钩框里组词，**提交时**才把那个词发进 PTY。
+ *
+ * 挂钩框（下面那个"在这里打字"）里不留已发出去的字符 —— 权威画面是终端本身。
  *
  * 光标：屏幕模型知道光标在第几行（[TermState.cursorLine]），滚动跟着它走 ——
  * 这是"键盘弹起来把正在编辑的那一行盖住"的根治办法。
@@ -106,8 +110,6 @@ private val TermTextStyle = TextStyle(
 fun TerminalScreen(
     term: TermState,
     followTail: Boolean,
-    draft: String,
-    onDraftChange: (String) -> Unit,
     onFollowTailChange: (Boolean) -> Unit,
     onEnsure: (cols: Int, rows: Int) -> Unit,
     onSend: (String) -> Unit,
@@ -304,124 +306,82 @@ fun TerminalScreen(
                 verticalArrangement = Arrangement.spacedBy(2.dp),
                 itemVerticalAlignment = Alignment.CenterVertically,
             ) {
-                if (term.fullScreen) {
-                    FilledTonalButton(onClick = { onSendRaw("\u001b") }) { Text("Esc") }
-                    KeyChip("⏎") { onSendRaw("\r") }
-                    KeyChip("Tab") { onSendRaw("\t") }
-                    KeyChip("⌫") { onSendRaw("\u007f") }
-                    KeyChip("↑") { onSendRaw("\u001b[A") }
-                    KeyChip("↓") { onSendRaw("\u001b[B") }
-                    KeyChip("←") { onSendRaw("\u001b[D") }
-                    KeyChip("→") { onSendRaw("\u001b[C") }
-                    KeyChip(if (ctrlLatch) "Ctrl ●" else "Ctrl") { ctrlLatch = !ctrlLatch }
-                    KeyChip("Ctrl-C") { onInterrupt() }
-                    KeyChip("/") { onSendRaw("/") }
-                    KeyChip(":") { onSendRaw(":") }
-                    KeyChip("|") { onSendRaw("|") }
-                    KeyChip("-") { onSendRaw("-") }
-                    KeyChip("粘贴") {
-                        val text = clipboard.getText()?.text.orEmpty()
-                        if (text.isEmpty()) note = "剪贴板是空的"
-                        else {
-                            onSendRaw(text)
-                            note = "已粘进全屏程序（${text.length} 字）"
-                        }
+                // 一套键，两种模式通用：命令行下 Tab/补全/历史/行编辑全靠它们，
+                // 全屏程序下多出来的也是这些（Esc / 方向键 / Ctrl）。
+                FilledTonalButton(onClick = {
+                    val text = clipboard.getText()?.text.orEmpty()
+                    if (text.isEmpty()) {
+                        note = "剪贴板是空的"
+                    } else {
+                        // 「粘贴」= 打进当前命令行（不回车）：补全、改一改再跑都行
+                        onSendRaw(text)
+                        note = "已把剪贴板的 ${text.length} 字打进命令行"
                     }
-                } else {
-                    FilledTonalButton(onClick = {
-                        val text = clipboard.getText()?.text.orEmpty()
-                        if (text.isEmpty()) {
-                            note = "剪贴板是空的"
-                        } else {
-                            onDraftChange(text)
-                            note = "已粘贴到输入框（${text.length} 字），点 ▶ 发送"
-                        }
-                    }) { Text("粘贴") }
+                }) { Text("粘贴") }
 
-                    FilledTonalButton(onClick = {
-                        val text = clipboard.getText()?.text.orEmpty()
-                        if (text.isEmpty()) {
-                            note = "剪贴板是空的"
-                        } else {
-                            onDraftChange("")
-                            onSend(text)
-                            note = "已把剪贴板的 ${text.length} 字发给终端"
-                        }
-                    }) { Text("粘贴并跑") }
+                FilledTonalButton(onClick = {
+                    val text = clipboard.getText()?.text.orEmpty()
+                    if (text.isEmpty()) {
+                        note = "剪贴板是空的"
+                    } else {
+                        onSend(text)
+                        note = "已把剪贴板的 ${text.length} 字发出去并回车"
+                    }
+                }) { Text("粘贴并跑") }
 
-                    KeyChip("清屏") { onClear() }
-                    KeyChip("Ctrl-C") { onInterrupt() }
-                    KeyChip("Tab") { onSendRaw("\t") }
-                    KeyChip("Esc") { onSendRaw("\u001b") }
-                    KeyChip("↑") { onSendRaw("\u001b[A") }
-                    KeyChip("↓") { onSendRaw("\u001b[B") }
-                    KeyChip("←") { onSendRaw("\u001b[D") }
-                    KeyChip("→") { onSendRaw("\u001b[C") }
-                    KeyChip("Ctrl-D") { onSendRaw("\u0004") }
-                    KeyChip("Ctrl-L") { onSendRaw("\u000c") }
-                }
+                KeyChip("⏎") { onSendRaw("\r") }
+                KeyChip("Tab") { onSendRaw("\t") }
+                KeyChip("⌫") { onSendRaw("\u007f") }
+                KeyChip("Esc") { onSendRaw("\u001b") }
+                KeyChip("↑") { onSendRaw("\u001b[A") }
+                KeyChip("↓") { onSendRaw("\u001b[B") }
+                KeyChip("←") { onSendRaw("\u001b[D") }
+                KeyChip("→") { onSendRaw("\u001b[C") }
+                KeyChip("Ctrl-C") { onInterrupt() }
+                KeyChip(if (ctrlLatch) "Ctrl ●" else "Ctrl") { ctrlLatch = !ctrlLatch }
+                KeyChip("清屏") { onClear() }
             }
 
             // ---------------- 输入区 ----------------
-            if (term.fullScreen) {
-                RawInputBar(
-                    value = raw,
-                    focusRequester = rawFocus,
-                    ctrlLatch = ctrlLatch,
-                    onValueChange = { v ->
-                        val composing = v.composition != null
-                        val text = v.text
-                        when {
-                            // 组词中：只留在框里给用户看，别发给 vim
-                            composing -> raw = v
-                            text.isEmpty() -> raw = v
-                            // Ctrl 锁存：下一个键按控制字符发（Ctrl-W / Ctrl-R 这些）
-                            ctrlLatch && text.length == 1 -> {
-                                ctrlLatch = false
-                                raw = TextFieldValue("")
-                                onSendRaw((text[0].code and 0x1F).toChar().toString())
-                            }
-                            else -> {
-                                raw = TextFieldValue("")
-                                onSendRaw(text)
-                            }
+            //
+            // 只有这一个输入框：它是**键盘挂钩**，不是"待发送内容"。
+            // 输入法一提交就把字符发进 PTY 并清空 —— 于是 shell 那边是真的
+            // 一个字一个字收到，补全/历史/行编辑全都成立。
+            RawInputBar(
+                value = raw,
+                focusRequester = rawFocus,
+                ctrlLatch = ctrlLatch,
+                onValueChange = { v ->
+                    val composing = v.composition != null
+                    val text = v.text
+                    when {
+                        // 组词中：只留在框里给用户看，别发给 shell
+                        composing -> raw = v
+                        text.isEmpty() -> raw = v
+                        // Ctrl 锁存：下一个键按控制字符发（Ctrl-W / Ctrl-R 这些）
+                        ctrlLatch && text.length == 1 -> {
+                            ctrlLatch = false
+                            raw = TextFieldValue("")
+                            onSendRaw((text[0].code and 0x1F).toChar().toString())
                         }
-                    },
-                )
-            } else {
-                Row(
-                    Modifier.fillMaxWidth().padding(start = 8.dp, end = 6.dp, bottom = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    OutlinedTextField(
-                        value = draft,
-                        onValueChange = { onDraftChange(it); note = null },
-                        modifier = Modifier.weight(1f),
-                        placeholder = { Text("在电脑上执行…（可长按粘贴）") },
-                        textStyle = TermTextStyle,
-                        singleLine = false,
-                        maxLines = 4,
-                    )
-                    IconButton(
-                        onClick = { onSend(draft); onDraftChange("") },
-                        enabled = draft.isNotBlank(),
-                    ) {
-                        Icon(Icons.Filled.Send, contentDescription = "发送到终端")
+                        else -> {
+                            raw = TextFieldValue("")
+                            onSendRaw(text)
+                        }
                     }
-                }
-            }
+                },
+            )
             }
         }
     }
 }
 
 /**
- * 全屏程序（vim/htop）里的输入框。
+ * 终端底部的输入框 —— 它是**键盘挂钩**，不是"待发送内容"。
  *
- * 它看着是个输入框，实际是**键盘挂钩**：输入法一提交就把内容发进 PTY、随即清空。
- * 这样中文能正常组词（输入法只在"框里"工作），
- * 而 vim 收到的是逐键直通的按键 —— 两边都满意。
- * 框里**不保留**已发出去的字符：终端那头会自己回显，那才是权威画面。
+ * 输入法一提交就把内容发进 PTY、随即清空：中文能正常组词（输入法只在"框里"工作），
+ * 而 shell / vim 收到的是逐键直通的按键。框里**不保留**已发出去的字符 ——
+ * 终端那头会自己回显，那才是权威画面（也正因如此，Tab 补全才成立）。
  */
 @Composable
 private fun RawInputBar(
@@ -449,7 +409,7 @@ private fun RawInputBar(
                 value = value,
                 onValueChange = onValueChange,
                 modifier = Modifier.weight(1f).focusRequester(focusRequester),
-                placeholder = { Text(if (ctrlLatch) "按一个键 = Ctrl+那个键" else "在这里打字，直接进 vim") },
+                placeholder = { Text(if (ctrlLatch) "按一个键 = Ctrl+那个键" else "在这里打字，直接进终端（Tab 可补全）") },
                 textStyle = TermTextStyle,
                 singleLine = true,
             )

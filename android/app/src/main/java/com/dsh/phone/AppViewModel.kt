@@ -791,10 +791,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _termFollowTail = MutableStateFlow(true)
     val termFollowTail: StateFlow<Boolean> = _termFollowTail.asStateFlow()
 
-    /** 还没发出去的终端输入。放 ViewModel：切去别的页再回来别丢。 */
-    private val _termDraft = MutableStateFlow("")
-    val termDraft: StateFlow<String> = _termDraft.asStateFlow()
-
     private var termCall: Call? = null
     private var termLoop: Job? = null
     private var termScreen: TermScreen? = null
@@ -811,10 +807,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setTermFollowTail(value: Boolean) {
         _termFollowTail.value = value
-    }
-
-    fun setTermDraft(value: String) {
-        _termDraft.value = value
     }
 
     /**
@@ -1016,19 +1008,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             say("终端还没打开")
             return
         }
-        val data = if (submit) text + "\n" else text
+        // 回车用 \r 而不是 \n：raw 模式（vim）里 CR 才是 Enter，
+        // 而命令行的行规程有 ICRNL，\r 同样等于回车 —— 两边都对。
+        val data = if (submit) text + "\r" else text
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { resolveClient().termInput(id, data) }
                 .onFailure { say("发送失败：${it.message}") }
         }
-    }
-
-    /** 发送输入框里的内容。 */
-    fun sendTermDraft() {
-        val text = _termDraft.value
-        if (text.isBlank()) return
-        _termDraft.value = ""
-        sendTerm(text, submit = true)
     }
 
     /**
