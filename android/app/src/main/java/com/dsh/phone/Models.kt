@@ -60,16 +60,24 @@ fun isUnread(activity: ActivityInfo?, seenSeq: Long, now: Long, windowMs: Long):
 data class SavedScroll(val index: Int, val offset: Int, val followTail: Boolean)
 
 /**
- * "上次看过之后，助手又说过话吗？"
+ * 刚加载到的历史里，有"上次看过之后"的新回复吗？
  *
- * 与未读角标同源（`lastReplySeq > 已读水位线` 且**最后说话的是助手**），
- * 但**不看 7 天窗口**：角标关心"这条回复还新不新鲜"（超过 7 天就不再提醒），
- * 而"进来该落在哪儿"只关心内容有没有变多 —— 哪怕隔了半个月，
- * 有新回复就该直接看最新，而不是把用户丢回半个月前那一段。
+ * 判据是**最后一条助手消息的 seq** 与进入会话时的已读水位线比较。
+ *
+ * 为什么不看 `activity.lastReplySeq`（会话摘要里那个）：**冷启动不可靠**。
+ * 从通知或 Intent 直接进会话时，state / workspaces 还没拉回来，
+ * `activityOf()` 是空的，会永远判成"没有新回复"，把用户丢回上次那一段
+ * —— 2026-10-16 真机验证时就是这么翻的车（见 docs/技术路线.md §47）。
+ * 而"加载到的最后一条助手消息"任何时候都在手上。
+ *
+ * [running] = 会话还在跑：那一定是在产出新内容（哪怕还没定稿成消息），也要看最新。
+ * 顺带说明：这里**不看 7 天窗口** —— 角标关心"回复新不新鲜"，
+ * 落点只关心"内容有没有变多"。
  */
-fun hasRepliesSince(activity: ActivityInfo?, seenSeq: Long): Boolean {
-    val a = activity ?: return false
-    return a.agentSpokeLast && a.lastReplySeq > seenSeq
+fun hasNewRepliesInHistory(messages: List<ChatMessage>, seenSeq: Long, running: Boolean): Boolean {
+    if (running) return true
+    val last = messages.lastOrNull { it.role == "assistant" } ?: return false
+    return last.seq > seenSeq
 }
 
 /**

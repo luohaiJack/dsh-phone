@@ -2,7 +2,7 @@ import com.dsh.phone.AnsiSpan
 import com.dsh.phone.ChatMessage
 import com.dsh.phone.mergeProgress
 import com.dsh.phone.questionToShow
-import com.dsh.phone.hasRepliesSince
+import com.dsh.phone.hasNewRepliesInHistory
 import com.dsh.phone.planEntryScroll
 import com.dsh.phone.SavedScroll
 import com.dsh.phone.ActivityInfo
@@ -437,13 +437,18 @@ fun main() {
         check("★ 旧规则会回到第 42 条（正是要修掉的行为）",
             oldRule != null && oldRule.index == 42 && unread.followTail)
 
-        // 判据本身：与未读角标同源，但**不看 7 天窗口**
-        val a = ActivityInfo(lastReplySeq = 100L, lastReplyAt = 1_000L, agentSpokeLast = true)
-        check("助手有更新的回复 → true", hasRepliesSince(a, 90L))
-        check("水位线已到最新 → false", !hasRepliesSince(a, 100L))
-        check("最后说话的是用户（没有待读回复）→ false", !hasRepliesSince(a.copy(agentSpokeLast = false), 90L))
-        check("没有活动信息 → false", !hasRepliesSince(null, 0L))
-        check("★ 不看 7 天窗口（很久以前的回复也算「有新内容」）", hasRepliesSince(a, 1L))
+        // 判据本身：看**加载到的历史**里最后一条助手消息，而不是会话摘要缓存
+        // （冷启动时缓存是空的 —— 真机验证就是栽在这里）
+        fun msg(seq: Int, role: String) = ChatMessage(seq, 0L, role, "x", turn = 1)
+        val hist = listOf(msg(80, "user"), msg(90, "assistant"), msg(95, "user"))
+        check("历史里最后一条助手消息比水位线新 → true", hasNewRepliesInHistory(hist, 85L, false))
+        check("水位线已到最新 → false", !hasNewRepliesInHistory(hist, 90L, false))
+        check("水位线更超前（比如别处已标已读）→ false", !hasNewRepliesInHistory(hist, 200L, false))
+        check("历史里没有助手消息 → false", !hasNewRepliesInHistory(listOf(msg(9, "user")), 0L, false))
+        check("空历史 → false", !hasNewRepliesInHistory(emptyList(), 0L, false))
+        check("★ 会话还在跑 → 一律看最新（哪怕历史还没定稿）",
+            hasNewRepliesInHistory(hist, 999L, running = true))
+        check("★ 冷启动也准：不依赖 activity 缓存", hasNewRepliesInHistory(hist, 0L, false))
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

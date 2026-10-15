@@ -195,6 +195,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 这两个状态属于哪个会话 —— 换会话才重置，同会话保留。 */
     private var chatStateSessionId = ""
 
+    /**
+     * 进入这个会话时的已读水位线。
+     *
+     * 要在这里存一份，是因为 `openSession` 一进门就把水位线推到最新
+     * （点进去就该算已读，否则快速进出会漏标）；之后再想判断
+     * "进来的时候有没有新回复"就没依据了。
+     */
+    private var chatEntrySeenSeq = 0L
+
     /** 待恢复的阅读位置（等历史加载完再滚过去）。 */
     private var pendingScrollRestore: SavedScroll? = null
 
@@ -692,10 +701,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         sessionCall = null
         _openSessionId.value = sessionId
         settings.lastSessionId = sessionId
-        // ★ 必须在 markSeenNow 之前问这一句：那一步会把已读水位线推到最新，
+        // ★ 必须在 markSeenNow 之前取：那一步会把已读水位线推到最新，
         //   之后就再也判断不出"进来的时候是不是有新回复"了。
-        //   它决定这次进来落在哪儿（见下面 planEntryScroll）。
-        val hadNewReplies = hasRepliesSince(activityOf(sessionId), settings.seenReplySeq(sessionId))
+        //   注意存的是**水位线本身**而不是"有没有新回复"的结论 ——
+        //   冷启动（Intent / 通知直接进会话）时 state 还没拉回来，
+        //   那一刻 activityOf() 是空的，只能等历史到位再比（见 planEntryScroll 的调用处）。
+        chatEntrySeenSeq = settings.seenReplySeq(sessionId)
         // 「最近会话」板块的数据来源就是这一句：只要是从手机上点开的，
         // 不管是点未读卡片、点工作区树、还是从通知进来，都记一笔
         rememberOpened(sessionId)
@@ -724,11 +735,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _streamText.value = ""
             _streamReasoning.value = ""
             _chatListState.value = LazyListState()
-            // 落在哪儿：有新回复直奔最新，没有才回到上次看的位置
-            // （位置按会话 id 存，所以"被挤出最近 6 条"也照样回得去）
-            val plan = planEntryScroll(hadNewReplies, settings.chatScroll(sessionId))
-            _chatFollowTail.value = plan.followTail
-            pendingScrollRestore = plan.takeIf { !it.followTail }
+            // 先按"看最新"起步；到底落在哪儿，等历史到位后按**实际内容**定
+            // （那一刻才算得出"有没有新回复"，见下面 history 的回调）
+            _chatFollowTail.value = true
+            pendingScrollRestore = null
         }
         // 打开会话时把它所属的工作区展开：返回列表时一眼能看到刚读的是哪个
         _workspaces.value.firstOrNull { w -> w.sessions.any { it.id == sessionId } }
@@ -741,7 +751,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { resolveClient().history(sessionId, 60) }
                 .onSuccess { page ->
+                    // 中途换了会话就丢弃这次结果，别把别人的消息铺上去
+                    if (chatStateSessionId != sessionId) return@onSuccess
                     val msgs = page.messages
+                    // ★ 落点在这里定，用**加载到的历史**跟进入时的水位线比：
+                    //   最后一条助手消息比水位线新 → 有新回复 → 直奔最新。
+                    //   为什么不看 `activity.lastReplySeq`：冷启动（从通知 / Intent
+                    //   直接进会话）时 state 还没拉回来，activityOf() 是空的，
+                    //   会永远判成"没有新回复"，把用户丢回上次那一段
+                    //   —— 真机验证时就是这么翻的车。
+                    val running = _state.value.sessions.firstOrNull { it.id == sessionId }?.running == true ||
+                        _working.value.contains(sessionId)
+                    val plan = planEntryScroll(
+                        hasNewReplies = hasNewRepliesInHistory(msgs, chatEntrySeenSeq, running),
+                        saved = settings.chatScroll(sessionId),
+                    )
+                    // 先定跟随状态再放消息：反过来的话会先按旧状态滚一次
+                    _chatFollowTail.value = plan.followTail
+                    pendingScrollRestore = plan.takeIf { !it.followTail }
                     _messages.value = msgs
                     _hasMoreHistory.value = page.hasMore
                     _chatError.value = null
