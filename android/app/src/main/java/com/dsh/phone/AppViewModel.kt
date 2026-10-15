@@ -230,6 +230,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val doc: StateFlow<DocState?> = _doc.asStateFlow()
 
     /**
+     * 上面还有没有更早的消息（聊天页往上翻的边界）。
+     *
+     * 手机一次只拿一页；没有这个标记的话，用户拉到顶也分不清
+     * "到头了"和"没加载"。
+     */
+    private val _hasMoreHistory = MutableStateFlow(false)
+    val hasMoreHistory: StateFlow<Boolean> = _hasMoreHistory.asStateFlow()
+
+    private val _loadingOlder = MutableStateFlow(false)
+    val loadingOlder: StateFlow<Boolean> = _loadingOlder.asStateFlow()
+
+    /**
      * 这个会话里"跑着的时候发出去、还没轮到执行"的消息。
      *
      * 来源两条：连上实时流时桥接先推一份全量，之后每次变动推增量；
@@ -494,6 +506,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _doc.value = null
         _queue.value = emptyList()
         _progress.value = SessionProgress()
+        _hasMoreHistory.value = false
+        _loadingOlder.value = false
         refreshUnread()
     }
 
@@ -643,8 +657,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { resolveClient().history(sessionId, 60) }
-                .onSuccess { msgs ->
+                .onSuccess { page ->
+                    val msgs = page.messages
                     _messages.value = msgs
+                    _hasMoreHistory.value = page.hasMore
                     _chatError.value = null
                     // 历史里的轮/步/用量最可靠（读的就是会话日志），拿来校正仪表盘
                     val fromHistory = progressFromMessages(msgs)
@@ -1275,6 +1291,100 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 .onFailure { say("打断失败：${it.message}") }
         }
     }
+
+    /* ------------------------- 往上翻历史 ------------------------- */
+
+    /**
+     * 往更早翻一页，并**保住当前的阅读位置**。
+     *
+     * 关键在"保住位置"：新消息是插在列表**头部**的，
+     * 插进去 N 条之后原来第一条的下标就变成了 i+N ——
+     * 不补偿的话画面会往下跳 N 行，用户正在看的地方就飞了。
+     *
+     * @return 插进来了多少条（0 = 没有更早的了，或者拿失败）
+     */
+    private suspend fun loadOlderOnce(): Int {
+        val sid = _openSessionId.value
+        if (sid.isEmpty()) return 0
+        val current = _messages.value
+        val before = current.minOfOrNull { it.seq } ?: 0
+        if (before <= 0) return 0
+
+        val page = runCatching { resolveClient().history(sid, 60, beforeSeq = before) }.getOrElse { e ->
+            say("读取更早消息失败：${e.message}")
+            return 0
+        }
+        val older = page.messages.filter { m -> current.none { it.seq == m.seq } }
+        _hasMoreHistory.value = page.hasMore
+        if (older.isEmpty()) return 0
+
+        // 记下当前阅读位置（头部插入前）
+        val st = _chatListState.value
+        val firstIdx = st.firstVisibleItemIndex
+        val firstOff = st.firstVisibleItemScrollOffset
+
+        val merged = ArrayList<ChatMessage>(current.size + older.size)
+        merged.addAll(older)
+        merged.addAll(current)
+        merged.sortBy { it.seq }
+        _messages.value = merged
+
+        // 头部插了多少条，就把滚动位置整体后移多少 —— 画面不动
+        withContext(Dispatchers.Main) {
+            runCatching { st.scrollToItem(firstIdx + older.size, firstOff) }
+        }
+        return older.size
+    }
+
+    /** 界面上的"载入更早的消息"。 */
+    fun loadOlder() {
+        if (_loadingOlder.value) return
+        _loadingOlder.value = true
+        viewModelScope.launch {
+            loadOlderOnce()
+            _loadingOlder.value = false
+        }
+    }
+
+    /**
+     * 跳到"上一条我发的消息"。
+     *
+     * 为什么需要：一轮里工具调用能有几十上百行，"我上次问了什么"要往上翻很久。
+     * 找不到就自动再翻几页 —— 用户点一下就该看到，而不是点一下再自己翻。
+     */
+    fun jumpToPreviousUser() {
+        if (_loadingOlder.value) return
+        viewModelScope.launch {
+            val st = _chatListState.value
+            var idx = st.firstVisibleItemIndex
+            var rounds = 0
+            while (rounds < 5) {
+                val found = lastUserIndexBefore(idx)
+                if (found >= 0) {
+                    setChatFollowTail(false)
+                    withContext(Dispatchers.Main) { runCatching { st.scrollToItem(found) } }
+                    return@launch
+                }
+                if (!_hasMoreHistory.value) {
+                    say("已经到这个会话最早的地方了")
+                    return@launch
+                }
+                _loadingOlder.value = true
+                val added = loadOlderOnce()
+                _loadingOlder.value = false
+                if (added <= 0) {
+                    say("没有更早的消息了")
+                    return@launch
+                }
+                idx += added // 前面插进来 added 条，原下标整体后移
+                rounds += 1
+            }
+            say("翻了 5 页还没找到更早的提问")
+        }
+    }
+
+    /** [limit] 之前最后一条"人发的"消息下标；没有就 -1。判据在 Models.kt（有单测）。 */
+    private fun lastUserIndexBefore(limit: Int): Int = lastUserIndexBefore(_messages.value, limit)
 
     /* ------------------------- 排队消息的改/撤 ------------------------- */
 

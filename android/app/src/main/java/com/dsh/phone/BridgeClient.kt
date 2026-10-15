@@ -93,10 +93,22 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
         parseState(get("/phone/state?max=$max$w"))
     }
 
-    suspend fun history(sessionId: String, max: Int = 40): List<ChatMessage> = withContext(Dispatchers.IO) {
-        val root = get("/phone/sessions/$sessionId/history?max=$max")
-        parseMessages(root.optJSONArray("messages"))
-    }
+    /**
+     * 读一页历史。
+     *
+     * [beforeSeq] > 0 时读**更早**那一页（往上翻），否则读最新那一页。
+     * 一轮里工具调用能有几十上百条消息，固定只给一页的话用户拉两下就到头了。
+     */
+    suspend fun history(sessionId: String, max: Int = 40, beforeSeq: Int = 0): HistoryPage =
+        withContext(Dispatchers.IO) {
+            val extra = if (beforeSeq > 0) "&beforeSeq=$beforeSeq" else ""
+            val root = get("/phone/sessions/$sessionId/history?max=$max$extra")
+            HistoryPage(
+                messages = parseMessages(root.optJSONArray("messages")),
+                hasMore = root.optBoolean("hasMore", false),
+                oldestSeq = root.optInt("oldestSeq", 0),
+            )
+        }
 
     suspend fun prompt(sessionId: String, text: String): Boolean = withContext(Dispatchers.IO) {
         val payload = JSONObject().put("text", text)

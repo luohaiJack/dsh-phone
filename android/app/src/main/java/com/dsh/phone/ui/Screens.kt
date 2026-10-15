@@ -1105,6 +1105,10 @@ fun ChatScreen(
     onOpenFile: (String) -> Unit,
     onToggleInjected: (Boolean) -> Unit,
     queue: List<QueuedMessage>,
+    hasMoreHistory: Boolean,
+    loadingOlder: Boolean,
+    onLoadOlder: () -> Unit,
+    onJumpPreviousUser: () -> Unit,
     activity: SessionActivity,
     progress: SessionProgress,
     goal: GoalInfo?,
@@ -1167,6 +1171,15 @@ fun ChatScreen(
         if (!followTail) return@LaunchedEffect
         val target = visible.size + if (streamText.isNotEmpty()) 1 else 0
         if (target > 0) runCatching { listState.scrollToItem(target - 1) }
+    }
+
+    // 滑到最顶上就自动接着往前载 —— 用户一路往上拉，不该在每页交界处停一下手
+    LaunchedEffect(listState, hasMoreHistory, loadingOlder) {
+        if (!hasMoreHistory || loadingOlder) return@LaunchedEffect
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .collect { idx ->
+                if (idx <= 0 && hasMoreHistory && !loadingOlder) onLoadOlder()
+            }
     }
 
     editQueueTarget?.let { target ->
@@ -1243,6 +1256,34 @@ fun ChatScreen(
                 state = listState,
                 modifier = Modifier.weight(1f).fillMaxWidth(),
             ) {
+                // 列表最上面：更早的消息入口。
+                // 一轮里工具调用能有一百多条，不给入口的话用户拉到顶也不知道
+                // "是到头了还是没加载"。
+                item {
+                    Box(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
+                        when {
+                            loadingOlder -> Row(verticalAlignment = Alignment.CenterVertically) {
+                                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("正在载入更早的消息…", style = MaterialTheme.typography.labelMedium)
+                            }
+                            hasMoreHistory -> TextButton(onClick = onLoadOlder) {
+                                Text("↑ 载入更早的消息")
+                            }
+                            else -> Text(
+                                "· 已经是最早 ·",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+                item {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        TextButton(onClick = onJumpPreviousUser) { Text("↑ 上一条我的提问") }
+                    }
+                }
+
                 items(visible.size) { i ->
                     MessageRow(visible[i], onOpenFile)
                 }

@@ -230,6 +230,8 @@ fun AppRoot(
     val termFollowTail by vm.termFollowTail.collectAsState()
     val queue by vm.queue.collectAsState()
     val progress by vm.progress.collectAsState()
+    val hasMoreHistory by vm.hasMoreHistory.collectAsState()
+    val loadingOlder by vm.loadingOlder.collectAsState()
     val liveRunning by vm.liveRunning.collectAsState()
     val catalog by vm.models.collectAsState()
     val switchingModel by vm.switchingModel.collectAsState()
@@ -394,6 +396,10 @@ fun AppRoot(
                 vm.setShowInjected(it)
             },
             queue = queue,
+            hasMoreHistory = hasMoreHistory,
+            loadingOlder = loadingOlder,
+            onLoadOlder = { vm.loadOlder() },
+            onJumpPreviousUser = { vm.jumpToPreviousUser() },
             // 纯计算，随 state/openId 变 —— 不用额外请求（state 每 5 秒已经拉了）
             activity = remember(state, openId) { sessionActivity(state, openId) },
             progress = progress,

@@ -823,3 +823,30 @@ fun progressFromMessages(messages: List<ChatMessage>): SessionProgress? {
         contextUsed = lastUsed,
     )
 }
+
+/**
+ * 一页历史消息。
+ *
+ * [hasMore] = 更早的地方还有内容（往上还能翻）；[oldestSeq] = 这一页最早那条的 seq，
+ * 下次翻页就拿它当"beforeSeq"。
+ */
+data class HistoryPage(
+    val messages: List<ChatMessage>,
+    val hasMore: Boolean,
+    val oldestSeq: Int,
+)
+
+/**
+ * [limit] 之前最后一条"人发的"消息在列表里的下标；没有就 -1。
+ *
+ * 单独拎出来是为了能测：这条是"跳到上一条我的提问"的判据，
+ * 而一轮里 tool / tool-result 能占几十条 —— 判据写错的表现是
+ * "点了跳到一条工具结果上"，很难一眼看出来。
+ */
+fun lastUserIndexBefore(messages: List<ChatMessage>, limit: Int): Int {
+    val from = minOf(limit, messages.size) - 1
+    for (i in from downTo 0) {
+        if (messages[i].role == "user") return i
+    }
+    return -1
+}

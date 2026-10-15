@@ -13,6 +13,7 @@ import com.dsh.phone.TermState
 import com.dsh.phone.sessionActivity
 import com.dsh.phone.cursorKind
 import com.dsh.phone.lastNonBlankRange
+import com.dsh.phone.lastUserIndexBefore
 import com.dsh.phone.linesText
 import com.dsh.phone.lineText
 import com.dsh.phone.renderCells
@@ -234,6 +235,40 @@ fun main() {
             SessionProgress(turn = 3, step = 7, turns = 12).text)
         check("第一轮不写累计", SessionProgress(turn = 1, step = 1, turns = 1).text == "第 1 轮 · 第 1 步")
         check("啥都没有时说清楚", SessionProgress().text == "还没开始跑")
+    }
+
+    /* ---------- "跳到上一条我的提问"的判据 ---------- */
+
+    run {
+        // 一条提问后面跟着一堆工具消息 —— 这正是真实会话的样子
+        val list = listOf(
+            ChatMessage(1, 0L, "user", "第一问"),
+            ChatMessage(2, 0L, "assistant", "答", turn = 1),
+            ChatMessage(3, 0L, "tool", "bash", name = "bash"),
+            ChatMessage(4, 0L, "tool-result", "结果"),
+            ChatMessage(5, 0L, "assistant", "再答", turn = 1),
+            ChatMessage(6, 0L, "user", "第二问"),
+            ChatMessage(7, 0L, "assistant", "答", turn = 2),
+            ChatMessage(8, 0L, "tool", "bash", name = "bash"),
+        )
+        check("从末尾往回找 = 第二问", lastUserIndexBefore(list, list.size) == 5,
+            lastUserIndexBefore(list, list.size).toString())
+        check("从第二问之前找 = 第一问", lastUserIndexBefore(list, 5) == 0,
+            lastUserIndexBefore(list, 5).toString())
+        check(
+            "全是工具消息时找不到",
+            lastUserIndexBefore(
+                listOf(
+                    ChatMessage(3, 0L, "tool", "bash", name = "bash"),
+                    ChatMessage(4, 0L, "tool-result", "结果"),
+                    ChatMessage(8, 0L, "tool", "bash", name = "bash"),
+                ),
+                3,
+            ) == -1,
+        )
+        check("limit 超过长度不炸", lastUserIndexBefore(list, 999) == 5)
+        check("limit=0 返回 -1", lastUserIndexBefore(list, 0) == -1)
+        check("空列表返回 -1", lastUserIndexBefore(emptyList(), 10) == -1)
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

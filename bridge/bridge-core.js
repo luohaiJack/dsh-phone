@@ -557,14 +557,52 @@ export function createBridge(ctx, opts) {
   }
 
   /** 拉一页历史：用 follow 的开场快照，拿完即关，避免依赖 throughSeq。 */
-  function loadHistory(sessionId, maxMessages) {
+  /**
+   * 读会话历史。
+   *
+   * 两种模式：
+   *   - 不给 beforeSeq：拿**最新**那一页（follow 的快照就是"截止到当前游标的最近 N 条"）
+   *   - 给了 beforeSeq：拿**更早**那一页（sc.page 的向后翻页，语义见下）
+   *
+   * 为什么必须能往后翻：一轮里工具调用能有几十上百条消息，
+   * 固定拿 60 条的话，用户往上拉两下就到头了 —— 连"我上一次问了什么"都看不见。
+   *
+   * page 的 beforeSeq 是**开区间上界**（paginate 里 `end = min(throughSeq+1, beforeSeq)`），
+   * 所以要"比 seq=X 更早的消息"，得传 throughSeq = X-1。
+   * 这段语义是读宿主源码确认的，不是猜的。
+   */
+  function loadHistory(sessionId, maxMessages, beforeSeq) {
+    const max = typeof maxMessages === 'number' && maxMessages > 0 ? maxMessages : 40
+    const address = { kind: 'session', sessionId: sessionId }
+
+    if (typeof beforeSeq === 'number' && beforeSeq > 0) {
+      if (sc === undefined || typeof sc.page !== 'function') {
+        return Promise.reject(new Error('sessionController.page unavailable'))
+      }
+      const signal = makeSignal()
+      return Promise.resolve()
+        .then(function () {
+          return sc.page({ address: address, throughSeq: beforeSeq - 1, maxMessages: max }, signal)
+        })
+        .then(function (value) {
+          const records = (value && value.records) || []
+          const messages = deriveMessages(records)
+          return {
+            messages: messages,
+            hasMore: !!(value && value.hasMore),
+            cursor: 0,
+            header: null,
+          }
+        })
+    }
+
     if (sc === undefined || typeof sc.follow !== 'function') {
       return Promise.reject(new Error('sessionController.follow unavailable'))
     }
     const signal = makeSignal()
     const request = {
-      address: { kind: 'session', sessionId: sessionId },
-      maxMessages: typeof maxMessages === 'number' && maxMessages > 0 ? maxMessages : 40,
+      address: address,
+      maxMessages: max,
     }
     // follow 是 async generator：调用即返回迭代器，不是 Promise
     return Promise.resolve().then(function () {
@@ -578,9 +616,11 @@ export function createBridge(ctx, opts) {
         }
         signal.abort('history snapshot taken')
         const frame = first && first.value
-        if (!frame) return { messages: [], cursor: 0, header: null }
+        if (!frame) return { messages: [], hasMore: false, cursor: 0, header: null }
         return {
           messages: deriveMessages(frame.records),
+          // 快照里自带 hasMore = "还有更早的记录"，直接转给手机
+          hasMore: frame.hasMore === true,
           cursor: typeof frame.cursor === 'number' ? frame.cursor : 0,
           header: frame.header
             ? {
@@ -2762,14 +2802,23 @@ export function createBridge(ctx, opts) {
         return
       }
       if (action === 'history') {
-        loadHistory(sessionId, max).then(
+        const beforeSeq = query.beforeSeq ? parseInt(query.beforeSeq, 10) : 0
+        loadHistory(sessionId, max, beforeSeq).then(
           function (value) {
+            const msgs = value.messages || []
+            let oldest = 0
+            for (let i = 0; i < msgs.length; i += 1) {
+              const q = typeof msgs[i].seq === 'number' ? msgs[i].seq : 0
+              if (q > 0 && (oldest === 0 || q < oldest)) oldest = q
+            }
             sendJson(res, 200, {
               ok: true,
               sessionId: sessionId,
               cursor: value.cursor,
               header: value.header,
-              messages: value.messages,
+              hasMore: value.hasMore === true,
+              oldestSeq: oldest,
+              messages: msgs,
             })
           },
           function (err) {
