@@ -56,6 +56,18 @@ scripts/verify.sh               # ⑤ 全链路自检，必须 15 项全过
 | ④ | `adb install` 输出 `Success`；手机上 App 已经起来 |
 | ⑤ | `================ 结果：15 项通过，0 项失败 ================` |
 
+> **本机现状（2026-10-15 起）**：桥接已经作为 profile bundle 装进 `web`
+> （`~/.dsh/profiles/web/package.json` 的 `dependencies` 与
+> `dsh.profile.bundles` 都有 `dsh-phone-bridge`，`node_modules` 里是指向
+> 本仓库 `bridge/` 的符号链接）。**它随 `dsh web` 常驻，重启不再丢。**
+>
+> 手机连不上时第一步先打本机回环：
+> `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3080/phone/health`
+> —— **404 = 桥接没挂载**（查 `dsh --profile web --dump-config | grep phone-bridge`，
+> 缺了就重跑 `scripts/enable-bridge.sh`）；**超时 = 网络/tailnet 问题**。
+> 拔了数据线时手机走 tailnet：`tailscale --socket ~/.ts-userspace/tailscaled.sock serve status`，
+> 手机上没连上看桥接 `/phone/diag` 的 `stateClients`。
+
 第 ⑤ 步失败时**先看它是哪一组红的**，别乱试：
 
 - `桥接已挂载` 红 → 桥接没进组合：确认 `dsh web` 是在 `enable-bridge.sh` **之后**才重启的
