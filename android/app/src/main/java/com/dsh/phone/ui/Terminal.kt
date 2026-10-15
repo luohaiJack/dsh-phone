@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -107,6 +108,7 @@ fun TerminalScreen(
     onInterrupt: () -> Unit,
     onClear: () -> Unit,
     onKill: () -> Unit,
+    onReopen: () -> Unit,
     onBack: () -> Unit,
 ) {
     val listState = rememberLazyListState()
@@ -232,8 +234,20 @@ fun TerminalScreen(
                             Text("正在电脑上开终端…", color = TermFg, style = MaterialTheme.typography.bodySmall)
                         }
                     }
-                    term.error != null -> Box(Modifier.fillMaxSize().padding(12.dp), contentAlignment = Alignment.Center) {
-                        Text(term.error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    // 没终端可看时：说清原因，并且给一个按钮 —— 别让用户只能靠"退出去再进来"
+                    term.error != null || term.exited || term.id.isEmpty() -> Box(
+                        Modifier.fillMaxSize().padding(12.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                term.error ?: if (term.exited) "电脑上的终端已经退出了" else "还没有终端",
+                                color = if (term.error != null) MaterialTheme.colorScheme.error else TermFg,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            Spacer(Modifier.height(10.dp))
+                            FilledTonalButton(onClick = onReopen) { Text("重新开一个终端") }
+                        }
                     }
                     else -> LazyColumn(
                         state = listState,
@@ -260,6 +274,9 @@ fun TerminalScreen(
                 )
             }
 
+            // 电脑上没有活终端时（已退出 / 开失败），按键和输入框都是死控件 ——
+            // 藏起来，只留上面那个「重新开一个终端」
+            if (term.alive || term.opening) {
             // ---------------- 按键条 ----------------
             //
             // 用 FlowRow 自动换行，**不要**用横向滚动的 Row：
@@ -376,6 +393,7 @@ fun TerminalScreen(
                         Icon(Icons.Filled.Send, contentDescription = "发送到终端")
                     }
                 }
+            }
             }
         }
     }

@@ -15,7 +15,15 @@ import java.io.IOException
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
-class BridgeException(message: String, cause: Throwable? = null) : IOException(message, cause)
+/**
+ * 桥接返回的错误。
+ *
+ * 带上 HTTP 状态码是有原因的：404 意味着"这个东西在电脑上已经不存在了"
+ * （比如 harness 重启、插件重载、终端被空闲回收），
+ * 那要**重开一个**；而超时/断流是"暂时联系不上"，重连就行。
+ * 不区分的话只能一直重试一个已经没了的终端。
+ */
+class BridgeException(message: String, val code: Int = 0, cause: Throwable? = null) : IOException(message, cause)
 
 /**
  * 与 PC 侧 `dsh-phone-bridge` 通信的客户端。
@@ -44,7 +52,7 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
     /** 失败时优先把桥接返回的 error 字段抬出来 —— 比"HTTP 404: {...}"有用得多。 */
     private fun failure(code: Int, body: String): BridgeException {
         val msg = runCatching { JSONObject(body).optString("error", "") }.getOrDefault("")
-        return BridgeException(if (msg.isNotBlank()) msg else "HTTP $code: ${body.take(200)}")
+        return BridgeException(if (msg.isNotBlank()) msg else "HTTP $code: ${body.take(200)}", code = code)
     }
 
     private fun get(path: String): JSONObject {
@@ -321,7 +329,16 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
                 response.use { resp ->
                     val body = resp.body
                     if (!resp.isSuccessful || body == null) {
-                        onClosed(BridgeException("HTTP ${resp.code}"))
+                        // 尽量把桥接写的 error 抬出来：界面直接显示"终端不存在或已关闭"
+                        // 比"HTTP 404"有用得多
+                        val text = runCatching { body?.string().orEmpty() }.getOrDefault("")
+                        val msg = runCatching { JSONObject(text).optString("error", "") }.getOrDefault("")
+                        onClosed(
+                            BridgeException(
+                                if (msg.isNotBlank()) msg else "HTTP ${resp.code}",
+                                code = resp.code,
+                            ),
+                        )
                         return
                     }
                     var event = "message"

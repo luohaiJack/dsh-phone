@@ -61,6 +61,26 @@ else
   else
     fail=$((fail + 1))
   fi
+
+  # 终端状态文案：要连 Models.kt 一起编（TermState 在那儿），
+  # 它引用了 org.json，所以拿 android.jar 当编译期 classpath
+  ANDROID_JAR="$(ls "$HOME"/android-sdk/platforms/*/android.jar 2>/dev/null | tail -1)"
+  if [ -n "$ANDROID_JAR" ]; then
+    OUT2="$(mktemp -d)"
+    java -cp "$KC:$STDLIB:$COROUTINES:$DAEMON:$ANNOT" \
+      org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
+      -classpath "$STDLIB:$ANDROID_JAR" \
+      "$SRC/Ansi.kt" "$SRC/TermScreen.kt" "$SRC/Models.kt" "$ROOT/tests/ansi/StateTest.kt" -d "$OUT2" -nowarn 2>&1 \
+      | grep -E "error:|exception" || true
+    if java -cp "$OUT2:$STDLIB:$ANDROID_JAR" StateTestKt; then
+      pass=$((pass + 1))
+    else
+      fail=$((fail + 1))
+    fi
+    rm -rf "$OUT2"
+  else
+    echo "（跳过状态文案验收：没找到 android.jar）"
+  fi
   rm -rf "$OUT"
 fi
 

@@ -801,6 +801,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var termRev = 0L
     private var lastTermPublish = 0L
     private var pendingTermSend: String? = null
+    /** 上次向电脑申请的终端尺寸：终端没了要重开时，还按这个开。 */
+    private var lastTermCols = 100
+    private var lastTermRows = 32
+    /** 终端页是不是正开着（决定"终端没了"要不要立刻重开）。 */
+    private var termWatching = false
     private var termPublishJob: Job? = null
     private val TERM_PUBLISH_MS = 50L
 
@@ -819,6 +824,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 所以由终端页按自己实际能显示多少列来传。
      */
     fun ensureTerminal(cols: Int, rows: Int) {
+        lastTermCols = cols
+        lastTermRows = rows
+        termWatching = true
         val cur = _term.value
         if (cur.opening) return
         if (cur.id.isNotEmpty() && !cur.exited) {
@@ -866,11 +874,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 termCall = call
                 val err = finished.await()
                 if (_term.value.id != id) return@launch
+                // ★ 404 = 电脑上这个终端已经不存在了（harness 重启、插件重载、
+                //   30 分钟空闲回收都会这样）。这时**不能再重连**，那会永远失败；
+                //   正确做法是把本地状态清掉，然后按原尺寸重开一个。
+                if (err is BridgeException && err.code == 404) {
+                    termScreen = null
+                    _term.value = TermState(
+                        error = if (termWatching) null else "电脑上的终端已经关掉了",
+                    )
+                    if (termWatching) {
+                        say("电脑上的终端已关闭，已重新开一个")
+                        ensureTerminal(lastTermCols, lastTermRows)
+                    }
+                    return@launch
+                }
                 if (_term.value.connected) {
                     _term.value = _term.value.copy(connected = false)
-                }
-                if (err != null && _term.value.error == null) {
-                    // 不把重连中的错误当成致命错误显示，状态行已经会写"重连中"
                 }
                 attempt += 1
                 delay(backoffMs(attempt))
@@ -895,6 +914,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     cols = data.optInt("cols", _term.value.cols),
                     rows = data.optInt("rows", _term.value.rows),
                     connected = true,
+                    detached = false,
                     error = null,
                     exited = data.optBoolean("exited", false),
                     exitCode = if (data.isNull("exitCode")) null else data.optInt("exitCode"),
@@ -1029,6 +1049,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * 手动重开一个终端（电脑上那个没了、或者退出了，界面上给一个按钮）。
+     */
+    fun reopenTerminal() {
+        termScreen = null
+        _term.value = TermState()
+        termRev = 0
+        ensureTerminal(lastTermCols, lastTermRows)
+    }
+
     /** 只清手机上的显示，不影响电脑上的终端。 */
     fun clearTerminal() {
         termScreen?.clear()
@@ -1061,11 +1091,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 的空闲回收兜底（30 分钟无人连接就关）。
      */
     fun detachTerminal() {
+        termWatching = false
         termCall?.cancel()
         termCall = null
         termLoop?.cancel()
         termLoop = null
-        if (_term.value.connected) _term.value = _term.value.copy(connected = false)
+        // 只标"挂起"，电脑上的 shell 不动（用户就是在"会话 ↔ 终端"之间来回切）
+        if (_term.value.id.isNotEmpty() && !_term.value.exited) {
+            _term.value = _term.value.copy(connected = false, detached = true)
+        }
     }
 
     /** 重拉一次整机状态（重命名/归档之后用）。 */

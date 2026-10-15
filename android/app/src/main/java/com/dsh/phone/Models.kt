@@ -539,14 +539,27 @@ data class TermState(
     val fullScreen: Boolean = false,
     val exited: Boolean = false,
     val exitCode: Int? = null,
+    /**
+     * 终端页没开着（我们主动断开了输出流，但电脑上的 shell 还活着）。
+     *
+     * ★ 必须和"连接断了"分开：原来离开页面就把 connected 置 false，
+     *   状态页于是显示"连接中断，重连中…" —— 明明一切正常，
+     *   用户看到的是"终端断开或已关闭"。状态文案骗人比没有文案更糟。
+     */
+    val detached: Boolean = false,
 ) {
     val alive: Boolean get() = id.isNotEmpty() && !exited
+
+    /** 电脑上还有一个我们能接上的终端（不管此刻有没有在收输出）。 */
+    val resumable: Boolean get() = alive && detached
+
     val statusText: String
         get() = when {
             opening -> "正在电脑上开终端…"
             error != null -> error
             id.isEmpty() -> "未打开"
             exited -> "已退出" + (exitCode?.let { "（code $it）" } ?: "")
+            detached -> "已挂起 · 电脑上还开着"
             connected -> "已连接"
             else -> "连接中断，重连中…"
         }

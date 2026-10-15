@@ -314,6 +314,7 @@ fun AppRoot(
             onInterrupt = { vm.interruptTerm() },
             onClear = { vm.clearTerminal() },
             onKill = { vm.killTerminal(); showTerminal = false },
+            onReopen = { vm.reopenTerminal() },
             onBack = { showTerminal = false },
         )
         // 这一页不再需要"输出流"时就断开：重进会拿桥接的滚动缓冲补上
