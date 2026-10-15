@@ -125,7 +125,8 @@ scripts/enable-bridge.sh --revert    # 回滚，harness 回到原样
 | POST | `/phone/workspaces/create` | 把已存在的目录登记成工作区 `{path,title?}` |
 | GET | `/phone/fs/list?path=` | 浏览电脑上的目录（用于挑/建项目文件夹） |
 | POST | `/phone/fs/mkdir` | 在电脑上新建文件夹 `{parent,name}` |
-| POST | `/phone/sessions/<id>/prompt` | 发消息 `{text}` |
+| POST | `/phone/sessions/<id>/prompt` | 发消息 `{text, receiptIds?}`（带附件凭据时一起发） |
+| POST | `/phone/upload?sessionId=&name=` | 手机传文件进会话（请求体就是原始字节，返回 receiptId） |
 | POST | `/phone/sessions/<id>/cancel` | 打断当前回合 |
 | POST | `/phone/new` | 新建会话 `{cwd?}` |
 | POST | `/phone/term/open` | 在电脑上开一个真终端（真 PTY）`{cols,rows,cwd?}` |
@@ -161,6 +162,8 @@ curl -s http://127.0.0.1:3080/phone/state | python3 -m json.tool | head -40
   harness 注入的上下文消息默认折叠（设置里可打开）；
   **历史可以往上无限翻**（滑到顶自动载入更早的），
   还有「↑ 上一条我的提问」一键跳到你上次说的话
+- **传文件到会话**：聊天页点 **＋** 从手机里选一个文件 → 传到电脑 → 跟下一条消息一起发；
+  可以只发附件不写字，发出去之前还能移除。上限 64 MB
 - **通知栏**：可选常驻，关着 App 也能看到运行中的会话与任务
 - **终端页（状态页进入）**：在手机上调这台电脑的**真 PTY**，
   而且是**真正的屏幕模型**（光标寻址 / 擦除 / 滚动区域 / 备用屏），

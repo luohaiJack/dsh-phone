@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -80,6 +82,12 @@ import com.dsh.phone.ConnPhase
 import com.dsh.phone.ConnStatus
 import com.dsh.phone.DirListing
 import com.dsh.phone.DocState
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import com.dsh.phone.PendingAttachment
 import com.dsh.phone.GoalInfo
 import com.dsh.phone.goalWorthShowing
 import com.dsh.phone.SessionProgress
@@ -1092,7 +1100,7 @@ fun DocumentScreen(
 
 /* ================================= 聊天 ================================= */
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun ChatScreen(
     title: String,
@@ -1129,6 +1137,10 @@ fun ChatScreen(
     queueEditDraft: Pair<String, String>?,
     onQueueEditChange: (String, String) -> Unit,
     onQueueEditDiscard: () -> Unit,
+    attachments: List<PendingAttachment>,
+    uploadingName: String?,
+    onAttachFile: (String, ByteArray) -> Unit,
+    onRemoveAttachment: (String) -> Unit,
     onLoadOlder: () -> Unit,
     onJumpPreviousUser: () -> Unit,
     activity: SessionActivity,
@@ -1144,7 +1156,27 @@ fun ChatScreen(
     var editQueueTarget by remember { mutableStateOf<QueuedMessage?>(null) }
     // 点标题看 session id：列表里显示的是标题，而要去电脑上找这个会话时用的是 id
     var showSessionId by remember { mutableStateOf(false) }
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
+
+    // 选文件：用系统的 SAF（不申请存储权限，用户选什么我们才读什么）
+    var pickError by remember { mutableStateOf<String?>(null) }
+    val filePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val picked = withContext(Dispatchers.IO) { readPickedFile(context, uri) }
+            when {
+                picked == null -> pickError = "读不到这个文件（可能没有访问权限）"
+                picked.second == null -> pickError = "文件太大（上限 ${MAX_UPLOAD_MB} MB）"
+                else -> {
+                    pickError = null
+                    onAttachFile(picked.first, picked.second!!)
+                }
+            }
+        }
+    }
 
     val visible = remember(messages, showInjected) {
         if (showInjected) messages else messages.filterNot { it.isInjected }
@@ -1390,6 +1422,49 @@ fun ChatScreen(
             }
 
             HorizontalDivider()
+
+            // 已传上去、等着跟下一条消息一起发的文件。
+            // 必须看得见：不然用户以为传丢了，会再传一遍
+            if (attachments.isNotEmpty() || uploadingName != null) {
+                FlowRow(
+                    Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    uploadingName?.let { n ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(6.dp))
+                            Text("正在传 $n …", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                    attachments.forEach { a ->
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                        ) {
+                            Row(
+                                Modifier.padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("📎 ${a.name} · ${a.sizeText}", style = MaterialTheme.typography.labelMedium)
+                                IconButton(onClick = { onRemoveAttachment(a.receiptId) }, modifier = Modifier.size(22.dp)) {
+                                    Icon(Icons.Filled.Close, contentDescription = "移除附件", modifier = Modifier.size(14.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            pickError?.let {
+                Text(
+                    it,
+                    modifier = Modifier.padding(start = 12.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -1398,11 +1473,15 @@ fun ChatScreen(
                     .padding(8.dp),
                 verticalAlignment = Alignment.Bottom,
             ) {
+                // 传文件：手机上选一个，传到电脑，跟这条消息一起发过去
+                IconButton(onClick = { filePicker.launch(arrayOf("*/*")) }, enabled = !busy) {
+                    Icon(Icons.Filled.Add, contentDescription = "传文件到会话")
+                }
                 OutlinedTextField(
                     value = draft,
                     onValueChange = onDraftChange,
                     modifier = Modifier.weight(1f),
-                    placeholder = { Text("给 harness 发消息…") },
+                    placeholder = { Text(if (attachments.isEmpty()) "给 harness 发消息…" else "可写说明，也可直接发附件…") },
                     maxLines = 6,
                 )
                 Spacer(Modifier.width(8.dp))
@@ -1425,7 +1504,7 @@ fun ChatScreen(
                     Spacer(Modifier.width(6.dp))
                 }
                 IconButton(
-                    enabled = draft.isNotBlank() && !busy,
+                    enabled = (draft.isNotBlank() || attachments.isNotEmpty()) && !busy,
                     onClick = {
                         val t = draft
                         onDraftChange("")
@@ -2502,4 +2581,38 @@ private fun SessionIdDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
     )
+}
+
+/** 上传上限（桥接那边也是这个数，超了会被 413 挡回来）。 */
+private const val MAX_UPLOAD_MB = 64
+
+/**
+ * 读用户选中的文件：返回 (文件名, 字节)；读不到返回 null，太大返回 (名字, null)。
+ *
+ * 为什么在 UI 层读：SAF 给的是一次性授权 URI，读取要用 ContentResolver
+ * （只有 Context 有），而 ViewModel 刻意不带 Context。
+ */
+private fun readPickedFile(context: android.content.Context, uri: android.net.Uri): Pair<String, ByteArray?>? {
+    val name = runCatching {
+        context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val i = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (i >= 0 && c.moveToFirst()) c.getString(i) else null
+        }
+    }.getOrNull() ?: uri.lastPathSegment?.substringAfterLast('/') ?: "upload.bin"
+    val bytes = runCatching {
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            val out = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(64 * 1024)
+            var total = 0
+            while (true) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                total += n
+                if (total > MAX_UPLOAD_MB * 1024 * 1024) return@use null
+                out.write(buf, 0, n)
+            }
+            out.toByteArray()
+        }
+    }.getOrNull()
+    return name to bytes
 }

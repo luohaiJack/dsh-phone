@@ -231,6 +231,8 @@ fun AppRoot(
     val queue by vm.queue.collectAsState()
     val progress by vm.progress.collectAsState()
     val queueEditDraft by vm.queueEditDraft.collectAsState()
+    val attachments by vm.attachments.collectAsState()
+    val uploadingName by vm.uploading.collectAsState()
     val hasMoreHistory by vm.hasMoreHistory.collectAsState()
     val loadingOlder by vm.loadingOlder.collectAsState()
     val liveRunning by vm.liveRunning.collectAsState()
@@ -401,6 +403,10 @@ fun AppRoot(
             queueEditDraft = queueEditDraft,
             onQueueEditChange = { id, text -> vm.setQueueEditDraft(id, text) },
             onQueueEditDiscard = { vm.discardQueueEditDraft() },
+            attachments = attachments,
+            uploadingName = uploadingName,
+            onAttachFile = { name, bytes -> vm.attachFile(name, bytes) },
+            onRemoveAttachment = { vm.removeAttachment(it) },
             hasMoreHistory = hasMoreHistory,
             loadingOlder = loadingOlder,
             onLoadOlder = { vm.loadOlder() },

@@ -66,6 +66,7 @@ const documented = [
   ['GET', '/sessions/s1/queue'],
   ['POST', '/sessions/s1/queue/m1', { action: 'remove' }],
   ['POST', '/sessions/s1/goal/clear', {}],
+  ['POST', '/upload?sessionId=s1&name=x.bin', null],
   ['POST', '/term/open', { cols: 80, rows: 24 }],
   ['GET', '/term/list'],
   ['POST', '/term/t1/input', { data: 'x' }],
@@ -76,8 +77,8 @@ const documented = [
 for (const [method, path, body] of documented) {
   const res = await fetch(base + path, {
     method,
-    headers: { 'x-phone-token': TOKEN, 'content-type': 'application/json' },
-    ...(method === 'POST' ? { body: JSON.stringify(body ?? {}) } : {}),
+    headers: { 'x-phone-token': TOKEN, 'content-type': body === null ? 'application/octet-stream' : 'application/json' },
+    ...(method === 'POST' ? { body: body === null ? 'hello' : JSON.stringify(body ?? {}) } : {}),
   })
   const text = await res.text()
   const unknown = text.includes('unknown bridge route')

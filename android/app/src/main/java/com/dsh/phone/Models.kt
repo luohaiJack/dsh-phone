@@ -902,3 +902,17 @@ fun parseQueueEditDraft(raw: String?): Pair<String, String>? {
     if (id.isBlank()) return null
     return id to raw.substring(i + 1)
 }
+
+/** 手机已传到电脑、等着跟下一条消息一起发出去的文件。 */
+data class PendingAttachment(
+    val receiptId: String,
+    val name: String,
+    val bytes: Int,
+) {
+    val sizeText: String
+        get() = when {
+            bytes >= 1024 * 1024 -> "%.1f MB".format(bytes / 1024.0 / 1024.0)
+            bytes >= 1024 -> "${bytes / 1024} KB"
+            else -> "$bytes B"
+        }
+}

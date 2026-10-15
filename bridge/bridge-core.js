@@ -1387,15 +1387,30 @@ export function createBridge(ctx, opts) {
     return 'phone-' + Date.now().toString(36) + '-' + rand
   }
 
-  function doPrompt(sessionId, text) {
+  /**
+   * 发一条消息。
+   *
+   * `receiptIds` 是手机先传上来的文件（见 handleUpload）—— 宿主的 prompt 接受
+   * `{type:'file', receiptId}` 这种内容块，它会自己去 resolve + bind 那些 receipt
+   * （读了 session-controller 的实现确认过，不是猜的）。
+   */
+  function doPrompt(sessionId, text, receiptIds) {
     if (sc === undefined || typeof sc.prompt !== 'function') {
       return Promise.reject(new Error('sessionController.prompt unavailable'))
     }
+    const content = []
+    const ids = Array.isArray(receiptIds) ? receiptIds : []
+    for (let i = 0; i < ids.length; i += 1) {
+      const id = ids[i]
+      if (typeof id === 'string' && id) content.push({ type: 'file', receiptId: id })
+    }
+    if (typeof text === 'string' && text) content.push({ type: 'text', text: text })
+    if (content.length === 0) return Promise.reject(new Error('没有内容可发'))
     const request = {
       requestId: requestId(),
       sessionId: sessionId,
       mode: 'queue',
-      content: [{ type: 'text', text: text }],
+      content: content,
     }
     return sc.prompt(request, makeSignal()).then(function (value) {
       return { accepted: !!(value && value.accepted) }
@@ -2519,6 +2534,73 @@ export function createBridge(ctx, opts) {
       })
   }
 
+  /* ---------------------- 手机往会话里传文件 ---------------------- */
+
+  const UPLOAD_MAX_BYTES = 64 * 1024 * 1024
+
+  /**
+   * `POST /phone/upload?sessionId=<id>&name=<文件名>`，请求体就是原始字节。
+   *
+   * 走宿主的 `fileUploads.uploadStream`：它按会话落盘并给一张 **receipt**，
+   * 之后发消息时把这个 receipt 放进 `content` 的 `{type:'file', receiptId}` 块就行
+   * （`sessionController.prompt` 会自己 resolve + bind，读了实现确认过）。
+   *
+   * 两个刻意的选择：
+   *   - **不把文件拼成一整块再交出去**：`req` 本身就是 AsyncIterable<Uint8Array>，
+   *     直接喂给宿主，几十兆的附件不会在桥接里翻倍占内存；
+   *   - 先看 `content-length` 再收：超限直接 413，不白写一遍磁盘。
+   */
+  function handleUpload(req, res, query) {
+    const uploads = ctx.get('fileUploads')
+    if (uploads === undefined || typeof uploads.uploadStream !== 'function') {
+      sendJson(res, 503, { ok: false, error: '这台电脑的 harness 没挂 fileUploads 服务，传不了文件' })
+      req.resume()
+      return
+    }
+    const sessionId = typeof query.sessionId === 'string' ? query.sessionId : ''
+    if (!sessionId) {
+      sendJson(res, 400, { ok: false, error: '缺少 sessionId' })
+      req.resume()
+      return
+    }
+    const declared = parseInt(String(req.headers['content-length'] || '0'), 10)
+    if (isFinite(declared) && declared > UPLOAD_MAX_BYTES) {
+      sendJson(res, 413, {
+        ok: false,
+        error: '文件太大（上限 ' + Math.round(UPLOAD_MAX_BYTES / 1024 / 1024) + ' MB）',
+      })
+      req.resume()
+      return
+    }
+    const name = typeof query.name === 'string' && query.name ? query.name : 'upload.bin'
+    safe(function () {
+      return Promise.resolve()
+        .then(function () {
+          return uploads.uploadStream({
+            sessionId: sessionId,
+            data: req,
+            name: name,
+            signal: makeSignal(),
+          })
+        })
+        .then(
+          function (value) {
+            const file = (value && value.file) || {}
+            console.log('[' + NAME + '] upload ' + name + ' → ' + String(file.bytes || 0) + ' bytes')
+            sendJson(res, 200, {
+              ok: true,
+              receiptId: String((value && value.receiptId) || ''),
+              name: String(file.name || name),
+              bytes: typeof file.bytes === 'number' ? file.bytes : 0,
+            })
+          },
+          function (err) {
+            sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
+    }, undefined)
+  }
+
   /** 改/撤一条还没轮到执行的排队消息。 */
   function doQueueUpdate(sessionId, itemId, body) {
     if (sc === undefined || typeof sc.updateQueue !== 'function') {
@@ -2652,6 +2734,12 @@ export function createBridge(ctx, opts) {
           lastContextEvent: lastContextEventDebug,
         },
       })
+      return
+    }
+
+    // POST /phone/upload?sessionId=<id>&name=<文件名>   手机把文件传进会话
+    if (seg.length === 1 && seg[0] === 'upload' && req.method === 'POST') {
+      handleUpload(req, res, query)
       return
     }
 
@@ -2955,11 +3043,13 @@ export function createBridge(ctx, opts) {
       if (action === 'prompt' && req.method === 'POST') {
         parseBody(req).then(function (body) {
           const text = typeof body.text === 'string' ? body.text : ''
-          if (!text.trim()) {
+          const receiptIds = Array.isArray(body.receiptIds) ? body.receiptIds : []
+          // 允许"只发附件、不写字"（转发个文件本来就是常见动作）
+          if (!text.trim() && receiptIds.length === 0) {
             sendJson(res, 400, { ok: false, error: 'empty text' })
             return
           }
-          doPrompt(sessionId, text).then(
+          doPrompt(sessionId, text, receiptIds).then(
             function (value) {
               markStateDirty()
               sendJson(res, 200, { ok: true, accepted: value.accepted })

@@ -64,6 +64,19 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
         }
     }
 
+    /** 直接发原始字节（传文件用）；路径里的参数由调用方拼好。 */
+    private fun postBytes(path: String, bytes: ByteArray): JSONObject {
+        val req = Request.Builder()
+            .url(url(path))
+            .post(bytes.toRequestBody("application/octet-stream".toMediaType()))
+            .build()
+        http.newCall(req).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw failure(resp.code, body)
+            return if (body.isBlank()) JSONObject() else JSONObject(body)
+        }
+    }
+
     private fun post(path: String, payload: JSONObject): JSONObject {
         val req = Request.Builder()
             .url(url(path))
@@ -110,10 +123,37 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
             )
         }
 
-    suspend fun prompt(sessionId: String, text: String): Boolean = withContext(Dispatchers.IO) {
-        val payload = JSONObject().put("text", text)
-        post("/phone/sessions/$sessionId/prompt", payload).optBoolean("accepted", false)
-    }
+    /**
+     * 发一条消息；[receiptIds] 是之前 [uploadFile] 换来的凭据（可以只发附件、不写字）。
+     */
+    suspend fun prompt(sessionId: String, text: String, receiptIds: List<String> = emptyList()): Boolean =
+        withContext(Dispatchers.IO) {
+            val payload = JSONObject().put("text", text)
+            if (receiptIds.isNotEmpty()) {
+                val arr = JSONArray()
+                receiptIds.forEach { arr.put(it) }
+                payload.put("receiptIds", arr)
+            }
+            post("/phone/sessions/$sessionId/prompt", payload).optBoolean("accepted", false)
+        }
+
+    /**
+     * 把一份文件传给电脑。
+     *
+     * 走宿主的"暂存 → 凭据"两步：拿到 receiptId 之后，把它放进 prompt 的 content，
+     * 电脑那边会自己把附件绑到这条消息上。
+     */
+    suspend fun uploadFile(sessionId: String, name: String, bytes: ByteArray): PendingAttachment =
+        withContext(Dispatchers.IO) {
+            val q = "?sessionId=" + URLEncoder.encode(sessionId, "UTF-8") +
+                "&name=" + URLEncoder.encode(name, "UTF-8")
+            val r = postBytes("/phone/upload$q", bytes)
+            PendingAttachment(
+                receiptId = r.optString("receiptId", ""),
+                name = r.optString("name", name),
+                bytes = r.optInt("bytes", bytes.size),
+            )
+        }
 
     suspend fun cancel(sessionId: String): Boolean = withContext(Dispatchers.IO) {
         post("/phone/sessions/$sessionId/cancel", JSONObject()).optBoolean("ok", false)

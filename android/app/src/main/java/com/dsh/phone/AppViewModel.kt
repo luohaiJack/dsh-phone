@@ -242,6 +242,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val loadingOlder: StateFlow<Boolean> = _loadingOlder.asStateFlow()
 
     /**
+     * 已经传到电脑、等着跟下一条消息一起发出去的文件。
+     *
+     * 两步走（宿主的设计）：先 upload 换一张 receipt，再放进 prompt 的 content。
+     * 所以在"传完"和"发出去"之间会有一小段挂着的时间 —— 这段时间要看得见、能删。
+     */
+    private val _attachments = MutableStateFlow<List<PendingAttachment>>(emptyList())
+    val attachments: StateFlow<List<PendingAttachment>> = _attachments.asStateFlow()
+
+    /** 正在传（用来显示个转圈，别让用户以为没反应）。 */
+    private val _uploading = MutableStateFlow<String?>(null)
+    val uploading: StateFlow<String?> = _uploading.asStateFlow()
+
+    /**
      * 正在改的那条排队消息的草稿（itemId → 正文）。
      *
      * 落盘原因和聊天草稿一样：改排队消息时被返回手势/电话打断是常事，
@@ -518,6 +531,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _hasMoreHistory.value = false
         _loadingOlder.value = false
         _queueEditDraft.value = null
+        _attachments.value = emptyList()
+        _uploading.value = null
         refreshUnread()
     }
 
@@ -641,6 +656,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _draft.value = settings.draft(sessionId)
         _progress.value = stateProgress(sessionId)
         _queueEditDraft.value = settings.queueEditDraft(sessionId)
+        _attachments.value = emptyList()
+        _uploading.value = null
         _queue.value = emptyList()
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { resolveClient().queue(sessionId) }.onSuccess { _queue.value = it }
@@ -787,13 +804,46 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val sessionId = _openSessionId.value
         if (sessionId.isEmpty()) return
         val body = text.trim()
-        if (body.isEmpty()) return
+        val files = _attachments.value
+        // 允许"只发附件、不写字" —— 传个文件过去本来就是常见动作
+        if (body.isEmpty() && files.isEmpty()) return
         _busy.value = true
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { resolveClient().prompt(sessionId, body) }
+            runCatching { resolveClient().prompt(sessionId, body, files.map { it.receiptId }) }
+                .onSuccess {
+                    // 发出去了才清空附件（失败要留着，让用户能重发）
+                    _attachments.value = emptyList()
+                }
                 .onFailure { say("发送失败：${it.message}") }
             _busy.value = false
         }
+    }
+
+    /** 把一个已经读进内存的文件传给电脑。 */
+    fun attachFile(name: String, bytes: ByteArray) {
+        val sessionId = _openSessionId.value
+        if (sessionId.isEmpty()) {
+            say("先打开一个会话再传文件")
+            return
+        }
+        _uploading.value = name
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { resolveClient().uploadFile(sessionId, name, bytes) }
+                .onSuccess { file ->
+                    if (file.receiptId.isEmpty()) {
+                        say("上传没有拿到凭据，可能没传成功")
+                    } else {
+                        _attachments.value = _attachments.value + file
+                        say("已传到电脑：${file.name}（${file.sizeText}）—— 写字或不写都能发")
+                    }
+                }
+                .onFailure { say("传文件失败：${it.message}") }
+            _uploading.value = null
+        }
+    }
+
+    fun removeAttachment(receiptId: String) {
+        _attachments.value = _attachments.value.filterNot { it.receiptId == receiptId }
     }
 
     /** 输入变化：更新内存 + 防抖落盘（每敲一个字都写盘没必要）。 */
