@@ -1171,7 +1171,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             runCatching { resolveClient().selectModel(sid, provider, model, effort) }
                 .onSuccess { sel ->
                     _models.value = _models.value.copy(current = sel)
-                    say("已切到 ${sel.model}" + (sel.effort?.let { " · $it" } ?: ""))
+                    // 说清楚"下一轮生效"：正跑着的时候切，当前这一轮用的还是老模型 ——
+                    // 不写清楚的话，用户会以为没切成（因为眼前的回答还是旧模型生成的）
+                    say(
+                        "已切到 ${sel.model}" + (sel.effort?.let { " · $it" } ?: "") +
+                            if (_liveRunning.value) "（下一轮生效）" else "",
+                    )
                     refreshModels()
                 }
                 .onFailure { say("切换失败：${it.message}") }

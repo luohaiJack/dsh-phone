@@ -2502,7 +2502,12 @@ export function createBridge(ctx, opts) {
 
     // GET  /phone/models?sessionId=<id>   模型目录 + 该会话当前选择
     // POST /phone/model  { sessionId, provider, model, reasoningEffort? }
-    if (seg.length === 1 && seg[0] === 'models') {
+    //
+    // ★ 单复数两条都要收：契约（README / App / 本文件上面的注释）写的是
+    //   /phone/model，而这里一度只实现了 /phone/models —— 于是 App 切模型
+    //   永远 404「unknown bridge route」。这种"两边各自看着都对"的偏差，
+    //   只有真发一次请求才发现，所以离线测试里专门钉了一条。
+    if (seg.length === 1 && (seg[0] === 'models' || seg[0] === 'model')) {
       if (req.method === 'POST') {
         parseBody(req).then(function (body) {
           doSelectModel(body.sessionId, body.provider, body.model, body.reasoningEffort).then(
