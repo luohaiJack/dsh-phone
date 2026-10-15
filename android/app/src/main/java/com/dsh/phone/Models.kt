@@ -90,6 +90,13 @@ data class HarnessState(
     val jobs: List<JobInfo>,
     val error: String?,
     val totalSessions: Int,
+    /**
+     * 手机正开着的那个会话上挂着的待答问题（桥接每轮状态都带一份）。
+     *
+     * 为什么要从状态里也拿：会话流是快通道、会断，状态轮询是稳定通道。
+     * 只看会话流的话，"推的那一刻没连着"就等于用户永远看不到这个问题。
+     */
+    val question: PendingQuestion? = null,
 ) {
     val runningCount: Int get() = sessions.count { it.running }
     val activeJobs: List<JobInfo> get() = jobs.filter { it.status == "running" || it.status == "stopping" }
@@ -224,6 +231,11 @@ internal fun parseState(root: JSONObject): HarnessState {
         jobs = parseJobs(root.optJSONArray("jobs")),
         error = root.optStringOrNull("error"),
         totalSessions = root.optInt("totalSessions", sessions.size),
+        question = if (root.isNull("question")) {
+            null
+        } else {
+            root.optJSONObject("question")?.let { parsePendingQuestion(it) }
+        },
     )
 }
 
@@ -391,8 +403,17 @@ data class QuestionItem(
     val multiSelect: Boolean,
 )
 
-/** 等待手机回答的一组问题（harness 的 ask_user_question）。 */
-data class PendingQuestion(val id: String, val questions: List<QuestionItem>)
+/**
+ * 等待手机回答的一组问题（harness 的 ask_user_question）。
+ *
+ * [sessionId] 是**哪条会话在问**：状态轮询里带的那个问题可能属于别的会话，
+ * 只有 openSessionId 与它一致时才该显示在当前聊天页上。
+ */
+data class PendingQuestion(
+    val id: String,
+    val questions: List<QuestionItem>,
+    val sessionId: String = "",
+)
 
 /** 一条回答：选中的选项标签 + 可选的自由文本。 */
 data class QuestionAnswer(val id: String, val selected: List<String>, val custom: String?)
@@ -432,7 +453,27 @@ internal fun parsePendingQuestion(root: JSONObject): PendingQuestion? {
     val id = root.optString("id", "")
     val qs = parseQuestions(root.optJSONArray("questions"))
     if (id.isBlank() || qs.isEmpty()) return null
-    return PendingQuestion(id, qs)
+    return PendingQuestion(id, qs, root.optString("sessionId", ""))
+}
+
+/**
+ * 状态轮询里带的待答问题，该不该显示在当前聊天页上？
+ *
+ * 规则只有两条，但都很容易写错：
+ *   1. **只显示本会话的**：状态是整机的，问题可能属于别的会话；
+ *   2. **只增不清**：返回 null 表示"这次快照没说别的"，而不是"要把卡片撤掉"。
+ *      清除只由 question-done、回答成功、切会话负责 —— 否则一份早于问题到达的
+ *      快照会把刚显示出来的卡片抹掉（用户看到的就是"闪一下没了"）。
+ */
+fun questionToShow(
+    current: PendingQuestion?,
+    fromState: PendingQuestion?,
+    openSessionId: String,
+): PendingQuestion? {
+    if (fromState == null) return current
+    if (openSessionId.isEmpty() || fromState.sessionId != openSessionId) return current
+    if (current != null && current.id == fromState.id) return current
+    return fromState
 }
 
 /* ------------------------------ 模型目录 ------------------------------ */

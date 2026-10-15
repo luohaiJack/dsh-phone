@@ -1,6 +1,9 @@
 import com.dsh.phone.AnsiSpan
 import com.dsh.phone.ChatMessage
 import com.dsh.phone.mergeProgress
+import com.dsh.phone.questionToShow
+import com.dsh.phone.PendingQuestion
+import com.dsh.phone.QuestionItem
 import com.dsh.phone.overlayProgress
 import com.dsh.phone.formatTokens
 import com.dsh.phone.contextPercent
@@ -377,6 +380,25 @@ fun main() {
         check("百分比取整", contextPercent(617879, 1000000) == 62, contextPercent(617879, 1000000).toString())
         check("不知道用量/窗口就不给百分比", contextPercent(0, 1000000) == null && contextPercent(5, 0) == null)
         check("超了封顶 100", contextPercent(9_000_000, 1_000_000) == 100, contextPercent(9_000_000, 1_000_000).toString())
+    }
+
+    /* ---------- 提问：状态轮询里那份该不该显示（2026-10-15 事故） ---------- */
+
+    run {
+        val open = "session-open"
+        val mine = PendingQuestion("q1", listOf(QuestionItem("a", "题面", null, null, emptyList(), false)), open)
+        val other = PendingQuestion("q2", listOf(QuestionItem("a", "别的会话的问题", null, null, emptyList(), false)), "session-other")
+
+        // ★ 核心：会话流（快通道）断了的时候，问题只能靠状态轮询送来 ——
+        //   这条规则错了，用户在手机上就永远看不到问题
+        check("状态里有本会话的问题 → 显示", questionToShow(null, mine, open) === mine)
+        check("★ 状态里的问题属于别的会话 → 不显示", questionToShow(null, other, open) == null)
+        check("还没打开任何会话 → 不显示", questionToShow(null, mine, "") == null)
+
+        // 只增不清：这一条防的是"卡片闪一下没了"
+        check("★ 这次快照没带问题 → 保持原样（不许清）", questionToShow(mine, null, open) === mine)
+        check("同一个问题重复到达 → 不重建", questionToShow(mine, mine, open) === mine)
+        check("换了一个新问题 → 换成新的", questionToShow(mine, PendingQuestion("q9", mine.questions, open), open)?.id == "q9")
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

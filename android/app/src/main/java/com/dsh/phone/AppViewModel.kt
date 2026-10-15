@@ -435,6 +435,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return _state.value.sessions.firstOrNull { it.id == sessionId }?.progress ?: SessionProgress()
     }
 
+    /**
+     * 应用一份整机快照：状态、未读、以及**待答问题**。
+     *
+     * 三个入口（状态 SSE、兜底轮询、手动刷新）都必须走这里 ——
+     * 谁也不能忘了问题那一步。
+     */
+    private fun applyState(parsed: HarnessState) {
+        _state.value = parsed
+        refreshUnread()
+        syncQuestion(parsed)
+    }
+
+    /**
+     * 把状态里带的待答问题接到界面上。
+     *
+     * 会话流（快通道）断了也不会漏：状态轮询每 3~5 秒一次，
+     * 桥接只要还在替手机拿着这个问题，下一轮就会带上它。
+     *
+     * **只增不清**：清除只由 question-done、回答成功、切会话负责。
+     * 若这里"没看到就清"，一份早于问题到达的快照会把刚显示出来的卡片抹掉。
+     */
+    private fun syncQuestion(parsed: HarnessState) {
+        _question.value = questionToShow(_question.value, parsed.question, _openSessionId.value)
+    }
+
     /** 每次状态刷新时把当前会话的进度补进来。 */
     private fun refreshProgress() {
         val sid = _openSessionId.value
@@ -567,8 +592,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             runCatching {
                 val t0 = System.currentTimeMillis()
                 val s = resolveClient().state(watching = watchingNow())
-                _state.value = s
-                refreshUnread()
+                applyState(s)
                 _conn.value = ConnStatus(ConnPhase.LIVE, latencyMs = System.currentTimeMillis() - t0)
             }.onFailure {
                 say("刷新失败：${it.message}")
@@ -610,8 +634,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     onEvent = { event, data ->
                         if (event == "hello" || event == "state") {
                             runCatching { parseState(data) }.onSuccess { parsed ->
-                                _state.value = parsed
-                                refreshUnread()
+                                applyState(parsed)
                                 _conn.value = ConnStatus(ConnPhase.LIVE)
                                 attempt = 0
                             }
@@ -646,8 +669,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     val t0 = System.currentTimeMillis()
                     val s = resolveClient().state(watching = watchingNow())
                     val dt = System.currentTimeMillis() - t0
-                    _state.value = s
-                    refreshUnread()
+                    applyState(s)
                     _conn.value = ConnStatus(ConnPhase.LIVE, latencyMs = dt)
                 }.onFailure { e ->
                     if (_conn.value.phase != ConnPhase.LIVE) {

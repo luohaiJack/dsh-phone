@@ -339,7 +339,7 @@ export function createBridge(ctx, opts) {
     return null
   }
 
-  function buildState(limit) {
+  function buildState(limit, watching) {
     const maxSessions = typeof limit === 'number' && limit > 0 ? limit : 60
     const state = {
       ok: true,
@@ -350,6 +350,9 @@ export function createBridge(ctx, opts) {
       sessions: [],
       jobs: projectJobs(),
       activeSessionId: activeSessionId,
+      // 手机正开着这个会话时，把它上面挂着的待答问题一起带上 ——
+      // 会话流只是快通道，这条轮询才是"一定会送到"的那条（见 pendingQuestionFor）
+      question: pendingQuestionFor(watching),
       error: null,
     }
     if (sc === undefined || typeof sc.list !== 'function') {
@@ -983,7 +986,11 @@ export function createBridge(ctx, opts) {
    *
    * 心跳搭在 App 本来就有的那次 /phone/state 轮询上，不额外加请求。
    */
-  const WATCH_TTL_MS = 15000
+  // "我在看这个会话"的心跳有效期。App 每 3~5 秒打一次，所以 15 秒足够宽容。
+  // 可被 opts 覆盖：离线用例用它把"心跳过期后交还电脑"这条规则在几秒内验完，
+  // 而不是让测试干等 18 秒。
+  const WATCH_TTL_MS =
+    typeof cfg.watchTtlMs === 'number' && cfg.watchTtlMs > 0 ? cfg.watchTtlMs : 15000
   const watchPings = {}
 
   /** 往某个会话的所有实时流推送一个事件。 */
@@ -1074,6 +1081,34 @@ export function createBridge(ctx, opts) {
     return out
   }
 
+  /**
+   * 某个会话上挂着的、还没人答的问题。
+   *
+   * ★ 为什么状态轮询里也要带一份（2026-10-15 事故）：
+   * 会话流 `/sessions/<id>/live` 是**快**通道，但它会断 —— 省电策略、
+   * 切基站、App 重建、OkHttp 长连接被切。而 `/phone/state?watching=<id>`
+   * 是每 3~5 秒一次的**稳定**通道（App 在轮询，它同时就是心跳）。
+   *
+   * 原来只往会话流推一次、且 `isWatched` 只看心跳不看"到底有没有订阅者"，
+   * 于是出现这种组合：心跳是新鲜的（`watched: true`）但会话流那一刻没有订阅者
+   * —— 问题被"判给"手机却推给了空气，手机上一个字都没有；
+   * 桥接还死等（最多 120 秒）才交还电脑，用户只能看到"手机一直不回复"。
+   *
+   * 现在：只要心跳说"我在看这个会话"，下一轮状态轮询就会把问题带上，
+   * 会话流只是让用户更快看到它。
+   */
+  function pendingQuestionFor(sessionId) {
+    if (!sessionId) return null
+    const ids = Object.keys(pendingQuestions)
+    for (let i = 0; i < ids.length; i += 1) {
+      const e = pendingQuestions[ids[i]]
+      if (e && !e.settled && e.sessionId === sessionId) {
+        return { id: e.id, sessionId: e.sessionId, questions: e.questions }
+      }
+    }
+    return null
+  }
+
   /** 把问题推给正在看这个会话的手机。 */
   function pushQuestion(entry) {
     sessionStreamSend(entry.sessionId, 'question', {
@@ -1090,6 +1125,10 @@ export function createBridge(ctx, opts) {
   function settleQuestion(entry, answer, reason) {
     if (!entry || entry.settled) return
     entry.settled = true
+    // 记在 diag 上：expired 说明手机那边一直没能回答（通道断了/人不看），
+    // answered 才是正常路径。排查"电脑上莫名弹出问题"时先看这一项。
+    lastQuestionDebug.settledReason = reason
+    lastQuestionDebug.settledAgeMs = Date.now() - entry.createdAt
     pushQuestionDone(entry, reason)
     if (typeof entry.resolve === 'function') entry.resolve(answer)
   }
@@ -1122,6 +1161,7 @@ export function createBridge(ctx, opts) {
     const sid = agentSessionId(request && request.agent)
     const questions = normalizeQuestions(request && request.questions)
     questionEventCount += 1
+    const streamClients = sid && sessionStreamClients[sid] ? sessionStreamClients[sid].length : 0
     lastQuestionDebug = {
       at: Date.now(),
       hasAgent: !!(request && request.agent),
@@ -1132,6 +1172,10 @@ export function createBridge(ctx, opts) {
       watched: sid === null ? null : isWatched(sid),
       watchedKeys: watchedKeys(),
       questionCount: questions.length,
+      // ★ 这一项是 2026-10-15 那次"手机上一直等不到问题"的关键证据：
+      //   watched 为真只说明心跳新鲜，不代表会话流真的有人连着。
+      //   两者不一致时，只能靠状态轮询那条通道兜住（现在它携带问题）。
+      streamClients: streamClients,
       intercepted: !!(sid && questions.length > 0 && isWatched(sid)),
     }
     if (!sid || questions.length === 0 || !isWatched(sid)) return fallback()
@@ -1170,15 +1214,40 @@ export function createBridge(ctx, opts) {
     })
   }
 
-  /** 把 userQuestions.ask 包一层；返回可还原的函数。 */
+  /**
+   * 把 userQuestions.ask 包一层；返回可还原的函数。
+   *
+   * ★ 要先**剥掉旧壳**再包：
+   * 每次插件 reload 都会重新装一次钩子，而原来直接 `original = uq.ask` ——
+   * 那时 `uq.ask` 已经是**上一个实例**的包装函数，于是钩子层层嵌套，
+   * 兜底链指向一个已经 dispose 掉的实例。实测危害没有"倍数超时"那么夸张
+   * （内层再问时心跳已过期，会立刻透传下去），但这条链会随 reload 无限变长，
+   * 而且它抓着一个死实例的闭包 —— 排查起来极难，所以必须剥干净。
+   *
+   * 包装函数上挂 `__dshPhoneOriginal` 指向真原始函数：
+   * 装的时候顺着它剥到底，卸载时只还原自己那一层（不是自己就不动）。
+   */
+  const QUESTION_HOOK_ORIGINAL = '__dshPhoneOriginal'
+
   function installQuestionHook() {
     const uq = ctx.get('userQuestions')
     if (uq === undefined || typeof uq.ask !== 'function') return null
-    const original = uq.ask
+    // 剥掉之前实例留下的壳，拿到真正的原始函数
+    let original = uq.ask
+    let guard = 0
+    while (typeof original === 'function' && original[QUESTION_HOOK_ORIGINAL] && guard < 32) {
+      original = original[QUESTION_HOOK_ORIGINAL]
+      guard += 1
+    }
     const wrapper = function (request) {
       return askPhoneFirst(request, function () {
         return original.call(uq, request)
       })
+    }
+    try {
+      wrapper[QUESTION_HOOK_ORIGINAL] = original
+    } catch (err) {
+      /* 冻住了也无妨，下面照样能用 */
     }
     try {
       uq.ask = wrapper
@@ -1291,6 +1360,11 @@ export function createBridge(ctx, opts) {
     // 只登记推送目标；「是否在看」由心跳决定（见上面的 WATCH_TTL_MS）
     if (!sessionStreamClients[sessionId]) sessionStreamClients[sessionId] = []
     sessionStreamClients[sessionId].push(res)
+    // ★ 连上就把挂着的待答问题补推一次。
+    //   问题是在"手机上没人连着这条流"的时刻产生的，只推一次就永远丢了 ——
+    //   重连/切回前台/App 重建都会重新连上来，这里补一次就补上了。
+    const stuck = pendingQuestionFor(sessionId)
+    if (stuck) sseSend(res, 'question', stuck)
 
     function drop() {
       if (closed) return
@@ -2751,7 +2825,7 @@ export function createBridge(ctx, opts) {
     // App 每次轮询顺便报一次"我还开着这个会话"，这就是心跳
     if (seg.length === 1 && seg[0] === 'state') {
       if (query.watching) touchWatch(query.watching)
-      buildState(query.max ? parseInt(query.max, 10) : 60).then(function (state) {
+      buildState(query.max ? parseInt(query.max, 10) : 60, query.watching || null).then(function (state) {
         sendJson(res, 200, state)
       })
       return
@@ -3255,6 +3329,26 @@ export function createBridge(ctx, opts) {
         /* 忽略 */
       }
       delete stateClients[ids[i]]
+    }
+    // ★ 单会话流也必须断掉（2026-10-15 提问丢失的根因之一）。
+    //   不主动 end 的话，reload 之后**老实例**还攥着手机那条 SSE：
+    //   手机以为自己连着（它确实连着，只是连的是已经没有心跳的那个实例），
+    //   而新实例的 sessionStreamClients 是空的。于是出现最坏的分裂：
+    //     心跳（/phone/state?watching=）打到**新**实例 → isWatched 为真
+    //     会话流却还在**老**实例上 → pushQuestion 推给空气
+    //   用户看到的就是"手机上一个字都没有，两分钟后电脑弹出了选择"。
+    //   断开它，手机就会重连到当前实例，两边重新对齐。
+    const streamIds = Object.keys(sessionStreamClients)
+    for (let i = 0; i < streamIds.length; i += 1) {
+      const list = sessionStreamClients[streamIds[i]]
+      for (let k = 0; k < list.length; k += 1) {
+        try {
+          list[k].end()
+        } catch (err) {
+          /* 忽略 */
+        }
+      }
+      delete sessionStreamClients[streamIds[i]]
     }
     for (let i = 0; i < disposers.length; i += 1) {
       try {
