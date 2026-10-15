@@ -19,7 +19,7 @@ export function createBridge(ctx, opts) {
   const TOKEN = typeof cfg.token === 'string' ? cfg.token : ''
   const BASE = typeof cfg.base === 'string' && cfg.base ? cfg.base : '/phone'
   const NAME = 'dsh-phone-bridge'
-  const VERSION = 4
+  const VERSION = 5
 
   const webServer = ctx.get('webServer')
   if (webServer === undefined) {
@@ -1728,33 +1728,54 @@ export function createBridge(ctx, opts) {
     })
   }
 
+  /**
+   * 建会话。
+   *
+   * ★ 宿主的契约是 **workspaceId 与 cwd 二选一**：
+   *   `session.create accepts workspaceId or cwd, not both`（同时给直接 400）。
+   *   而且给了 workspaceId 时宿主自己会 `cwd = workspace.path`，还会
+   *   `attachSession` —— 会话这才出现在工作区树里。
+   *   所以"两个都带上"不但会报错，还丢掉了 attach。
+   *
+   * 曾经的写法就是两个都带（而且是从 cwd 反查到 workspaceId 之后**再加**上去的），
+   * 结果是"手机上新建工作区 → 开会话"每次都失败：
+   * 工作区建出来了（所以列表里能看到），会话却一个都没有。
+   */
   function doCreate(cwd, workspaceId, agentPreset) {
     if (sc === undefined || typeof sc.create !== 'function') {
       return Promise.reject(new Error('sessionController.create unavailable'))
     }
-    const request = {}
-    if (typeof cwd === 'string' && cwd) request.cwd = cwd
-    if (typeof workspaceId === 'string' && workspaceId) request.workspaceId = workspaceId
-    if (typeof agentPreset === 'string' && agentPreset) request.agentPreset = agentPreset
+    const hasWs = typeof workspaceId === 'string' && workspaceId !== ''
+    const hasCwd = typeof cwd === 'string' && cwd !== ''
 
-    return Promise.resolve()
-      .then(function () {
-        if (request.workspaceId || !request.cwd) return undefined
-        if (workspaceSvc === undefined || typeof workspaceSvc.resolveByPath !== 'function') return undefined
-        return workspaceSvc.resolveByPath(request.cwd).then(
-          function (w) {
-            if (w && w.id) request.workspaceId = String(w.id)
-          },
-          function () {
-            /* 目录还没登记成工作区，保持只带 cwd */
-          },
-        )
-      })
-      .then(function () {
-        return sc.create(request)
-      })
-      .then(function (value) {
-        return { sessionId: String(value && value.sessionId), workspaceId: request.workspaceId || null }
+    // 先定下"用哪一个"，再拼 request —— 绝不让两个字段同时出现
+    const pick = hasWs
+      ? Promise.resolve({ workspaceId: workspaceId })
+      : hasCwd && workspaceSvc !== undefined && typeof workspaceSvc.resolveByPath === 'function'
+        ? workspaceSvc.resolveByPath(cwd).then(
+            function (w) {
+              // 这个目录已经登记成工作区 → 用 workspaceId（仍然只给一个）
+              return w && w.id ? { workspaceId: String(w.id) } : { cwd: cwd }
+            },
+            function () {
+              // 反查失败（没登记 / 服务不支持）→ 退回只带 cwd
+              return { cwd: cwd }
+            },
+          )
+        : Promise.resolve(hasCwd ? { cwd: cwd } : {})
+
+    return pick
+      .then(function (loc) {
+        const request = {}
+        if (loc.workspaceId) request.workspaceId = loc.workspaceId
+        else if (loc.cwd) request.cwd = loc.cwd
+        if (typeof agentPreset === 'string' && agentPreset) request.agentPreset = agentPreset
+        return sc.create(request).then(function (value) {
+          return {
+            sessionId: String(value && value.sessionId),
+            workspaceId: request.workspaceId || null,
+          }
+        })
       })
   }
 
