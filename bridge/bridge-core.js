@@ -19,7 +19,7 @@ export function createBridge(ctx, opts) {
   const TOKEN = typeof cfg.token === 'string' ? cfg.token : ''
   const BASE = typeof cfg.base === 'string' && cfg.base ? cfg.base : '/phone'
   const NAME = 'dsh-phone-bridge'
-  const VERSION = 5
+  const VERSION = 6
 
   const webServer = ctx.get('webServer')
   if (webServer === undefined) {
@@ -1313,7 +1313,42 @@ export function createBridge(ctx, opts) {
   function markStateDirty() {
     stateDirty = true
   }
-  every(1000, function () {
+  /* ------------------------------------------------------------------ *
+   * 事件循环卡顿表（"页面自动重连失败"的第一手证据）
+   *
+   * 这个 tick 是**在 harness 自己的事件循环里**跑的。它本该每 1000ms 醒一次，
+   * 实测迟到多少，就等于"宿主当时有多忙" —— 多会话并发、swap 抖动、
+   * 构建任务抢 CPU，都会让事件循环整段停住。
+   *
+   * 为什么需要它：2026-10-15 那次页面左下角黄色"自动重连"→"重连失败"，
+   * 事后在所有日志里**什么都查不到** —— harness 不写连接日志，进程也没崩，
+   * 只是当时忙得没能在客户端的 15 秒窗口内把连接握手完。
+   * 有了这张表，下次可以直接看 `/phone/diag` 的 `eventLoop`：
+   * 如果 maxLagMs 到了几十秒，就别再怀疑网络了，是这台机器被压住了。
+   * ------------------------------------------------------------------ */
+  const TICK_MS = 1000
+  const lag = { last: 0, max: 0, sum: 0, count: 0, over100: 0, over1s: 0, worst: [] }
+  let lastTickAt = Date.now()
+  function noteTickLag(now) {
+    const delta = now - lastTickAt - TICK_MS
+    lastTickAt = now
+    if (delta < 0) return
+    lag.last = delta
+    lag.sum += delta
+    lag.count += 1
+    if (delta > lag.max) lag.max = delta
+    if (delta >= 100) lag.over100 += 1
+    if (delta >= 1000) {
+      lag.over1s += 1
+      lag.worst.push({ at: now, ms: delta })
+      if (lag.worst.length > 8) lag.worst.shift()
+    }
+  }
+
+  every(TICK_MS, function () {
+    safe(function () {
+      noteTickLag(Date.now())
+    }, undefined)
     safe(expireQuestions, undefined)
     safe(ensureControlStream, undefined)
     if (!stateDirty) return
@@ -2869,6 +2904,17 @@ export function createBridge(ctx, opts) {
         stateClients: Object.keys(stateClients).length,
         terminals: termList(),
         queue: { controlRunning: controlRunning, frames: controlFrames, sessions: Object.keys(queues).length },
+        // 宿主事件循环忙不忙 —— 排查"页面自动重连失败"先看这里
+        eventLoop: {
+          tickMs: TICK_MS,
+          lastLagMs: lag.last,
+          maxLagMs: lag.max,
+          avgLagMs: lag.count > 0 ? Math.round(lag.sum / lag.count) : 0,
+          ticks: lag.count,
+          over100ms: lag.over100,
+          over1s: lag.over1s,
+          worst: lag.worst,
+        },
         progress: {
           sessions: Object.keys(progress).length,
           modelWindows: modelWindows,

@@ -75,6 +75,19 @@ scripts/verify.sh               # ⑤ 全链路自检，必须 15 项全过
 - `终端离线验收` 红 → 桥接代码本身有问题，看 `/tmp/dsh-phone-term-test.log`
 - `tailnet 通路` 红 → 这一步是可选的，用户只想在家里用就直接跳过第 6 步
 
+**页面左下角黄色「自动重连」→「重连失败」时先读这段**（2026-10-15 实测）：
+
+- 这**不是网络问题**：浏览器与 harness 在同一台机器上走 `127.0.0.1` 的 WebSocket。
+  客户端给一次连接"就绪"的窗口默认只有 **15 秒**
+  （`@deepseek-ai/dsh-client-connection` 的 `recovery.generationReadyTimeoutMs`），
+  宿主一忙就握手不完 → 连续失败。当前 profile 已放宽到 45 秒。
+- **先别重启**：先打 `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3080/phone/health`。
+  有响应（哪怕慢）说明进程活着、agent 也在跑，等它自己恢复；
+  重启会打断正在跑的会话（历史上还把动态插件桥接弄丢过）。
+- **别起第二个实例**：`~/.dsh/logs/startup-*.log` 里全是 `EADDRINUSE` 就是重复启动。
+- 宿主有多忙看桥接 `/phone/diag` 的 `eventLoop`（1 秒 tick 的迟到量，
+  `maxLagMs` 到几十秒就别怀疑网络了）与 `vmstat` 的 `cs`。
+
 ## 3. 可选：在外面用（远程）
 
 ```bash
