@@ -6,6 +6,7 @@ import com.dsh.phone.CursorKind
 import com.dsh.phone.GoalInfo
 import com.dsh.phone.HarnessState
 import com.dsh.phone.goalWorthShowing
+import com.dsh.phone.hookKeystrokes
 import com.dsh.phone.JobInfo
 import com.dsh.phone.SessionActivity
 import com.dsh.phone.SessionInfo
@@ -288,6 +289,32 @@ fun main() {
         check("几天前完成的就别挂了", !goalWorthShowing(goal("complete", now - 3 * 24 * 3600_000L), now))
         check("completed 这种写法也认", !goalWorthShowing(goal("completed", now - 3600_000), now))
         check("没有目标就不显示", !goalWorthShowing(null, now))
+    }
+
+    /* ---------- 终端输入挂钩：回车必须真的发出去 ---------- */
+
+    run {
+        // ★ 这就是用户报的那个 bug：手机键盘回车"没反应"。
+        //   修好之后回车是一句换行符 —— 必须 send 出去，不许被当空内容吞掉
+        val enter = hookKeystrokes("\n", composing = false, ctrlLatch = false)
+        check("回车要发出去（不是吞掉）", enter.send == "\n", enter.toString())
+        check("发出去的不留在框里", !enter.keepInField)
+
+        val a = hookKeystrokes("a", composing = false, ctrlLatch = false)
+        check("普通字符照发", a.send == "a" && !a.keepInField)
+
+        val composing = hookKeystrokes("nihao", composing = true, ctrlLatch = false)
+        check("组词中先不发（中文要能选词）", composing.send == null && composing.keepInField)
+
+        val empty = hookKeystrokes("", composing = false, ctrlLatch = false)
+        check("删空了不发", empty.send == null && empty.keepInField)
+
+        // Ctrl 锁存：点亮后按一个键 = 那个控制字符
+        val ctrl = hookKeystrokes("c", composing = false, ctrlLatch = true)
+        check("Ctrl 锁存把 c 变成 0x03（Ctrl-C）", ctrl.send == "\u0003", ctrl.send?.let { it[0].code.toString() } ?: "null")
+        check("Ctrl 锁存用完就消费掉", ctrl.consumeLatch)
+        val ctrlLong = hookKeystrokes("abc", composing = false, ctrlLatch = true)
+        check("多字符提交不消费锁存（留给下一个键）", ctrlLong.send == "abc" && !ctrlLong.consumeLatch)
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

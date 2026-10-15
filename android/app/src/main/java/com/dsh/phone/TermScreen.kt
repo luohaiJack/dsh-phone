@@ -795,3 +795,35 @@ fun lastNonBlankRange(lines: List<AnsiLine>, n: Int): Pair<Int, Int>? {
     }
     return if (first >= 0) 0 to first else null
 }
+
+/** 输入挂钩收到一段文本后该怎么办。 */
+data class HookResult(
+    /** 要发给 PTY 的东西；null = 先不发（还在组词，或者框被删空了）。 */
+    val send: String?,
+    /** 是否把这串留在框里继续显示（组词中要留，发出去的就不留）。 */
+    val keepInField: Boolean,
+    /** 是否把 Ctrl 锁存消费掉。 */
+    val consumeLatch: Boolean = false,
+)
+
+/**
+ * 终端输入挂钩的判据：框里来了一段文本，该往 PTY 发什么。
+ *
+ * 单独拎出来是因为这里坏过一次，而且坏得很隐蔽：
+ * 原来输入框是 `singleLine = true`，**手机键盘的回车被输入法当成"IME 动作"吃掉了**，
+ * 压根到不了这里 —— 用户看到的是"按回车没反应，什么也没进去"。
+ * 现在输入框改成多行 + `imeAction = None`，回车就是**换行符**进到这里，
+ * 由这条判据发出去（`sendTermRaw` 再把 `\n` 翻成 `\r`）。
+ *
+ * 所以这个函数必须钉住的是：**拿到 "\n" 就是要发出去**，不许当成"空内容"吞掉。
+ */
+fun hookKeystrokes(text: String, composing: Boolean, ctrlLatch: Boolean): HookResult = when {
+    // 输入法还在组词：只留在框里给用户看（中文要能选词）
+    composing -> HookResult(send = null, keepInField = true)
+    // 框被删空了：什么都不发
+    text.isEmpty() -> HookResult(send = null, keepInField = true)
+    // Ctrl 锁存：下一个"单字符"按控制字符发（Ctrl-C / Ctrl-W / Ctrl-R）
+    ctrlLatch && text.length == 1 ->
+        HookResult(send = (text[0].code and 0x1F).toChar().toString(), keepInField = false, consumeLatch = true)
+    else -> HookResult(send = text, keepInField = false)
+}

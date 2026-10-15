@@ -1,6 +1,7 @@
 package com.dsh.phone.ui
 
 import androidx.compose.foundation.background
+import com.dsh.phone.hookKeystrokes
 import com.dsh.phone.lastNonBlankRange
 import com.dsh.phone.linesText
 import androidx.compose.ui.text.AnnotatedString
@@ -31,6 +32,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Send
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
@@ -471,24 +475,18 @@ fun TerminalScreen(
                 focusRequester = rawFocus,
                 ctrlLatch = ctrlLatch,
                 onValueChange = { v ->
-                    val composing = v.composition != null
-                    val text = v.text
-                    when {
-                        // 组词中：只留在框里给用户看，别发给 shell
-                        composing -> raw = v
-                        text.isEmpty() -> raw = v
-                        // Ctrl 锁存：下一个键按控制字符发（Ctrl-W / Ctrl-R 这些）
-                        ctrlLatch && text.length == 1 -> {
-                            ctrlLatch = false
-                            raw = TextFieldValue("")
-                            onSendRaw((text[0].code and 0x1F).toChar().toString())
-                        }
-                        else -> {
-                            raw = TextFieldValue("")
-                            onSendRaw(text)
-                        }
+                    // 判据在 TermScreen.kt 的 hookKeystrokes（纯函数，有单测）：
+                    // 回车在这里就是一句换行符，必须**发出去**，不许被当空内容吞掉
+                    val r = hookKeystrokes(v.text, v.composition != null, ctrlLatch)
+                    if (r.keepInField) {
+                        raw = v
+                    } else {
+                        if (r.consumeLatch) ctrlLatch = false
+                        raw = TextFieldValue("")
+                        r.send?.let { onSendRaw(it) }
                     }
                 },
+                onEnter = { onSendRaw("\r") },
             )
             }
         }
@@ -508,6 +506,7 @@ private fun RawInputBar(
     focusRequester: FocusRequester,
     ctrlLatch: Boolean,
     onValueChange: (TextFieldValue) -> Unit,
+    onEnter: () -> Unit,
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
@@ -530,7 +529,21 @@ private fun RawInputBar(
                 modifier = Modifier.weight(1f).focusRequester(focusRequester),
                 placeholder = { Text(if (ctrlLatch) "按一个键 = Ctrl+那个键" else "在这里打字，直接进终端（Tab 可补全）") },
                 textStyle = TermTextStyle,
-                singleLine = true,
+                // ★ 回车必须真的发出去。这里踩过一个坑：原来 singleLine = true，
+                //   手机键盘的回车被输入法当成"IME 动作"吃掉了，压根进不到 onValueChange，
+                //   表现就是"按回车没反应、什么也没进去"。
+                //   两条路一起铺，哪条通都算：
+                //     1) imeAction = None + 多行：回车**变成换行符**进到文本里，
+                //        由 onValueChange 发出去（对输入法最不挑）；
+                //     2) 万一某个输入法仍然发"动作"，onSend/onDone/onGo 也接住。
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.None),
+                keyboardActions = KeyboardActions(
+                    onSend = { onEnter() },
+                    onDone = { onEnter() },
+                    onGo = { onEnter() },
+                ),
+                singleLine = false,
+                maxLines = 1,
             )
         }
     }
