@@ -56,6 +56,40 @@ fun isUnread(activity: ActivityInfo?, seenSeq: Long, now: Long, windowMs: Long):
     return a.lastReplyAt > 0 && now - a.lastReplyAt < windowMs
 }
 
+/** 会话页上次离开时的阅读位置（也是"这次进来落在哪儿"的输入）。 */
+data class SavedScroll(val index: Int, val offset: Int, val followTail: Boolean)
+
+/**
+ * "上次看过之后，助手又说过话吗？"
+ *
+ * 与未读角标同源（`lastReplySeq > 已读水位线` 且**最后说话的是助手**），
+ * 但**不看 7 天窗口**：角标关心"这条回复还新不新鲜"（超过 7 天就不再提醒），
+ * 而"进来该落在哪儿"只关心内容有没有变多 —— 哪怕隔了半个月，
+ * 有新回复就该直接看最新，而不是把用户丢回半个月前那一段。
+ */
+fun hasRepliesSince(activity: ActivityInfo?, seenSeq: Long): Boolean {
+    val a = activity ?: return false
+    return a.agentSpokeLast && a.lastReplySeq > seenSeq
+}
+
+/**
+ * 进入会话时该落在哪儿。
+ *
+ * 规则（用户 2026-10-16 明确要求）：
+ *   - **有新回复**（这个会话在「未读回复」区）→ 直奔**最新内容**。
+ *     不能把用户留在上次那一段让他自己往下翻 —— 他点进来就是要看新回复的；
+ *   - **没有新回复** → 回到上次看的位置。哪怕这个会话已经被挤出
+ *     「最近会话」前 6 条、甚至从列表里看不见了，也必须回得去
+ *     （位置只按会话 id 存，与列表顺序无关）。
+ */
+fun planEntryScroll(hasNewReplies: Boolean, saved: SavedScroll?): SavedScroll {
+    if (hasNewReplies) return SavedScroll(index = 0, offset = 0, followTail = true)
+    val s = saved ?: return SavedScroll(index = 0, offset = 0, followTail = true)
+    // 上次就在尾部、或"位置"其实是第一条：都当成跟随最新
+    if (s.followTail || s.index <= 0) return SavedScroll(index = 0, offset = 0, followTail = true)
+    return s
+}
+
 /** 一个 harness 会话的概要。 */
 data class SessionInfo(
     val id: String,

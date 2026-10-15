@@ -232,6 +232,3 @@ class Settings(context: Context) {
         private const val KEY_LAST_SESSION = "lastSessionId"
     }
 }
-
-/** 会话页上次离开时的阅读位置。 */
-data class SavedScroll(val index: Int, val offset: Int, val followTail: Boolean)

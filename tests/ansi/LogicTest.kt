@@ -2,6 +2,10 @@ import com.dsh.phone.AnsiSpan
 import com.dsh.phone.ChatMessage
 import com.dsh.phone.mergeProgress
 import com.dsh.phone.questionToShow
+import com.dsh.phone.hasRepliesSince
+import com.dsh.phone.planEntryScroll
+import com.dsh.phone.SavedScroll
+import com.dsh.phone.ActivityInfo
 import com.dsh.phone.PendingQuestion
 import com.dsh.phone.QuestionItem
 import com.dsh.phone.overlayProgress
@@ -399,6 +403,47 @@ fun main() {
         check("★ 这次快照没带问题 → 保持原样（不许清）", questionToShow(mine, null, open) === mine)
         check("同一个问题重复到达 → 不重建", questionToShow(mine, mine, open) === mine)
         check("换了一个新问题 → 换成新的", questionToShow(mine, PendingQuestion("q9", mine.questions, open), open)?.id == "q9")
+    }
+
+    /* ---------- 进会话落在哪儿：有新回复→最新；没有→上次的位置 ---------- */
+
+    run {
+        val mid = SavedScroll(index = 42, offset = 7, followTail = false)
+
+        // ★ 用户明确要求：在「未读回复」区里的会话，点进去就该看到最新内容
+        val unread = planEntryScroll(hasNewReplies = true, saved = mid)
+        check("★ 有新回复 → 直奔最新（跟随尾部）", unread.followTail && unread.index == 0 && unread.offset == 0,
+            unread.toString())
+
+        // 没有新回复 → 回到上次看的地方；哪怕它已被挤出「最近会话」前 6 条
+        // （位置按会话 id 存，这里没有"列表顺序"这个输入，天然与列表无关）
+        val back = planEntryScroll(hasNewReplies = false, saved = mid)
+        check("★ 没有新回复 → 回到上次的位置", !back.followTail && back.index == 42 && back.offset == 7,
+            back.toString())
+
+        check("上次就在尾部 → 仍然跟随最新",
+            planEntryScroll(false, SavedScroll(9, 3, followTail = true)).followTail)
+        check("没有存过位置 → 看最新", planEntryScroll(false, null).followTail)
+        check("存的是「第一条」（index=0）→ 当跟随处理",
+            planEntryScroll(false, SavedScroll(0, 0, followTail = false)).followTail)
+        // 有新回复时，"上次位置"不该有任何残留（否则会先跳旧位置再回尾部）
+        check("有新回复时不保留旧索引",
+            planEntryScroll(true, SavedScroll(99, 5, false)).let { it.followTail && it.index == 0 })
+
+        // 旧规则是 saved?.takeIf { !it.followTail && it.index > 0 } —— 它只管"上次停哪"，
+        // 不看有没有新回复，所以点进未读会话会把用户丢回第 42 条、让他自己往下翻。
+        // 这条断言把"新旧确实不同"钉住，防止以后改回去。
+        val oldRule = mid.takeIf { !it.followTail && it.index > 0 }
+        check("★ 旧规则会回到第 42 条（正是要修掉的行为）",
+            oldRule != null && oldRule.index == 42 && unread.followTail)
+
+        // 判据本身：与未读角标同源，但**不看 7 天窗口**
+        val a = ActivityInfo(lastReplySeq = 100L, lastReplyAt = 1_000L, agentSpokeLast = true)
+        check("助手有更新的回复 → true", hasRepliesSince(a, 90L))
+        check("水位线已到最新 → false", !hasRepliesSince(a, 100L))
+        check("最后说话的是用户（没有待读回复）→ false", !hasRepliesSince(a.copy(agentSpokeLast = false), 90L))
+        check("没有活动信息 → false", !hasRepliesSince(null, 0L))
+        check("★ 不看 7 天窗口（很久以前的回复也算「有新内容」）", hasRepliesSince(a, 1L))
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

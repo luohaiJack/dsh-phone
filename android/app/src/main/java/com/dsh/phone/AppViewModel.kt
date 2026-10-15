@@ -692,6 +692,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         sessionCall = null
         _openSessionId.value = sessionId
         settings.lastSessionId = sessionId
+        // ★ 必须在 markSeenNow 之前问这一句：那一步会把已读水位线推到最新，
+        //   之后就再也判断不出"进来的时候是不是有新回复"了。
+        //   它决定这次进来落在哪儿（见下面 planEntryScroll）。
+        val hadNewReplies = hasRepliesSince(activityOf(sessionId), settings.seenReplySeq(sessionId))
         // 「最近会话」板块的数据来源就是这一句：只要是从手机上点开的，
         // 不管是点未读卡片、点工作区树、还是从通知进来，都记一笔
         rememberOpened(sessionId)
@@ -720,9 +724,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _streamText.value = ""
             _streamReasoning.value = ""
             _chatListState.value = LazyListState()
-            val saved = settings.chatScroll(sessionId)
-            _chatFollowTail.value = saved?.followTail ?: true
-            pendingScrollRestore = saved?.takeIf { !it.followTail && it.index > 0 }
+            // 落在哪儿：有新回复直奔最新，没有才回到上次看的位置
+            // （位置按会话 id 存，所以"被挤出最近 6 条"也照样回得去）
+            val plan = planEntryScroll(hadNewReplies, settings.chatScroll(sessionId))
+            _chatFollowTail.value = plan.followTail
+            pendingScrollRestore = plan.takeIf { !it.followTail }
         }
         // 打开会话时把它所属的工作区展开：返回列表时一眼能看到刚读的是哪个
         _workspaces.value.firstOrNull { w -> w.sessions.any { it.id == sessionId } }
