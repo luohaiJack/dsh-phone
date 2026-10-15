@@ -1292,6 +1292,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** 清掉当前会话的目标（已完成的目标会一直留在注册表里，纯噪音）。 */
+    fun clearGoal() {
+        val sid = _openSessionId.value
+        if (sid.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { resolveClient().clearGoal(sid) }
+                .onSuccess {
+                    say("目标已清除（会话日志里的历史还在）")
+                    refreshState()
+                    refreshWorkspaces()
+                }
+                .onFailure { say("清除失败：${it.message}") }
+        }
+    }
+
     /* ------------------------- 往上翻历史 ------------------------- */
 
     /**

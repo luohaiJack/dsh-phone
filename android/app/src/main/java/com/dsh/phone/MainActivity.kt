@@ -404,6 +404,7 @@ fun AppRoot(
             activity = remember(state, openId) { sessionActivity(state, openId) },
             progress = progress,
             goal = remember(state, openId) { state.sessions.firstOrNull { it.id == openId }?.goal },
+            onClearGoal = { vm.clearGoal() },
             onOpenSession = { vm.openSession(it) },
             onEditQueued = { id, text -> vm.editQueued(id, text) },
             onRetractQueued = { vm.retractQueued(it) },

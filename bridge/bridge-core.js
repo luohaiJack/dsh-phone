@@ -293,6 +293,10 @@ export function createBridge(ctx, opts) {
       const g = goalsSvc.get(agent)
       if (!g) return null
       return {
+        // id/revision 是宿主 clear/edit/pause 要的 GoalRef —— 少了它手机就"看得见清不掉"
+        id: g.id !== undefined && g.id !== null ? String(g.id) : '',
+        revision: typeof g.revision === 'number' ? g.revision : 0,
+        createdAt: typeof g.createdAt === 'number' ? g.createdAt : 0,
         objective: String(g.objective || ''),
         phase: String(g.phase || ''),
         roundsStarted: typeof g.roundsStarted === 'number' ? g.roundsStarted : 0,
@@ -2408,6 +2412,35 @@ export function createBridge(ctx, opts) {
     startControlStream()
   }
 
+  /**
+   * 清除当前目标。
+   *
+   * 为什么需要：宿主把**已完成**的目标留在注册表里当墓碑（`create` 的说明里写着
+   * "已完成的目标可以被替换，其它阶段必须先清除或恢复"）—— 不清就一直显示。
+   * clear 只清"当前目标"，会话日志里的历史仍在（宿主自己的说明：
+   * "retaining a durable tombstone and history"）。
+   *
+   * ref 由服务端现取，不信客户端传的 revision：手机那边显示的可能已经过期，
+   * 过期就会被宿主的乐观并发挡下来，反而让用户莫名其妙地清不掉。
+   */
+  function doGoalClear(sessionId) {
+    if (!goalsSvc || typeof goalsSvc.clear !== 'function' || !agentsSvc || typeof agentsSvc.get !== 'function') {
+      return Promise.reject(new Error('这个 harness 版本不支持清除目标'))
+    }
+    return Promise.resolve()
+      .then(function () {
+        const agent = agentsSvc.get(sessionId)
+        if (!agent) return Promise.reject(new Error('会话不在活动状态（冷会话没有 live Agent）'))
+        const g = goalsSvc.get(agent)
+        if (!g) return Promise.reject(new Error('这个会话当前没有目标'))
+        return goalsSvc.clear(agent, { id: g.id, revision: g.revision })
+      })
+      .then(function () {
+        markStateDirty()
+        return { ok: true }
+      })
+  }
+
   /** 改/撤一条还没轮到执行的排队消息。 */
   function doQueueUpdate(sessionId, itemId, body) {
     if (sc === undefined || typeof sc.updateQueue !== 'function') {
@@ -2540,6 +2573,19 @@ export function createBridge(ctx, opts) {
           lastContextEvent: lastContextEventDebug,
         },
       })
+      return
+    }
+
+    // POST /phone/sessions/<id>/goal/clear   清掉当前目标（已完成的目标会一直留着）
+    if (seg.length === 4 && seg[0] === 'sessions' && seg[2] === 'goal' && seg[3] === 'clear' && req.method === 'POST') {
+      doGoalClear(seg[1]).then(
+        function (value) {
+          sendJson(res, 200, value)
+        },
+        function (err) {
+          sendJson(res, 400, { ok: false, error: String((err && err.message) || err) })
+        },
+      )
       return
     }
 

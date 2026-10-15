@@ -32,6 +32,11 @@ data class GoalInfo(
     val roundsStarted: Int,
     val maxGoalRounds: Int?,
     val blockedReason: String?,
+    /** 宿主的 GoalRef：清除目标时要用（少了它手机就"看得见清不掉"）。 */
+    val id: String = "",
+    val revision: Int = 0,
+    val createdAt: Long = 0L,
+    val updatedAt: Long = 0L,
 )
 
 /** 会话的"最近有没有助手回复"依据（由桥接提供，已读状态在手机侧）。 */
@@ -179,6 +184,10 @@ internal fun parseGoal(o: JSONObject?): GoalInfo? {
         roundsStarted = o.optInt("roundsStarted", 0),
         maxGoalRounds = if (o.isNull("maxGoalRounds")) null else o.optInt("maxGoalRounds", 0),
         blockedReason = o.optStringOrNull("blockedReason"),
+        id = o.optString("id", ""),
+        revision = o.optInt("revision", 0),
+        createdAt = o.optLong("createdAt", 0L),
+        updatedAt = o.optLong("updatedAt", 0L),
     )
 }
 
@@ -849,4 +858,26 @@ fun lastUserIndexBefore(messages: List<ChatMessage>, limit: Int): Int {
         if (messages[i].role == "user") return i
     }
     return -1
+}
+
+/**
+ * 这个目标值不值得占仪表盘一行。
+ *
+ * 规则（按"用户此刻关心什么"排）：
+ *   - **active**（进行中）：显示 —— 它正在推进；
+ *   - **blocked**（受阻）：显示 —— 需要人管，藏起来是最糟的；
+ *   - **paused**（已暂停）：显示 —— 它在等人恢复；
+ *   - **complete**（已完成）：**默认不显示**，只在刚完成的一小段时间里显示一下
+ *     （给一个"跑完了"的确认），之后就不再占地方。
+ *
+ * 为什么已完成要收起来：宿主把完成的目标留在注册表里当墓碑，
+ * 不清就一直存在 —— 一个几天前完成的目标天天挂在聊天页顶上，纯噪音。
+ * [graceMs] 就是"刚完成还愿意显示多久"。
+ */
+fun goalWorthShowing(goal: GoalInfo?, now: Long, graceMs: Long = 10 * 60 * 1000L): Boolean {
+    if (goal == null) return false
+    return when (goal.phase) {
+        "complete", "completed" -> goal.updatedAt > now - graceMs
+        else -> true
+    }
 }

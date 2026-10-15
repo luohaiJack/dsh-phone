@@ -272,6 +272,11 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
             post("/phone/sessions/$sessionId/queue/$itemId", payload).optBoolean("ok", false)
         }
 
+    /** 清掉当前目标（宿主把已完成的目标留在注册表里，不清就一直显示）。 */
+    suspend fun clearGoal(sessionId: String): Boolean = withContext(Dispatchers.IO) {
+        post("/phone/sessions/$sessionId/goal/clear", JSONObject()).optBoolean("ok", false)
+    }
+
     /* ----------------------------- 终端 ----------------------------- */
 
     /**

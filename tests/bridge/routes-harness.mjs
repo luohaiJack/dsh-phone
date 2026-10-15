@@ -65,6 +65,7 @@ const documented = [
   ['POST', '/sessions/s1/archive', {}],
   ['GET', '/sessions/s1/queue'],
   ['POST', '/sessions/s1/queue/m1', { action: 'remove' }],
+  ['POST', '/sessions/s1/goal/clear', {}],
   ['POST', '/term/open', { cols: 80, rows: 24 }],
   ['GET', '/term/list'],
   ['POST', '/term/t1/input', { data: 'x' }],

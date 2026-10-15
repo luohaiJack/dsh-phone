@@ -3,7 +3,9 @@ import com.dsh.phone.ChatMessage
 import com.dsh.phone.mergeProgress
 import com.dsh.phone.progressFromMessages
 import com.dsh.phone.CursorKind
+import com.dsh.phone.GoalInfo
 import com.dsh.phone.HarnessState
+import com.dsh.phone.goalWorthShowing
 import com.dsh.phone.JobInfo
 import com.dsh.phone.SessionActivity
 import com.dsh.phone.SessionInfo
@@ -269,6 +271,23 @@ fun main() {
         check("limit 超过长度不炸", lastUserIndexBefore(list, 999) == 5)
         check("limit=0 返回 -1", lastUserIndexBefore(list, 0) == -1)
         check("空列表返回 -1", lastUserIndexBefore(emptyList(), 10) == -1)
+    }
+
+    /* ---------- 目标该不该显示（已完成的不该一直挂着） ---------- */
+
+    run {
+        fun goal(phase: String, updatedAt: Long) = GoalInfo(
+            objective = "把 X 做完", phase = phase, roundsStarted = 2, maxGoalRounds = 10,
+            blockedReason = null, id = "g1", revision = 3, createdAt = 0L, updatedAt = updatedAt,
+        )
+        val now = 1_000_000_000L
+        check("进行中要显示", goalWorthShowing(goal("active", now - 3600_000), now))
+        check("受阻要显示（藏起来最糟）", goalWorthShowing(goal("blocked", now - 3600_000), now))
+        check("已暂停要显示（它在等人恢复）", goalWorthShowing(goal("paused", now - 3600_000), now))
+        check("刚完成还露一下脸", goalWorthShowing(goal("complete", now - 60_000), now))
+        check("几天前完成的就别挂了", !goalWorthShowing(goal("complete", now - 3 * 24 * 3600_000L), now))
+        check("completed 这种写法也认", !goalWorthShowing(goal("completed", now - 3600_000), now))
+        check("没有目标就不显示", !goalWorthShowing(null, now))
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

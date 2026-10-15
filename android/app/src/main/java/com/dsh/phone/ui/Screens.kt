@@ -78,6 +78,7 @@ import com.dsh.phone.ConnStatus
 import com.dsh.phone.DirListing
 import com.dsh.phone.DocState
 import com.dsh.phone.GoalInfo
+import com.dsh.phone.goalWorthShowing
 import com.dsh.phone.SessionProgress
 import com.dsh.phone.PendingQuestion
 import com.dsh.phone.SessionActivity
@@ -1112,6 +1113,7 @@ fun ChatScreen(
     activity: SessionActivity,
     progress: SessionProgress,
     goal: GoalInfo?,
+    onClearGoal: () -> Unit,
     onOpenSession: (String) -> Unit,
     onEditQueued: (String, String) -> Unit,
     onRetractQueued: (String) -> Unit,
@@ -1229,7 +1231,7 @@ fun ChatScreen(
     ) { inner ->
         Column(Modifier.fillMaxSize().padding(inner)) {
             // 仪表盘：轮/步 + 目标（有才显示）+ 上下文进度
-            SessionDashboard(progress = progress, goal = goal)
+            SessionDashboard(progress = progress, goal = goal, onClearGoal = onClearGoal)
 
             // 掉线横幅：USB 通道（adb reverse）会因拔插线/系统重协商而失效，
             // 这时聊天页如果只是空白，用户无法区分"没有消息"和"没连上"。
@@ -2226,11 +2228,35 @@ private fun goalPhaseText(phase: String): String = when (phase) {
 fun SessionDashboard(
     progress: SessionProgress,
     goal: GoalInfo?,
+    onClearGoal: () -> Unit = {},
     fullScreen: Boolean = false,
 ) {
-    if (!progress.hasAnything && goal == null) return
+    // 已完成的目标只"刚完成时"露一下脸，之后收起来 ——
+    // 宿主把完成的目标当墓碑留在注册表里，不清就永远在，挂在顶上纯噪音
+    val shownGoal = goal?.takeIf { goalWorthShowing(it, System.currentTimeMillis()) }
+    if (!progress.hasAnything && shownGoal == null) return
     var expanded by remember { mutableStateOf(false) }
+    var confirmClear by remember { mutableStateOf(false) }
     val ratio = progress.contextRatio
+
+    if (confirmClear && shownGoal != null) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("清除这个目标？") },
+            text = {
+                Text(
+                    "会把当前目标从 harness 的目标注册表里清掉（会话日志里的历史仍然保留）。\n\n" +
+                        "「${shownGoal.objective.take(60)}」",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { confirmClear = false; onClearGoal() }) {
+                    Text("清除", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("取消") } },
+        )
+    }
 
     Surface(
         modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded },
@@ -2248,14 +2274,14 @@ fun SessionDashboard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                if (goal != null) {
-                    val blocked = goal.phase == "blocked"
+                if (shownGoal != null) {
+                    val blocked = shownGoal.phase == "blocked"
                     Text(
-                        "🎯 " + goalPhaseText(goal.phase) +
-                            if (goal.maxGoalRounds != null && goal.maxGoalRounds > 0) {
-                                " ${goal.roundsStarted}/${goal.maxGoalRounds}"
-                            } else if (goal.roundsStarted > 0) {
-                                " ${goal.roundsStarted} 轮"
+                        "🎯 " + goalPhaseText(shownGoal.phase) +
+                            if (shownGoal.maxGoalRounds != null && shownGoal.maxGoalRounds > 0) {
+                                " ${shownGoal.roundsStarted}/${shownGoal.maxGoalRounds}"
+                            } else if (shownGoal.roundsStarted > 0) {
+                                " ${shownGoal.roundsStarted} 轮"
                             } else {
                                 ""
                             },
@@ -2310,7 +2336,7 @@ fun SessionDashboard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                goal?.let { g ->
+                shownGoal?.let { g ->
                     Spacer(Modifier.height(4.dp))
                     Text(
                         "🎯 目标（${goalPhaseText(g.phase)}）",
@@ -2330,6 +2356,11 @@ fun SessionDashboard(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error,
                         )
+                    }
+                    if (g.phase == "complete" || g.phase == "completed" || g.phase == "blocked") {
+                        TextButton(onClick = { confirmClear = true }) {
+                            Text("清除这个目标", color = MaterialTheme.colorScheme.error)
+                        }
                     }
                 }
             }
