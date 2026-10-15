@@ -41,6 +41,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -386,7 +387,7 @@ data class DshActions(
     val clearRecent: () -> Unit,
 )
 
-@OptIn(ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun SessionsScreen(
     state: HarnessState,
@@ -396,6 +397,8 @@ fun SessionsScreen(
     recentAt: Map<String, Long>,
     expanded: Set<String>,
     listState: LazyListState,
+    refreshing: Boolean = false,
+    onRefresh: () -> Unit = {},
     actions: DshActions,
 ) {
     // 长按弹出的菜单 / 对话框的目标
@@ -435,278 +438,285 @@ fun SessionsScreen(
         .filter { (_, s, _) -> !working.contains(s.id) && !unread.contains(s.id) }
         .take(RECENT_SHOWN)
 
-    LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-        item {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "${workspaces.size} 个工作区 · $totalSessions 个会话",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                FilledTonalButton(onClick = actions.newSession) {
-                    Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("新建会话")
-                }
-            }
-        }
-
-        if (unreadItems.isNotEmpty()) {
-            item {
-                Text(
-                    "未读回复（${unreadItems.size}）",
-                    modifier = Modifier.padding(start = 16.dp, top = 4.dp, bottom = 4.dp),
-                    style = MaterialTheme.typography.labelLarge,
-                    color = UnreadGreen,
-                )
-            }
-            items(unreadItems.size) { i ->
-                val (w, sess) = unreadItems[i]
-                SessionSectionCard(
-                    container = MaterialTheme.colorScheme.surfaceVariant,
-                    leading = {
-                        Box(Modifier.size(8.dp).clip(RoundedCornerShape(50)).background(UnreadGreen))
-                    },
-                    title = sess.displayTitle,
-                    subtitle = w.displayTitle + " · " + relativeTime(sess.activity.lastReplyAt),
-                    actionLabel = "去看 ›",
-                    actionColor = UnreadGreen,
-                    onClick = { actions.openSession(sess.id) },
-                    onLongClick = { menuSession = sess.id },
-                    menu = {
-                        SessionMenu(
-                            expanded = menuSession == sess.id,
-                            onDismiss = { menuSession = null },
-                            onOpen = { menuSession = null; actions.openSession(sess.id) },
-                            onRename = { menuSession = null; renameSessionTarget = sess },
-                            onFork = { menuSession = null; actions.forkSession(sess.id) },
-                            onArchive = { menuSession = null; archiveTarget = sess },
-                            onShowId = { menuSession = null; idTarget = sess },
-                        )
-                    },
-                )
-            }
-        }
-
-        if (runningNow.isNotEmpty()) {
-            item {
-                Text(
-                    "正在工作",
-                    modifier = Modifier.padding(start = 16.dp, top = 4.dp, bottom = 4.dp),
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-            }
-            items(runningNow.size) { i ->
-                val (w, sess) = runningNow[i]
-                SessionSectionCard(
-                    container = MaterialTheme.colorScheme.primaryContainer,
-                    leading = { CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp) },
-                    title = sess.displayTitle,
-                    subtitle = w.displayTitle + " · " + relativeTime(sess.updatedAt),
-                    actionLabel = "进入 ›",
-                    actionColor = MaterialTheme.colorScheme.primary,
-                    onClick = { actions.openSession(sess.id) },
-                    onLongClick = { menuSession = sess.id },
-                    menu = {
-                        SessionMenu(
-                            expanded = menuSession == sess.id,
-                            onDismiss = { menuSession = null },
-                            onOpen = { menuSession = null; actions.openSession(sess.id) },
-                            onRename = { menuSession = null; renameSessionTarget = sess },
-                            onFork = { menuSession = null; actions.forkSession(sess.id) },
-                            onArchive = { menuSession = null; archiveTarget = sess },
-                            onShowId = { menuSession = null; idTarget = sess },
-                        )
-                    },
-                )
-            }
-        }
-
-        // 「最近会话」：手机屏小，工作区树一展开就滚不到底。
-        // 这块只放"已经看过、也已经停下来"的 —— 未读和正在工作的在上面两块里，
-        // 同一个会话不会同时出现在两块，免得用户不知道该点哪张卡。
-        if (recentItems.isNotEmpty()) {
+    // 下拉刷新：列表是工作区树渲染的，归档/新会话/重命名都要靠重拉才看得到
+    PullToRefreshBox(
+        isRefreshing = refreshing,
+        onRefresh = onRefresh,
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
             item {
                 Row(
-                    Modifier.fillMaxWidth().padding(start = 16.dp, end = 6.dp, top = 4.dp),
+                    Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        "最近会话",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    TextButton(onClick = actions.clearRecent) { Text("清空") }
-                }
-            }
-            items(recentItems.size) { i ->
-                val (w, sess, openedAt) = recentItems[i]
-                SessionSectionCard(
-                    container = MaterialTheme.colorScheme.surfaceVariant,
-                    leading = {
-                        Icon(
-                            Icons.Filled.Refresh,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(14.dp),
-                        )
-                    },
-                    title = sess.displayTitle,
-                    subtitle = w.displayTitle + " · 上次打开：" + relativeTime(openedAt),
-                    actionLabel = "继续 ›",
-                    actionColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                    onClick = { actions.openSession(sess.id) },
-                    onLongClick = { menuSession = sess.id },
-                    menu = {
-                        SessionMenu(
-                            expanded = menuSession == sess.id,
-                            onDismiss = { menuSession = null },
-                            onOpen = { menuSession = null; actions.openSession(sess.id) },
-                            onRename = { menuSession = null; renameSessionTarget = sess },
-                            onFork = { menuSession = null; actions.forkSession(sess.id) },
-                            onArchive = { menuSession = null; archiveTarget = sess },
-                            onShowId = { menuSession = null; idTarget = sess },
-                        )
-                    },
-                )
-            }
-        }
-
-        item {
-            Text(
-                "工作区（历史 + 当前）",
-                modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 4.dp),
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.primary,
-            )
-        }
-
-        if (workspaces.isEmpty()) {
-            item {
-                Box(Modifier.fillMaxWidth().padding(40.dp), contentAlignment = Alignment.Center) {
-                    Text(
-                        "还没读到工作区\n检查连接，或点右上「新建会话」建一个",
+                        "${workspaces.size} 个工作区 · $totalSessions 个会话",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    FilledTonalButton(onClick = actions.newSession) {
+                        Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("新建会话")
+                    }
                 }
             }
-        }
 
-        items(workspaces.size) { i ->
-            val w = workspaces[i]
-            val isOpen = expanded.contains(w.id)
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-            ) {
-                Box {
-                    Column(Modifier.fillMaxWidth()) {
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .combinedClickable(
-                                    onClick = { actions.toggleWorkspace(w.id) },
-                                    onLongClick = { menuWorkspace = w.id },
-                                )
-                                .padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(
-                                if (isOpen) "▾" else "▸",
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            if (unreadItems.isNotEmpty()) {
+                item {
+                    Text(
+                        "未读回复（${unreadItems.size}）",
+                        modifier = Modifier.padding(start = 16.dp, top = 4.dp, bottom = 4.dp),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = UnreadGreen,
+                    )
+                }
+                items(unreadItems.size) { i ->
+                    val (w, sess) = unreadItems[i]
+                    SessionSectionCard(
+                        container = MaterialTheme.colorScheme.surfaceVariant,
+                        leading = {
+                            Box(Modifier.size(8.dp).clip(RoundedCornerShape(50)).background(UnreadGreen))
+                        },
+                        title = sess.displayTitle,
+                        subtitle = w.displayTitle + " · " + relativeTime(sess.activity.lastReplyAt),
+                        actionLabel = "去看 ›",
+                        actionColor = UnreadGreen,
+                        onClick = { actions.openSession(sess.id) },
+                        onLongClick = { menuSession = sess.id },
+                        menu = {
+                            SessionMenu(
+                                expanded = menuSession == sess.id,
+                                onDismiss = { menuSession = null },
+                                onOpen = { menuSession = null; actions.openSession(sess.id) },
+                                onRename = { menuSession = null; renameSessionTarget = sess },
+                                onFork = { menuSession = null; actions.forkSession(sess.id) },
+                                onArchive = { menuSession = null; archiveTarget = sess },
+                                onShowId = { menuSession = null; idTarget = sess },
                             )
-                            Spacer(Modifier.width(8.dp))
-                            Column(Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(
-                                        w.displayTitle,
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.weight(1f, fill = false),
-                                    )
-                                    if (w.runningCount > 0) {
-                                        Spacer(Modifier.width(6.dp))
-                                        Text("运行中 ${w.runningCount}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
-                                    }
-                                    val wUnread = w.sessions.count { unread.contains(it.id) }
-                                    if (wUnread > 0) {
-                                        Spacer(Modifier.width(6.dp))
-                                        Text("未读 $wUnread", style = MaterialTheme.typography.labelSmall, color = UnreadGreen)
-                                    }
-                                }
-                                Text(w.path, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text("${w.sessionCount} 个会话", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                        }
-                        if (isOpen) {
-                            HorizontalDivider()
-                            if (w.sessions.isEmpty()) {
-                                Text(
-                                    "这个工作区还没有会话",
-                                    modifier = Modifier.padding(start = 34.dp, top = 8.dp, bottom = 4.dp),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                            w.sessions.take(30).forEach { sess ->
-                                Box {
-                                    Row(
-                                        Modifier
-                                            .fillMaxWidth()
-                                            .combinedClickable(
-                                                onClick = { actions.openSession(sess.id) },
-                                                onLongClick = { menuSession = sess.id },
-                                            )
-                                            .padding(start = 34.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                    ) {
-                                        if (sess.running) {
-                                            CircularProgressIndicator(modifier = Modifier.size(11.dp), strokeWidth = 2.dp)
-                                            Spacer(Modifier.width(6.dp))
-                                        } else if (unread.contains(sess.id)) {
-                                            Box(Modifier.size(8.dp).clip(RoundedCornerShape(50)).background(UnreadGreen))
-                                            Spacer(Modifier.width(6.dp))
-                                        }
-                                        Text(sess.displayTitle, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                                        Text(relativeTime(sess.updatedAt), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    }
-                                    SessionMenu(
-                                        expanded = menuSession == sess.id,
-                                        onDismiss = { menuSession = null },
-                                        onOpen = { menuSession = null; actions.openSession(sess.id) },
-                                        onRename = { menuSession = null; renameSessionTarget = sess },
-                                        onFork = { menuSession = null; actions.forkSession(sess.id) },
-                                        onArchive = { menuSession = null; archiveTarget = sess },
-                                        onShowId = { menuSession = null; idTarget = sess },
-                                    )
-                                }
-                            }
-                            TextButton(
-                                onClick = { actions.newSessionInWorkspace(w.id) },
-                                modifier = Modifier.padding(start = 24.dp, bottom = 6.dp),
-                            ) { Text("在此工作区新建会话") }
-                        }
-                    }
-                    WorkspaceMenu(
-                        expanded = menuWorkspace == w.id,
-                        onDismiss = { menuWorkspace = null },
-                        onRename = { menuWorkspace = null; renameWorkspaceTarget = w },
-                        onDelete = { menuWorkspace = null; deleteWorkspaceTarget = w },
-                        onNewSession = { menuWorkspace = null; actions.newSessionInWorkspace(w.id) },
+                        },
                     )
                 }
             }
+
+            if (runningNow.isNotEmpty()) {
+                item {
+                    Text(
+                        "正在工作",
+                        modifier = Modifier.padding(start = 16.dp, top = 4.dp, bottom = 4.dp),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                items(runningNow.size) { i ->
+                    val (w, sess) = runningNow[i]
+                    SessionSectionCard(
+                        container = MaterialTheme.colorScheme.primaryContainer,
+                        leading = { CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp) },
+                        title = sess.displayTitle,
+                        subtitle = w.displayTitle + " · " + relativeTime(sess.updatedAt),
+                        actionLabel = "进入 ›",
+                        actionColor = MaterialTheme.colorScheme.primary,
+                        onClick = { actions.openSession(sess.id) },
+                        onLongClick = { menuSession = sess.id },
+                        menu = {
+                            SessionMenu(
+                                expanded = menuSession == sess.id,
+                                onDismiss = { menuSession = null },
+                                onOpen = { menuSession = null; actions.openSession(sess.id) },
+                                onRename = { menuSession = null; renameSessionTarget = sess },
+                                onFork = { menuSession = null; actions.forkSession(sess.id) },
+                                onArchive = { menuSession = null; archiveTarget = sess },
+                                onShowId = { menuSession = null; idTarget = sess },
+                            )
+                        },
+                    )
+                }
+            }
+
+            // 「最近会话」：手机屏小，工作区树一展开就滚不到底。
+            // 这块只放"已经看过、也已经停下来"的 —— 未读和正在工作的在上面两块里，
+            // 同一个会话不会同时出现在两块，免得用户不知道该点哪张卡。
+            if (recentItems.isNotEmpty()) {
+                item {
+                    Row(
+                        Modifier.fillMaxWidth().padding(start = 16.dp, end = 6.dp, top = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "最近会话",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        TextButton(onClick = actions.clearRecent) { Text("清空") }
+                    }
+                }
+                items(recentItems.size) { i ->
+                    val (w, sess, openedAt) = recentItems[i]
+                    SessionSectionCard(
+                        container = MaterialTheme.colorScheme.surfaceVariant,
+                        leading = {
+                            Icon(
+                                Icons.Filled.Refresh,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(14.dp),
+                            )
+                        },
+                        title = sess.displayTitle,
+                        subtitle = w.displayTitle + " · 上次打开：" + relativeTime(openedAt),
+                        actionLabel = "继续 ›",
+                        actionColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        onClick = { actions.openSession(sess.id) },
+                        onLongClick = { menuSession = sess.id },
+                        menu = {
+                            SessionMenu(
+                                expanded = menuSession == sess.id,
+                                onDismiss = { menuSession = null },
+                                onOpen = { menuSession = null; actions.openSession(sess.id) },
+                                onRename = { menuSession = null; renameSessionTarget = sess },
+                                onFork = { menuSession = null; actions.forkSession(sess.id) },
+                                onArchive = { menuSession = null; archiveTarget = sess },
+                                onShowId = { menuSession = null; idTarget = sess },
+                            )
+                        },
+                    )
+                }
+            }
+
+            item {
+                Text(
+                    "工作区（历史 + 当前）",
+                    modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 4.dp),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+
+            if (workspaces.isEmpty()) {
+                item {
+                    Box(Modifier.fillMaxWidth().padding(40.dp), contentAlignment = Alignment.Center) {
+                        Text(
+                            "还没读到工作区\n检查连接，或点右上「新建会话」建一个",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+
+            items(workspaces.size) { i ->
+                val w = workspaces[i]
+                val isOpen = expanded.contains(w.id)
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                ) {
+                    Box {
+                        Column(Modifier.fillMaxWidth()) {
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .combinedClickable(
+                                        onClick = { actions.toggleWorkspace(w.id) },
+                                        onLongClick = { menuWorkspace = w.id },
+                                    )
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    if (isOpen) "▾" else "▸",
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            w.displayTitle,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f, fill = false),
+                                        )
+                                        if (w.runningCount > 0) {
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("运行中 ${w.runningCount}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                        }
+                                        val wUnread = w.sessions.count { unread.contains(it.id) }
+                                        if (wUnread > 0) {
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("未读 $wUnread", style = MaterialTheme.typography.labelSmall, color = UnreadGreen)
+                                        }
+                                    }
+                                    Text(w.path, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text("${w.sessionCount} 个会话", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                            if (isOpen) {
+                                HorizontalDivider()
+                                if (w.sessions.isEmpty()) {
+                                    Text(
+                                        "这个工作区还没有会话",
+                                        modifier = Modifier.padding(start = 34.dp, top = 8.dp, bottom = 4.dp),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                w.sessions.take(30).forEach { sess ->
+                                    Box {
+                                        Row(
+                                            Modifier
+                                                .fillMaxWidth()
+                                                .combinedClickable(
+                                                    onClick = { actions.openSession(sess.id) },
+                                                    onLongClick = { menuSession = sess.id },
+                                                )
+                                                .padding(start = 34.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            if (sess.running) {
+                                                CircularProgressIndicator(modifier = Modifier.size(11.dp), strokeWidth = 2.dp)
+                                                Spacer(Modifier.width(6.dp))
+                                            } else if (unread.contains(sess.id)) {
+                                                Box(Modifier.size(8.dp).clip(RoundedCornerShape(50)).background(UnreadGreen))
+                                                Spacer(Modifier.width(6.dp))
+                                            }
+                                            Text(sess.displayTitle, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                                            Text(relativeTime(sess.updatedAt), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                        SessionMenu(
+                                            expanded = menuSession == sess.id,
+                                            onDismiss = { menuSession = null },
+                                            onOpen = { menuSession = null; actions.openSession(sess.id) },
+                                            onRename = { menuSession = null; renameSessionTarget = sess },
+                                            onFork = { menuSession = null; actions.forkSession(sess.id) },
+                                            onArchive = { menuSession = null; archiveTarget = sess },
+                                            onShowId = { menuSession = null; idTarget = sess },
+                                        )
+                                    }
+                                }
+                                TextButton(
+                                    onClick = { actions.newSessionInWorkspace(w.id) },
+                                    modifier = Modifier.padding(start = 24.dp, bottom = 6.dp),
+                                ) { Text("在此工作区新建会话") }
+                            }
+                        }
+                        WorkspaceMenu(
+                            expanded = menuWorkspace == w.id,
+                            onDismiss = { menuWorkspace = null },
+                            onRename = { menuWorkspace = null; renameWorkspaceTarget = w },
+                            onDelete = { menuWorkspace = null; deleteWorkspaceTarget = w },
+                            onNewSession = { menuWorkspace = null; actions.newSessionInWorkspace(w.id) },
+                        )
+                    }
+                }
+            }
+            item { Spacer(Modifier.height(24.dp)) }
         }
-        item { Spacer(Modifier.height(24.dp)) }
     }
 
     /* ------------------------------ 对话框 ------------------------------ */

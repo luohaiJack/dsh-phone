@@ -226,6 +226,7 @@ fun AppRoot(
     val unread by vm.unread.collectAsState()
     val working by vm.working.collectAsState()
     val recentAt by vm.recentAt.collectAsState()
+    val refreshing by vm.refreshing.collectAsState()
     val term by vm.term.collectAsState()
     val termFollowTail by vm.termFollowTail.collectAsState()
     val queue by vm.queue.collectAsState()
@@ -468,6 +469,8 @@ fun AppRoot(
                     unread = unread,
                     working = working,
                     recentAt = recentAt,
+                    refreshing = refreshing,
+                    onRefresh = { vm.pullRefresh() },
                     expanded = expandedWorkspaces,
                     listState = vm.sessionsListState,
                     actions = DshActions(

@@ -7,6 +7,39 @@
 
 ---
 
+## v0.3.12 —— 2026-10-16
+
+### 修：归档了但手机上没消失
+- 用户报的。查宿主文档就明白了：`archiveSession` 只往一个**全局归档集**里加 id，
+  > Archiving never touches workspace accounting — an archived session keeps its
+  > `sessionIds` slot so unarchiving restores its position.
+  **"从列表里隐藏"是渲染方自己的事**，而我的桥接是直接从工作区 `sessionIds`
+  生成列表的，**没过滤** ✗。
+- 改法一处收口：`listWorkspaces()` 用 `workspaceSvc.archivedSessionIds` 过滤。
+  App 的三栏（未读 / 正在工作 / 最近会话）都从工作区树渲染，所以一处就够了；
+  通知栏未读计数走 `/phone/workspaces`，也跟着对。
+- App 文案：原来那句"已归档（会话日志仍然保留在电脑上）"容易被读成"电脑端不归档"，
+  改成 **"已归档：已从手机列表里移除（电脑上的会话日志仍然保留）"**；
+  宿主拒绝归档时的英文原话（`the session is active (…)`）翻译成
+  **"这个会话还在电脑上跑着，先停止它再归档"**。
+- `diag` 新增 `archived` 计数（怀疑"归档没生效"时先看它有没有变大）。
+
+### 新增：会话列表下拉刷新
+- 会话页包了一层 Material3 `PullToRefreshBox`，`pullRefresh()` 一次拉**状态 +
+  工作区树**两样 —— 列表是工作区树渲染的，但未读/正在工作要靠状态里的 activity，
+  只拉一个会出现"会话没了但未读角标还在"的半截状态。
+- `refreshing` 与 `conn.phase` 分开：前者是"用户刚拽了一下"，后者是"链路通不通"。
+
+验证：离线新增 5 项（`create-harness.mjs` 17 → 22）—— 归档前在列表里 →
+归档后消失 → **工作区记账没被改**（保证能归位）→ `diag.archived` 计数 →
+取消归档后回来；**反向验证**：改动前的桥接跑同一份用例 2 项红。
+合计 8 组 **285 项**全过。
+
+> ⚠️ **部署提醒**：桥接的**代码**改动不能热加载（Node 的 ESM 模块按 URL 缓存；
+> `plugin_manager` 的 disable/enable 只重新应用插件定义、仍复用旧模块 ——
+> 这次实测过），要生效得**重启 `dsh web`**。APK 部分（下拉刷新 + 文案）
+> 已经构建好，等数据线插上就装。
+
 ## v0.3.11 —— 2026-10-16
 
 ### 修：进会话落点在**冷启动**时判错（真机验收抓到的）

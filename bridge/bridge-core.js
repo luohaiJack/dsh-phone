@@ -1909,6 +1909,27 @@ export function createBridge(ctx, opts) {
    * 会话归属不靠我们自己算 —— workspace.sessionIds 已经是 harness 按
    * canonical-cwd 索引过滤好的，直接用它，避免两边规则不一致。
    */
+  /**
+   * 已归档的会话 id 集合。
+   *
+   * ★ 过滤是**消费方**的事：宿主自己的文档写得很清楚 ——
+   * `archiveSession` 只往一个全局归档集里加 id，
+   * "Archiving never touches workspace accounting — an archived session keeps its
+   * `sessionIds` slot so unarchiving restores its position."
+   * 也就是说工作区的 `sessionIds` **不会**变，电脑端界面是按这个集合隐藏的。
+   * 桥接原来没做这一步，于是手机上归档完会话还在列表里 ——
+   * 用户看到的就是"归档了但没消失"（2026-10-16 报的）。
+   */
+  function archivedSet() {
+    const out = {}
+    safe(function () {
+      const ids = workspaceSvc && workspaceSvc.archivedSessionIds
+      if (!ids || typeof ids.length !== 'number') return
+      for (let i = 0; i < ids.length; i += 1) out[String(ids[i])] = true
+    }, undefined)
+    return out
+  }
+
   function listWorkspaces() {
     if (workspaceSvc === undefined || typeof workspaceSvc.list !== 'function') {
       return Promise.resolve({ ok: false, error: 'workspaceRegistry unavailable', workspaces: [] })
@@ -1932,13 +1953,19 @@ export function createBridge(ctx, opts) {
 
     return listPromise.then(function () {
       const live = liveSessionMap()
+      const archived = archivedSet()
       const out = []
       for (let i = 0; i < ws.length; i += 1) {
         const w = ws[i]
         if (!w) continue
-        const ids = (w.sessionIds || []).map(function (x) {
-          return String(x)
-        })
+        const ids = (w.sessionIds || [])
+          .map(function (x) {
+            return String(x)
+          })
+          // 归档的不进列表（工作区记账里还留着，方便电脑端"取消归档"归位）
+          .filter(function (sid) {
+            return !archived[sid]
+          })
         let runningCount = 0
         const sessions = []
         for (let k = 0; k < ids.length; k += 1) {
@@ -2904,6 +2931,8 @@ export function createBridge(ctx, opts) {
         stateClients: Object.keys(stateClients).length,
         terminals: termList(),
         queue: { controlRunning: controlRunning, frames: controlFrames, sessions: Object.keys(queues).length },
+        // 归档集大小：手机上"归档了但没消失"时先看这一项有没有变大
+        archived: Object.keys(archivedSet()).length,
         // 宿主事件循环忙不忙 —— 排查"页面自动重连失败"先看这里
         eventLoop: {
           tickMs: TICK_MS,

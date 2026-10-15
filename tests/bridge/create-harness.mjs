@@ -77,6 +77,14 @@ const sessionController = {
 }
 
 const workspaceRegistry = {
+  /**
+   * 归档集（宿主是 registry 上的一个 getter）。
+   *
+   * 宿主自己的语义：`archiveSession` 只往这个集合里加 id，
+   * **工作区的 sessionIds 不动**（"Archiving never touches workspace accounting"），
+   * 隐藏是消费方的事 —— 桥接原来没做，于是手机上"归档了还在列表里"。
+   */
+  archivedSessionIds: [],
   list: () => workspaces.map(cloneWorkspace),
   get: (id) => {
     const w = workspaces.find((x) => x.id === id)
@@ -204,6 +212,34 @@ check('默认目录没被写成空串', sessions[4] && sessions[4].cwd === '/hom
 const bad = await post('/new', { workspaceId: 'ws-nope' })
 check('不存在的 workspaceId → 报错而不是静默成功', bad.json.ok === false && /not found/.test(bad.json.error || ''),
   JSON.stringify(bad.json))
+
+/* ------------------------------------------------------------------ *
+ * 6. 归档的会话必须从工作区树里消失（2026-10-16 用户报的）
+ * ------------------------------------------------------------------ */
+{
+  const before = await fetch(`${base}/workspaces`, { headers: H }).then((r) => r.json())
+  const w0 = (before.workspaces || []).find((w) => w.id === ws.json.id)
+  const sid = sessions[0].id
+  check('归档前：会话在工作区树里', !!w0 && w0.sessions.some((s) => s.id === sid),
+    JSON.stringify((w0?.sessions || []).map((s) => s.id)))
+
+  // 宿主归档：只往归档集加 id，工作区记账**不动**
+  workspaceRegistry.archivedSessionIds.push(sid)
+  const after = await fetch(`${base}/workspaces`, { headers: H }).then((r) => r.json())
+  const w1 = (after.workspaces || []).find((w) => w.id === ws.json.id)
+  check('★ 归档后：会话从工作区树里消失', !!w1 && !w1.sessions.some((s) => s.id === sid),
+    JSON.stringify((w1?.sessions || []).map((s) => s.id)))
+  check('★ 但工作区本身的记账没被改（宿主语义：取消归档要能归位）',
+    workspaceRegistry.get(ws.json.id).sessionIds.includes(sid))
+  const diag = await (await fetch(`${base}/diag`, { headers: H })).json()
+  check('diag 里能看到归档集大小', diag.archived === 1, String(diag.archived))
+
+  workspaceRegistry.archivedSessionIds.length = 0
+  const back = await fetch(`${base}/workspaces`, { headers: H }).then((r) => r.json())
+  const w2 = (back.workspaces || []).find((w) => w.id === ws.json.id)
+  check('取消归档后会话回来（位置没丢）', !!w2 && w2.sessions.some((s) => s.id === sid),
+    JSON.stringify((w2?.sessions || []).map((s) => s.id)))
+}
 
 check('全程零越界请求', violations.length === 0, JSON.stringify(violations))
 

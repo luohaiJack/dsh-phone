@@ -314,6 +314,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         publishProgress()
     }
 
+    /**
+     * 正在下拉刷新。
+     *
+     * 和 `conn.phase` 分开：连接状态说的是"链路通不通"，
+     * 这个说的是"用户刚刚拽了一下，正在重拉"。
+     */
+    private val _refreshing = MutableStateFlow(false)
+    val refreshing: StateFlow<Boolean> = _refreshing.asStateFlow()
+
     /** 主机侧可路由的模型目录。 */
     private val _models = MutableStateFlow(ModelCatalog.EMPTY)
     val models: StateFlow<ModelCatalog> = _models.asStateFlow()
@@ -593,6 +602,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _attachments.value = emptyList()
         _uploading.value = null
         refreshUnread()
+    }
+
+    /**
+     * 下拉刷新：整机状态 + 工作区树一起重拉。
+     *
+     * 为什么两个都拉：列表是工作区树渲染的，而"未读/正在工作"还要靠状态里的
+     * activity —— 只拉一个会出现"会话没了但未读角标还在"这类半截状态。
+     * 归档之后也该走这条路（归档只改电脑上的归档集，得重新拉才看得到）。
+     */
+    fun pullRefresh() {
+        if (_refreshing.value) return
+        _refreshing.value = true
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                applyState(resolveClient().state(watching = watchingNow()))
+                applyWorkspaces(resolveClient().workspaces())
+                _conn.value = ConnStatus(ConnPhase.LIVE)
+            }.onFailure { say("刷新失败：${it.message}") }
+            _refreshing.value = false
+        }
     }
 
     /** 手动刷新一次整机快照。 */
@@ -1328,11 +1357,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { resolveClient().archiveSession(sessionId) }
                 .onSuccess {
-                    say("已归档（会话日志仍然保留在电脑上）")
+                    say("已归档：已从手机列表里移除（电脑上的会话日志仍然保留）")
+                    // 归档只改电脑上的归档集，列表要重新拉才会消失
                     refreshWorkspaces()
                     refreshState()
                 }
-                .onFailure { say("归档失败：${it.message}") }
+                .onFailure { e ->
+                    val m = e.message ?: ""
+                    // 宿主原话是英文的 "cannot archive session 'x': the session is active (…)"
+                    say(
+                        if (m.contains("is active")) {
+                            "归档失败：这个会话还在电脑上跑着，先停止它再归档"
+                        } else {
+                            "归档失败：$m"
+                        },
+                    )
+                }
         }
     }
 
