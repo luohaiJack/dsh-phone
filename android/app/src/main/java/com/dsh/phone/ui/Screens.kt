@@ -48,6 +48,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -77,6 +78,7 @@ import com.dsh.phone.ConnStatus
 import com.dsh.phone.DirListing
 import com.dsh.phone.DocState
 import com.dsh.phone.PendingQuestion
+import com.dsh.phone.QueuedMessage
 import com.dsh.phone.TermState
 import com.dsh.phone.QuestionAnswer
 import com.dsh.phone.HarnessState
@@ -1099,8 +1101,13 @@ fun ChatScreen(
     onRefreshModels: () -> Unit,
     onOpenFile: (String) -> Unit,
     onToggleInjected: (Boolean) -> Unit,
+    queue: List<QueuedMessage>,
+    onEditQueued: (String, String) -> Unit,
+    onRetractQueued: (String) -> Unit,
+    onSteerQueued: (String) -> Unit,
 ) {
     var showModels by remember { mutableStateOf(false) }
+    var editQueueTarget by remember { mutableStateOf<QueuedMessage?>(null) }
     val scope = rememberCoroutineScope()
 
     val visible = remember(messages, showInjected) {
@@ -1153,6 +1160,17 @@ fun ChatScreen(
         if (!followTail) return@LaunchedEffect
         val target = visible.size + if (streamText.isNotEmpty()) 1 else 0
         if (target > 0) runCatching { listState.scrollToItem(target - 1) }
+    }
+
+    editQueueTarget?.let { target ->
+        EditQueueDialog(
+            original = target.text,
+            onDismiss = { editQueueTarget = null },
+            onConfirm = { text ->
+                editQueueTarget = null
+                onEditQueued(target.id, text)
+            },
+        )
     }
 
     Scaffold(
@@ -1256,6 +1274,18 @@ fun ChatScreen(
             // 有提问时，卡片贴在输入框上方
             if (question != null) {
                 QuestionCard(pending = question, onAnswer = onAnswer)
+            }
+
+            // 排队消息：harness 还在跑的时候发出去的那几条。
+            // 放在输入框正上方 —— 用户的视线和手指本来就在这儿，
+            // "我发的那句话去哪了"必须一眼看得见，而且能改能撤。
+            if (queue.isNotEmpty()) {
+                QueueCard(
+                    items = queue,
+                    onEdit = { id, _ -> editQueueTarget = queue.firstOrNull { it.id == id } },
+                    onRetract = onRetractQueued,
+                    onSteer = onSteerQueued,
+                )
             }
 
             HorizontalDivider()
@@ -1884,4 +1914,104 @@ fun SettingsScreen(
 
         Spacer(Modifier.height(24.dp))
     }
+}
+
+/* ============================== 排队消息 ============================== */
+
+/**
+ * 「跑着的时候又发的那几条」。
+ *
+ * 为什么必须显示：消息发出去之后被 harness 收进队列，要等这一轮跑完才执行 ——
+ * 如果界面上什么都不显示，用户会以为"发出去了却没人理"，
+ * 然后重复发一遍。所以条数、内容、能不能改/撤都要摆在明面上。
+ */
+@Composable
+fun QueueCard(
+    items: List<QueuedMessage>,
+    onEdit: (String, String) -> Unit,
+    onRetract: (String) -> Unit,
+    onSteer: (String) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer,
+    ) {
+        Column(Modifier.fillMaxWidth().padding(10.dp)) {
+            Row(
+                Modifier.fillMaxWidth().clickable { expanded = !expanded },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("⏳", style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    "${items.size} 条排队中 · 等这一轮跑完依次发出",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    if (expanded) "收起 ▾" else "展开 ▸",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+            }
+            if (expanded) {
+                items.forEachIndexed { i, item ->
+                    if (i > 0) HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                    Text(
+                        item.text.ifBlank { "（空）" },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        maxLines = 4,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = { onEdit(item.id, item.text) }) { Text("改") }
+                        TextButton(onClick = { onRetract(item.id) }) {
+                            Text("撤回", color = MaterialTheme.colorScheme.error)
+                        }
+                        if (item.placement == "queued") {
+                            TextButton(onClick = { onSteer(item.id) }) { Text("立刻插话") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 改一条还没执行的排队消息。 */
+@Composable
+fun EditQueueDialog(
+    original: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var text by remember(original) { mutableStateOf(original) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("改这条排队消息") },
+        text = {
+            Column {
+                Text(
+                    "改完还是排在队列里，等这一轮跑完才发。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    maxLines = 8,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(text) }, enabled = text.isNotBlank()) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }

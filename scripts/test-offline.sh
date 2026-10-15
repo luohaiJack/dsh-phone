@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# 终端相关的离线验收（不需要 harness、不需要手机）。
+# 离线验收（不需要 harness、不需要手机，约 20 秒）。
 #
-#   1) bridge 侧：假 ctx + 真 `script`(PTY)，用真 HTTP 打一遍 /phone/term/*
-#   2) 手机侧：AnsiParser / TermBuffer 的纯逻辑测试（含一段从真机抓下来的字节）
+#   1) bridge 侧：假 ctx 起真 HTTP，把 /phone/* 打一遍
+#        tests/bridge/term-harness.mjs    终端（真 `script` 当 PTY 后端）
+#        tests/bridge/queue-harness.mjs   排队消息（镜像 / 改 / 撤 / 插话）
+#   2) Android 侧：AnsiParser / TermScreen 的纯逻辑测试（含真机字节回放）
 #
 # 为什么要有这两个：终端这条链路上"看起来对"的东西太多了 ——
 #   * 转义序列被 chunk 切断、
@@ -17,20 +19,24 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pass=0
 fail=0
 
-echo "================ 1/2  bridge 终端接口（真 PTY） ================"
+echo "================ 1/2  bridge 接口 ================"
 if ! command -v node >/dev/null 2>&1; then
   echo "✗  找不到 node，跳过"
   fail=$((fail + 1))
 else
-  if node "$ROOT/tests/bridge/term-harness.mjs"; then
-    pass=$((pass + 1))
-  else
-    fail=$((fail + 1))
-  fi
+  for h in "$ROOT"/tests/bridge/*-harness.mjs; do
+    echo "--- $(basename "$h") ---"
+    if node "$h"; then
+      pass=$((pass + 1))
+    else
+      fail=$((fail + 1))
+    fi
+    echo
+  done
 fi
 
 echo
-echo "================ 2/2  ANSI / TermBuffer ================"
+echo "================ 2/2  ANSI / 屏幕模型 ================"
 # 用 Gradle 缓存里的 kotlin-compiler-embeddable，不额外装东西
 CACHE="${GRADLE_CACHE:-$HOME/.gradle/caches/modules-2/files-2.1}"
 KC="$(find "$CACHE/org.jetbrains.kotlin/kotlin-compiler-embeddable" -name '*.jar' 2>/dev/null | sort | tail -1)"
@@ -44,11 +50,12 @@ if [ -z "$KC" ] || [ -z "$STDLIB" ]; then
   fail=$((fail + 1))
 else
   OUT="$(mktemp -d)"
-  SRC="$ROOT/android/app/src/main/java/com/dsh/phone/Ansi.kt"
+  SRC="$ROOT/android/app/src/main/java/com/dsh/phone"
   java -cp "$KC:$STDLIB:$COROUTINES:$DAEMON:$ANNOT" \
     org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
     -classpath "$STDLIB" \
-    "$SRC" "$ROOT/tests/ansi/AnsiTest.kt" -d "$OUT" -nowarn 2>&1 | grep -E "^error|exception" || true
+    "$SRC/Ansi.kt" "$SRC/TermScreen.kt" "$ROOT/tests/ansi/AnsiTest.kt" -d "$OUT" -nowarn 2>&1 \
+    | grep -E "error:|exception" || true
   if java -cp "$OUT:$STDLIB" AnsiTestKt; then
     pass=$((pass + 1))
   else

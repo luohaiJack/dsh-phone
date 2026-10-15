@@ -524,8 +524,19 @@ data class TermState(
     val cwd: String = "",
     val cols: Int = 0,
     val rows: Int = 0,
+    /** 渲染列表 = 历史滚动 + 当前屏幕（`TermScreen` 拼好给界面的那份）。 */
     val lines: List<AnsiLine> = emptyList(),
-    val currentLine: AnsiLine = emptyList(),
+    /** 光标在 [lines] 里的下标（不可见时为 null）—— 自动滚动就跟着它走。 */
+    val cursorLine: Int? = null,
+    /** 光标列（0 基）。 */
+    val cursorCol: Int = 0,
+    /**
+     * 正在跑全屏程序（vim/htop/less 用的是备用屏）。
+     *
+     * 界面据此换一套输入方式：全屏程序要的是**逐键直通**，
+     * 而不是"写好一行再回车"——后者会把 vim 的插入模式用废。
+     */
+    val fullScreen: Boolean = false,
     val exited: Boolean = false,
     val exitCode: Int? = null,
 ) {
@@ -539,4 +550,35 @@ data class TermState(
             connected -> "已连接"
             else -> "连接中断，重连中…"
         }
+}
+
+/**
+ * 一条还没轮到执行的排队消息。
+ *
+ * placement 是宿主给的：`queued` 正常排队、`steering` 是"插话"（下一轮立刻带上）、
+ * `context` 是塞进去当上下文。手机只对 queued 的显示「立刻插话」。
+ */
+data class QueuedMessage(
+    val id: String,
+    val text: String,
+    val placement: String = "queued",
+)
+
+/** 桥接返回的排队项 → 手机侧模型。 */
+internal fun parseQueue(arr: JSONArray?): List<QueuedMessage> {
+    if (arr == null) return emptyList()
+    val out = ArrayList<QueuedMessage>(arr.length())
+    for (i in 0 until arr.length()) {
+        val o = arr.optJSONObject(i) ?: continue
+        val id = o.optString("id", "")
+        if (id.isEmpty()) continue
+        out.add(
+            QueuedMessage(
+                id = id,
+                text = o.optString("text", ""),
+                placement = o.optString("placement", "queued"),
+            ),
+        )
+    }
+    return out
 }

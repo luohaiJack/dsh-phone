@@ -233,6 +233,25 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
         )
     }
 
+    /* ---------------------------- 排队消息 ---------------------------- */
+
+    /** 还没轮到执行的排队消息（跑着的时候发出去的那几条）。 */
+    suspend fun queue(sessionId: String): List<QueuedMessage> = withContext(Dispatchers.IO) {
+        parseQueue(get("/phone/sessions/$sessionId/queue").optJSONArray("items"))
+    }
+
+    /**
+     * 改 / 撤 / 插话一条排队消息。
+     *
+     * action: "remove" 撤回 ｜ "edit" 改内容（要带 text）｜ "steer" 让它下轮立刻带上
+     */
+    suspend fun queueAction(sessionId: String, itemId: String, action: String, text: String? = null): Boolean =
+        withContext(Dispatchers.IO) {
+            val payload = JSONObject().put("action", action)
+            if (text != null) payload.put("text", text)
+            post("/phone/sessions/$sessionId/queue/$itemId", payload).optBoolean("ok", false)
+        }
+
     /* ----------------------------- 终端 ----------------------------- */
 
     /**

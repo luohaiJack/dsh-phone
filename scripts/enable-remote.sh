@@ -16,6 +16,17 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# 令牌：优先 bridge/.token（插件自己生成的那份，不进仓库），
+# 其次才是 cordis.patch.yml 里手填的值。
+read_token() {
+  local f="$ROOT/bridge/.token"
+  if [ -s "$f" ]; then
+    tr -d '\r\n' < "$f"
+    return 0
+  fi
+  grep -oE "token: '[^']*'" "$ROOT/bridge/cordis.patch.yml" 2>/dev/null | head -1 | sed "s/token: '//;s/'//" || true
+}
+
 TS_DIR="${TS_DIR:-$HOME/tailscale}"
 TS_VER="${TS_VER:-1.104.1}"
 TS_ARCH="${TS_ARCH:-amd64}"
@@ -32,7 +43,7 @@ ADB="${ADB:-$HOME/android-sdk/platform-tools-dl/platform-tools/adb}"
 BRIDGE_PATCH="$ROOT/bridge/cordis.patch.yml"
 
 echo "== 0/4 探测哪个本地端口上有桥接 =="
-TOKEN_EARLY="$(grep -oE "token: '[^']*'" "$BRIDGE_PATCH" 2>/dev/null | head -1 | sed "s/token: '//;s/'//" || true)"
+TOKEN_EARLY="$(read_token)"
 probe_port() {
   # 必须看响应体：harness 的 web 服务器对未匹配路由会回落到 SPA，
   # 于是没有桥接的端口也返回 200（HTML）。只看状态码会误判。
@@ -138,7 +149,7 @@ echo "   $ENDPOINT"
 
 echo
 echo "== 4/4 把端点与令牌灌进手机 App =="
-TOKEN="$(grep -oE "token: '[^']*'" "$BRIDGE_PATCH" | head -1 | sed "s/token: '//;s/'//")"
+TOKEN="$(read_token)"
 if [ ! -x "$ADB" ]; then
   echo "   跳过：找不到 adb（$ADB）"
 elif ! "$ADB" get-state >/dev/null 2>&1; then

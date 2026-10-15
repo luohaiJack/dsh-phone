@@ -49,6 +49,7 @@ harness (dsh web) ──/phone/* HTTP+SSE┤                      ├─▶ Andr
 | `docs/技术路线.md` | 架构、取舍、接口表、踩过的坑 |
 | `tests/` | 离线验收：桥接终端接口（真 PTY）+ ANSI 解析 |
 | `AGENTS.md` | 给 AI 的部署手册 |
+| `CHANGELOG.md` | 版本记录（最新的在最上面） |
 
 ---
 
@@ -133,6 +134,8 @@ scripts/enable-bridge.sh --revert    # 回滚，harness 回到原样
 | POST | `/phone/term/<id>/signal` | 给前台进程组发信号 `{signal}`（Ctrl-C 等） |
 | POST | `/phone/term/<id>/close` | 关掉这个终端 |
 | GET | `/phone/term/list` | 当前活着的终端（排查用） |
+| GET | `/phone/sessions/<id>/queue` | 还没轮到执行的排队消息 |
+| POST | `/phone/sessions/<id>/queue/<itemId>` | 改/撤/插话 `{action:'remove'\|'edit'\|'steer', text?}` |
 
 自测（桥接起来之后）：
 
@@ -157,10 +160,15 @@ curl -s http://127.0.0.1:3080/phone/state | python3 -m json.tool | head -40
 - **聊天页**：SSE 实时流式输出、工具调用与结果、打断按钮、
   harness 注入的上下文消息默认折叠（设置里可打开）
 - **通知栏**：可选常驻，关着 App 也能看到运行中的会话与任务
-- **终端页（状态页进入）**：在手机上调这台电脑的**真 PTY** ——
-  提示符、颜色、Ctrl-C、Tab、方向键、vim/htop 都能用；
-  在会话里长按复制一段命令，切到终端点「粘贴并跑」就直接执行。
-  只有全屏 TUI（vim/htop 那种反复重绘的）显示不出正确画面（见 docs §25）
+- **终端页（状态页进入）**：在手机上调这台电脑的**真 PTY**，
+  而且是**真正的屏幕模型**（光标寻址 / 擦除 / 滚动区域 / 备用屏），
+  所以 **vim、nano、htop、less 都能正常用**：
+  - 命令行模式：写好一行发送；在会话里长按复制的命令，点「粘贴并跑」直接执行
+  - **进 vim 自动切"逐键直通"**：隐藏发送框，用手机原生输入法打字，
+    外加一排电脑键（Esc / ⏎ / Tab / ⌫ / 方向键 / Ctrl 锁存 / `:` `/` `|` `-`）
+  - **滚动跟着光标走**：键盘弹起来也不会盖住你正在编辑的那一行
+- **排队消息**：harness 还在跑的时候你发的消息会进队列 ——
+  输入框上方显示「N 条排队中」，展开可以**逐条改 / 撤回 / 立刻插话**
 - **设置页**：地址 / 令牌 / 显示开关 / 测试连接
 
 ---
@@ -239,9 +247,9 @@ harness 的工作区（`workspaceRegistry`）就是「项目文件夹」，会�
 改完东西**别只靠眼看**，仓库里带了三层验收，从便宜到贵：
 
 ```bash
-# 1) 离线（不需要 harness / 手机，约 20 秒）
-#    桥接的终端接口用真 PTY 跑一遍 + ANSI 解析器的纯逻辑测试（含真机字节回放）
-scripts/test-terminal.sh
+# 1) 离线（不需要 harness / 手机，约 25 秒，67 项）
+#    桥接终端接口（真 PTY）+ 排队消息（镜像/改/撤/插话）+ 终端屏幕模型（含真机 vim 帧）
+scripts/test-offline.sh
 
 # 2) 在线全链路（桥接挂了没、令牌对不对、tailnet 通不通、手机认不认）
 scripts/verify.sh
@@ -277,8 +285,8 @@ fetch / setTimeout` —— 它要能同时跑在"真 Node 进程"和"受限的�
 - 未做 WebView 兜底（成本很低，需要时可加）
 - 远程延迟取决于链路：家里同网实测 240ms 直连、蜂窝 IPv6 打洞 58ms、
   走 DERP 中继则 ~300ms（中继节点都在境外，最近的洛杉矶 303ms）
-- 终端页对**全屏 TUI**（vim/htop 这类反复重绘的）显示不出正确画面：
-  解析器丢掉了光标寻址，只认样式与换行。跑命令、看输出不受影响
+- 终端页的屏幕模型覆盖"跑命令 + 编辑文本"够用的那部分 VT100；
+  鼠标上报、完整字符集表、真 24 位光标形状没做（vim/htop/less 不受影响）
 - APK 是 **debug 自签名**，只能 `adb install`，不能上应用商店；
   要正式分发就把 `app/build.gradle.kts` 里的 `signingConfig` 换成自己的 keystore
 

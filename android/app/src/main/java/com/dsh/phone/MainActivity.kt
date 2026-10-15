@@ -210,6 +210,7 @@ fun AppRoot(
     val term by vm.term.collectAsState()
     val termFollowTail by vm.termFollowTail.collectAsState()
     val termDraft by vm.termDraft.collectAsState()
+    val queue by vm.queue.collectAsState()
     val liveRunning by vm.liveRunning.collectAsState()
     val catalog by vm.models.collectAsState()
     val switchingModel by vm.switchingModel.collectAsState()
@@ -372,6 +373,10 @@ fun AppRoot(
                 showInjected = it
                 vm.setShowInjected(it)
             },
+            queue = queue,
+            onEditQueued = { id, text -> vm.editQueued(id, text) },
+            onRetractQueued = { vm.retractQueued(it) },
+            onSteerQueued = { vm.steerQueued(it) },
         )
         return
     }

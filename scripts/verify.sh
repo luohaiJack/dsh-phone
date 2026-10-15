@@ -6,6 +6,17 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# 令牌：优先 bridge/.token（插件自己生成的那份，不进仓库），
+# 其次才是 cordis.patch.yml 里手填的值。
+read_token() {
+  local f="$ROOT/bridge/.token"
+  if [ -s "$f" ]; then
+    tr -d '\r\n' < "$f"
+    return 0
+  fi
+  grep -oE "token: '[^']*'" "$ROOT/bridge/cordis.patch.yml" 2>/dev/null | head -1 | sed "s/token: '//;s/'//" || true
+}
+
 BRIDGE_PATCH="$ROOT/bridge/cordis.patch.yml"
 ADB="${ADB:-$HOME/android-sdk/platform-tools-dl/platform-tools/adb}"
 TS_BIN="${TS_BIN:-$HOME/tailscale/tailscale_1.104.1_amd64/tailscale}"
@@ -21,7 +32,7 @@ good() { say "$OK" "$1"; pass=$((pass+1)); }
 bad()  { say "$BAD" "$1"; fail=$((fail+1)); }
 warn() { say "$WARN" "$1"; }
 
-TOKEN="$(grep -oE "token: '[^']*'" "$BRIDGE_PATCH" 2>/dev/null | head -1 | sed "s/token: '//;s/'//" || true)"
+TOKEN="$(read_token)"
 
 echo "================ DSH 手机端 全链路自检 ================"
 echo
@@ -78,14 +89,14 @@ fi
 
 echo
 echo "--- 3c. 终端离线验收（真 PTY） ---"
-if [ -x "$ROOT/scripts/test-terminal.sh" ]; then
-  if "$ROOT/scripts/test-terminal.sh" >/tmp/dsh-phone-term-test.log 2>&1; then
+if [ -x "$ROOT/scripts/test-offline.sh" ]; then
+  if "$ROOT/scripts/test-offline.sh" >/tmp/dsh-phone-term-test.log 2>&1; then
     good "终端离线验收全通过（详见 /tmp/dsh-phone-term-test.log）"
   else
     bad "终端离线验收有失败 => /tmp/dsh-phone-term-test.log"
   fi
 else
-  warn "没有 scripts/test-terminal.sh"
+  warn "没有 scripts/test-offline.sh"
 fi
 
 echo

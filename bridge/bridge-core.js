@@ -1010,6 +1010,7 @@ export function createBridge(ctx, opts) {
   }
   every(1000, function () {
     safe(expireQuestions, undefined)
+    safe(ensureControlStream, undefined)
     if (!stateDirty) return
     stateDirty = false
     broadcastState(false)
@@ -1041,6 +1042,9 @@ export function createBridge(ctx, opts) {
       return
     }
     openSse(req, res)
+    // 先补一份当前排队情况：手机上多半是"跑着的时候点进来"的，
+    // 光等增量帧会看见一段空白
+    sseSend(res, 'queue', { items: queueViews(sessionId) })
     const signal = makeSignal()
     const request = {
       address: { kind: 'session', sessionId: sessionId },
@@ -2129,6 +2133,179 @@ export function createBridge(ctx, opts) {
   }
 
   /* ------------------------------------------------------------------ *
+   * 6ter. 排队消息
+   *
+   * 场景：harness 正在跑（在思考、在调工具），手机又发了一条 —— 它进的是
+   * 会话的**待处理队列**，不是立刻执行。用户必须能看见"排了几条"，
+   * 并且能改、能撤（发错了、想补一句、想改个措辞都要能收回来）。
+   *
+   * 数据来源是宿主的 `sessionController.control()`：它先给一份**全量基线**
+   * （queues/jobs/projections），之后推增量帧。桥接把 queues 镜像下来，
+   * 一份用于 GET 查询，一份直接推给正在看这个会话的手机（事件名 `queue`）。
+   *
+   * 为什么不让手机自己去调 control()：那是一条长期流，手机一断线就丢状态；
+   * 而桥接本来就常驻，镜像一份最省事，也避免多个手机各拉一条流。
+   * ------------------------------------------------------------------ */
+
+  const queues = {}
+  let controlRunning = false
+  let controlRetryAt = 0
+  let controlFrames = 0
+
+  /** 队列项里真正要显示的文字（content 是 ContentBlock 数组，只取 text 块）。 */
+  function queueItemText(item) {
+    const msg = item && item.message ? item.message : {}
+    const content = Array.isArray(msg.content) ? msg.content : []
+    const parts = []
+    for (let i = 0; i < content.length; i += 1) {
+      const b = content[i]
+      if (b && b.type === 'text' && typeof b.text === 'string') parts.push(b.text)
+    }
+    return parts.join('\n')
+  }
+
+  /** 转成手机要的形状；不把宿主的活对象原样丢出去。 */
+  function queueViews(sessionId) {
+    const list = queues[sessionId]
+    if (!Array.isArray(list)) return []
+    const out = []
+    for (let i = 0; i < list.length; i += 1) {
+      const it = list[i]
+      if (!it) continue
+      out.push({
+        id: String(it.id || ''),
+        placement: typeof it.placement === 'string' ? it.placement : 'queued',
+        text: queueItemText(it),
+      })
+    }
+    return out
+  }
+
+  function notifyQueue(sessionId) {
+    if (!sessionId) return
+    sessionStreamSend(sessionId, 'queue', { items: queueViews(sessionId) })
+  }
+
+  function applyControlFrame(frame) {
+    if (!frame || typeof frame !== 'object') return
+    controlFrames += 1
+    if (frame.type === 'baseline') {
+      const value = frame.value || {}
+      const next = value.queues && typeof value.queues === 'object' ? value.queues : {}
+      const ids = Object.keys(queues)
+      for (let i = 0; i < ids.length; i += 1) delete queues[ids[i]]
+      const keys = Object.keys(next)
+      for (let i = 0; i < keys.length; i += 1) {
+        queues[keys[i]] = Array.isArray(next[keys[i]]) ? next[keys[i]] : []
+      }
+      for (let i = 0; i < keys.length; i += 1) notifyQueue(keys[i])
+      return
+    }
+    if (frame.type === 'queue') {
+      const sid = String(frame.sessionId || '')
+      if (!sid) return
+      queues[sid] = Array.isArray(frame.items) ? frame.items : []
+      notifyQueue(sid)
+    }
+  }
+
+  /**
+   * 常驻消费 control() 流。
+   *
+   * 宿主没有 setTimeout，所以重连不自己排定时器，而是挂在那条 1 秒的
+   * `every()` 上（见下面的 ensureControlStream），失败后 5 秒再试。
+   */
+  function startControlStream() {
+    if (controlRunning) return
+    if (sc === undefined || typeof sc.control !== 'function') return
+    controlRunning = true
+    const signal = makeSignal()
+    function giveUp() {
+      controlRunning = false
+      controlRetryAt = Date.now() + 5000
+    }
+    Promise.resolve()
+      .then(function () {
+        return sc.control(signal)
+      })
+      .then(
+        function (iter) {
+          const it = iter && iter[Symbol.asyncIterator] ? iter[Symbol.asyncIterator]() : iter
+          if (!it || typeof it.next !== 'function') {
+            giveUp()
+            return
+          }
+          function step() {
+            it.next().then(
+              function (r) {
+                if (r.done) {
+                  giveUp()
+                  return
+                }
+                safe(function () {
+                  applyControlFrame(r.value)
+                }, undefined)
+                step()
+              },
+              function () {
+                giveUp()
+              },
+            )
+          }
+          step()
+        },
+        function () {
+          giveUp()
+        },
+      )
+  }
+
+  function ensureControlStream() {
+    if (controlRunning) return
+    if (Date.now() < controlRetryAt) return
+    startControlStream()
+  }
+
+  /** 改/撤一条还没轮到执行的排队消息。 */
+  function doQueueUpdate(sessionId, itemId, body) {
+    if (sc === undefined || typeof sc.updateQueue !== 'function') {
+      return Promise.reject(new Error('这个 harness 版本没有 updateQueue'))
+    }
+    if (!itemId) return Promise.reject(new Error('缺少排队项 id'))
+    const kind = String((body && body.action) || '')
+    let action
+    if (kind === 'remove') {
+      action = { kind: 'remove' }
+    } else if (kind === 'steer') {
+      action = { kind: 'steer' }
+    } else if (kind === 'edit') {
+      const text = body && typeof body.text === 'string' ? body.text : ''
+      if (!text.trim()) return Promise.reject(new Error('改成空的内容没有意义'))
+      action = { kind: 'edit', content: [{ type: 'text', text: text }] }
+    } else {
+      return Promise.reject(new Error('不认识的队列操作：' + kind))
+    }
+    return Promise.resolve()
+      .then(function () {
+        return sc.updateQueue({ sessionId: sessionId, itemId: itemId, action: action })
+      })
+      .then(function (value) {
+        // 本地先乐观更新一次，界面上按钮点下去立刻有反馈；
+        // 权威值随后由 control() 推回来覆盖。
+        const list = queues[sessionId]
+        if (Array.isArray(list)) {
+          if (kind === 'remove') {
+            queues[sessionId] = list.filter(function (it) {
+              return String(it && it.id) !== itemId
+            })
+            notifyQueue(sessionId)
+          }
+        }
+        return { ok: true, accepted: !!(value && value.accepted) }
+      })
+  }
+
+  /* ------------------------------------------------------------------ *
    * 7. 路由
    * ------------------------------------------------------------------ */
 
@@ -2212,6 +2389,30 @@ export function createBridge(ctx, opts) {
         lastQuestion: lastQuestionDebug,
         stateClients: Object.keys(stateClients).length,
         terminals: termList(),
+        queue: { controlRunning: controlRunning, frames: controlFrames, sessions: Object.keys(queues).length },
+      })
+      return
+    }
+
+    // GET /phone/sessions/<id>/queue   还没轮到执行的排队消息
+    // ★ 段数按剥掉 BASE 之后算：/phone/sessions/<id>/queue → 3 段
+    if (seg.length === 3 && seg[0] === 'sessions' && seg[2] === 'queue' && req.method === 'GET') {
+      sendJson(res, 200, { ok: true, items: queueViews(seg[1]) })
+      return
+    }
+
+    // POST /phone/sessions/<id>/queue/<itemId>  { action: 'remove'|'steer'|'edit', text? }
+    if (seg.length === 4 && seg[0] === 'sessions' && seg[2] === 'queue' && req.method === 'POST') {
+      parseBody(req).then(function (body) {
+        return doQueueUpdate(seg[1], seg[3], body).then(
+          function (value) {
+            markStateDirty()
+            sendJson(res, 200, value)
+          },
+          function (err) {
+            sendJson(res, 400, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
       })
       return
     }
@@ -2583,12 +2784,17 @@ export function createBridge(ctx, opts) {
     Promise.resolve().then(backfillActivity)
   }, undefined)
 
+  // 立刻开始镜像排队消息：等那 1 秒的 tick 也行，但手机一进来就该看到队列
+  safe(startControlStream, undefined)
+
   console.log('[' + NAME + '] mounted on ' + BASE + ' (v' + VERSION + ', token=' + (TOKEN ? 'on' : 'off') + ')')
 
   return function dispose() {
     // 终端是这台电脑上的真进程：插件卸载/更新时必须全部杀掉，
     // 否则 reload 一次就在宿主里漏一堆 bash
     safe(termKillAll, undefined)
+    const qids = Object.keys(queues)
+    for (let i = 0; i < qids.length; i += 1) delete queues[qids[i]]
     const ids = Object.keys(stateClients)
     for (let i = 0; i < ids.length; i += 1) {
       try {

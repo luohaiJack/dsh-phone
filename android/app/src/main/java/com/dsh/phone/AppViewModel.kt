@@ -229,6 +229,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _doc = MutableStateFlow<DocState?>(null)
     val doc: StateFlow<DocState?> = _doc.asStateFlow()
 
+    /**
+     * 这个会话里"跑着的时候发出去、还没轮到执行"的消息。
+     *
+     * 来源两条：连上实时流时桥接先推一份全量，之后每次变动推增量；
+     * 打开会话时再主动 GET 一次兜底。
+     */
+    private val _queue = MutableStateFlow<List<QueuedMessage>>(emptyList())
+    val queue: StateFlow<List<QueuedMessage>> = _queue.asStateFlow()
+
     /** 主机侧可路由的模型目录。 */
     private val _models = MutableStateFlow(ModelCatalog.EMPTY)
     val models: StateFlow<ModelCatalog> = _models.asStateFlow()
@@ -459,6 +468,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _question.value = null
         setLiveRunning(false)
         _doc.value = null
+        _queue.value = emptyList()
         refreshUnread()
     }
 
@@ -580,6 +590,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _question.value = null
         setLiveRunning(false)
         _draft.value = settings.draft(sessionId)
+        _queue.value = emptyList()
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { resolveClient().queue(sessionId) }.onSuccess { _queue.value = it }
+        }
 
         // 同会话再来（退出看别的、又点回来）：消息与滚动位置都保留，直接接着看。
         // 换会话才重置 —— 并顺手把上次的阅读位置读回来。
@@ -689,6 +703,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 // 即时切换运行态，停止按钮据此显隐
                 setLiveRunning(data.optString("phase") == "start")
             }
+            "queue" -> {
+                _queue.value = parseQueue(data.optJSONArray("items"))
+            }
             "question" -> {
                 // harness 在等回答。只有手机开着这个会话时桥接才会把问题发过来
                 // （否则它会直接交给电脑上的 UI），所以收到就可以展示。
@@ -780,7 +797,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private var termCall: Call? = null
     private var termLoop: Job? = null
-    private var termBuf = TermBuffer()
+    private var termScreen: TermScreen? = null
     private var termRev = 0L
     private var lastTermPublish = 0L
     private var pendingTermSend: String? = null
@@ -810,12 +827,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         _term.value = TermState(opening = true)
-        termBuf = TermBuffer()
+        termScreen = null
         termRev = 0
         _termFollowTail.value = true
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { resolveClient().termOpen(cols, rows) }
                 .onSuccess { r ->
+                    // 屏幕尺寸按**电脑上实际分配到的**来：服务端会把列数夹到合法区间
+                    termScreen = TermScreen(r.cols, r.rows)
                     _term.value = TermState(
                         id = r.id,
                         pid = r.pid,
@@ -864,9 +883,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             "hello" -> {
                 // 桥接那边留着最近一段滚动缓冲：重连时以它为准重建屏幕，
                 // 这样"切走几分钟再回来"看到的是完整的，而不是从中间接上的碎片。
-                termBuf = TermBuffer()
+                val cols = data.optInt("cols", _term.value.cols).coerceAtLeast(20)
+                val rows = data.optInt("rows", _term.value.rows).coerceAtLeast(6)
+                termScreen = TermScreen(cols, rows)
                 val buffered = data.optString("buffered", "")
-                if (buffered.isNotEmpty()) termBuf.feed(buffered)
+                if (buffered.isNotEmpty()) termScreen?.feed(buffered)
                 _term.value = _term.value.copy(
                     id = data.optString("id", _term.value.id),
                     pid = data.optInt("pid", _term.value.pid),
@@ -883,7 +904,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             "out" -> {
                 val text = data.optString("data", "")
-                if (text.isNotEmpty() && termBuf.feed(text)) publishTerm()
+                val screen = termScreen
+                if (text.isNotEmpty() && screen != null) {
+                    screen.feed(text)
+                    publishTerm()
+                }
             }
             "exit" -> {
                 _term.value = _term.value.copy(
@@ -923,11 +948,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun doPublishTerm() {
+        val screen = termScreen ?: return
         termRev += 1
+        // 渲染列表 = 历史滚动 + 当前屏幕。外层列表每次新建（Compose 靠 rev 判断变化），
+        // 里面的行对象是共享的，不复制内容。
+        val combined = ArrayList<AnsiLine>(screen.scrollbackSize + screen.rows)
+        combined.addAll(screen.scrollback)
+        combined.addAll(screen.screenLines())
         _term.value = _term.value.copy(
             rev = termRev,
-            lines = termBuf.lines,
-            currentLine = termBuf.currentLine,
+            lines = combined,
+            cursorLine = screen.cursorLine(),
+            cursorCol = screen.cursorCol,
+            fullScreen = screen.usingAltScreen,
+            cols = screen.cols,
+            rows = screen.rows,
         )
     }
 
@@ -972,10 +1007,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         sendTerm(text, submit = true)
     }
 
-    /** 裸按键：Tab / 方向键 / Esc / Ctrl-D 之类，不补回车。 */
+    /**
+     * 裸按键 / 逐键直通：Tab、方向键、Esc、Ctrl-C，以及全屏程序里敲的每个字。
+     *
+     * 全屏程序（vim）会把 PTY 设成 raw 模式，这时**回车是 CR 不是 LF** ——
+     * 命令模式下发 `\n` 没问题（行规程的 ICRNL 会翻译），raw 模式下
+     * 发 `\n` 只会插一个换行符。所以这里统一翻译成 `\r`。
+     */
     fun sendTermRaw(data: String) {
         if (data.isEmpty()) return
-        sendTerm(data, submit = false)
+        sendTerm(data.replace('\n', '\r'), submit = false)
     }
 
     /** Ctrl-C：给前台进程组发 SIGINT，终端本身留着。 */
@@ -990,7 +1031,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 只清手机上的显示，不影响电脑上的终端。 */
     fun clearTerminal() {
-        termBuf.clear()
+        termScreen?.clear()
         publishTerm()
     }
 
@@ -1006,7 +1047,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching { resolveClient().termClose(id) }
             }
         }
-        termBuf.clear()
+        termScreen = null
         termRev = 0
         _term.value = TermState()
         say("终端已关闭")
@@ -1168,6 +1209,49 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { resolveClient().cancel(sessionId) }
                 .onFailure { say("打断失败：${it.message}") }
+        }
+    }
+
+    /* ------------------------- 排队消息的改/撤 ------------------------- */
+
+    /** 撤回：从队列里拿掉，不会发出去。 */
+    fun retractQueued(itemId: String) {
+        val sid = _openSessionId.value
+        if (sid.isEmpty()) return
+        // 先本地拿掉，点下去立刻有反馈；权威值随后由实时流覆盖
+        _queue.value = _queue.value.filterNot { it.id == itemId }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { resolveClient().queueAction(sid, itemId, "remove") }
+                .onFailure {
+                    say("撤回失败：${it.message}")
+                    runCatching { _queue.value = resolveClient().queue(sid) }
+                }
+        }
+    }
+
+    /** 改内容：还是排在队里，只是把要发的那句话换掉。 */
+    fun editQueued(itemId: String, text: String) {
+        val sid = _openSessionId.value
+        if (sid.isEmpty() || text.isBlank()) return
+        _queue.value = _queue.value.map { if (it.id == itemId) it.copy(text = text) else it }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { resolveClient().queueAction(sid, itemId, "edit", text) }
+                .onSuccess { say("排队消息已改（等这一轮跑完再发）") }
+                .onFailure {
+                    say("改失败：${it.message}")
+                    runCatching { _queue.value = resolveClient().queue(sid) }
+                }
+        }
+    }
+
+    /** 插话：不排队了，下一轮立刻带上它。 */
+    fun steerQueued(itemId: String) {
+        val sid = _openSessionId.value
+        if (sid.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { resolveClient().queueAction(sid, itemId, "steer") }
+                .onSuccess { say("已改成「立刻插话」") }
+                .onFailure { say("插话失败：${it.message}") }
         }
     }
 
