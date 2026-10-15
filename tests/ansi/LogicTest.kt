@@ -6,7 +6,9 @@ import com.dsh.phone.CursorKind
 import com.dsh.phone.GoalInfo
 import com.dsh.phone.HarnessState
 import com.dsh.phone.goalWorthShowing
+import com.dsh.phone.formatQueueEditDraft
 import com.dsh.phone.hookKeystrokes
+import com.dsh.phone.parseQueueEditDraft
 import com.dsh.phone.JobInfo
 import com.dsh.phone.SessionActivity
 import com.dsh.phone.SessionInfo
@@ -315,6 +317,25 @@ fun main() {
         check("Ctrl 锁存用完就消费掉", ctrl.consumeLatch)
         val ctrlLong = hookKeystrokes("abc", composing = false, ctrlLatch = true)
         check("多字符提交不消费锁存（留给下一个键）", ctrlLong.send == "abc" && !ctrlLong.consumeLatch)
+    }
+
+    /* ---------- 排队消息"改到一半"的草稿：正文能带换行 ---------- */
+
+    run {
+        val one = formatQueueEditDraft("msg-1", "改过的内容")
+        check("单行：编解码往返", parseQueueEditDraft(one) == ("msg-1" to "改过的内容"), parseQueueEditDraft(one).toString())
+
+        // ★ 关键：正文自己带换行（用户改的常常是一段多行命令）——
+        //   只能按**第一个**换行切分；按最后一个切、或者 split 全部，多行就被切坏了
+        val multi = formatQueueEditDraft("msg-2", "第一行\n第二行\n第三行")
+        val back = parseQueueEditDraft(multi)
+        check("多行正文不切坏", back == ("msg-2" to "第一行\n第二行\n第三行"), back?.second?.replace("\n", "|") ?: "null")
+        check("多行正文的行数没变", back!!.second.count { it == '\n' } == 2)
+
+        check("没有换行的脏数据 → null", parseQueueEditDraft("msg-3") == null)
+        check("空串 → null", parseQueueEditDraft("") == null)
+        check("null → null", parseQueueEditDraft(null) == null)
+        check("只有换行 → null", parseQueueEditDraft("\n正文") == null)
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

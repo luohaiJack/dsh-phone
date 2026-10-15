@@ -242,6 +242,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val loadingOlder: StateFlow<Boolean> = _loadingOlder.asStateFlow()
 
     /**
+     * 正在改的那条排队消息的草稿（itemId → 正文）。
+     *
+     * 落盘原因和聊天草稿一样：改排队消息时被返回手势/电话打断是常事，
+     * 而那段文字是刚打出来的 —— 丢了最气人。
+     */
+    private val _queueEditDraft = MutableStateFlow<Pair<String, String>?>(null)
+    val queueEditDraft: StateFlow<Pair<String, String>?> = _queueEditDraft.asStateFlow()
+
+    /**
      * 这个会话里"跑着的时候发出去、还没轮到执行"的消息。
      *
      * 来源两条：连上实时流时桥接先推一份全量，之后每次变动推增量；
@@ -508,6 +517,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _progress.value = SessionProgress()
         _hasMoreHistory.value = false
         _loadingOlder.value = false
+        _queueEditDraft.value = null
         refreshUnread()
     }
 
@@ -630,6 +640,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         setLiveRunning(false)
         _draft.value = settings.draft(sessionId)
         _progress.value = stateProgress(sessionId)
+        _queueEditDraft.value = settings.queueEditDraft(sessionId)
         _queue.value = emptyList()
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { resolveClient().queue(sessionId) }.onSuccess { _queue.value = it }
@@ -1409,6 +1420,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (sid.isEmpty()) return
         // 先本地拿掉，点下去立刻有反馈；权威值随后由实时流覆盖
         _queue.value = _queue.value.filterNot { it.id == itemId }
+        // 撤回掉的那条如果正存着草稿，草稿也一起丢（否则它指向一条不存在的消息）
+        if (_queueEditDraft.value?.first == itemId) {
+            _queueEditDraft.value = null
+            settings.clearQueueEditDraft(sid)
+        }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { resolveClient().queueAction(sid, itemId, "remove") }
                 .onFailure {
@@ -1418,6 +1434,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** 边改边存：对话框里每敲一下都落盘，意外退出也能捡回来。 */
+    fun setQueueEditDraft(itemId: String, text: String) {
+        val sid = _openSessionId.value
+        if (sid.isEmpty() || itemId.isEmpty()) return
+        _queueEditDraft.value = itemId to text
+        settings.setQueueEditDraft(sid, itemId, text)
+    }
+
+    /** 明确放弃这次修改（点「放弃」才算，返回手势不算）。 */
+    fun discardQueueEditDraft() {
+        val sid = _openSessionId.value
+        _queueEditDraft.value = null
+        if (sid.isNotEmpty()) settings.clearQueueEditDraft(sid)
+    }
+
     /** 改内容：还是排在队里，只是把要发的那句话换掉。 */
     fun editQueued(itemId: String, text: String) {
         val sid = _openSessionId.value
@@ -1425,7 +1456,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _queue.value = _queue.value.map { if (it.id == itemId) it.copy(text = text) else it }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { resolveClient().queueAction(sid, itemId, "edit", text) }
-                .onSuccess { say("排队消息已改（等这一轮跑完再发）") }
+                .onSuccess {
+                    say("排队消息已改（等这一轮跑完再发）")
+                    // 存成功了草稿就没用了
+                    _queueEditDraft.value = null
+                    settings.clearQueueEditDraft(sid)
+                }
                 .onFailure {
                     say("改失败：${it.message}")
                     runCatching { _queue.value = resolveClient().queue(sid) }

@@ -1126,6 +1126,9 @@ fun ChatScreen(
     queue: List<QueuedMessage>,
     hasMoreHistory: Boolean,
     loadingOlder: Boolean,
+    queueEditDraft: Pair<String, String>?,
+    onQueueEditChange: (String, String) -> Unit,
+    onQueueEditDiscard: () -> Unit,
     onLoadOlder: () -> Unit,
     onJumpPreviousUser: () -> Unit,
     activity: SessionActivity,
@@ -1221,7 +1224,14 @@ fun ChatScreen(
     editQueueTarget?.let { target ->
         EditQueueDialog(
             original = target.text,
+            restored = queueEditDraft?.takeIf { it.first == target.id }?.second,
+            // 返回手势/点外面：只关对话框，草稿留着
             onDismiss = { editQueueTarget = null },
+            onChange = { onQueueEditChange(target.id, it) },
+            onDiscard = {
+                onQueueEditDiscard()
+                editQueueTarget = null
+            },
             onConfirm = { text ->
                 editQueueTarget = null
                 onEditQueued(target.id, text)
@@ -1372,6 +1382,7 @@ fun ChatScreen(
             if (queue.isNotEmpty()) {
                 QueueCard(
                     items = queue,
+                    draftItemId = queueEditDraft?.first,
                     onEdit = { id, _ -> editQueueTarget = queue.firstOrNull { it.id == id } },
                     onRetract = onRetractQueued,
                     onSteer = onSteerQueued,
@@ -2018,6 +2029,8 @@ fun SettingsScreen(
 @Composable
 fun QueueCard(
     items: List<QueuedMessage>,
+    /** 有未保存修改的那一条（界面上打个标，免得用户不知道还能捡回来）。 */
+    draftItemId: String? = null,
     onEdit: (String, String) -> Unit,
     onRetract: (String) -> Unit,
     onSteer: (String) -> Unit,
@@ -2057,6 +2070,13 @@ fun QueueCard(
                         maxLines = 4,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    if (draftItemId == item.id) {
+                        Text(
+                            "● 有未保存的修改（点「改」接着写）",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         TextButton(onClick = { onEdit(item.id, item.text) }) { Text("改") }
                         TextButton(onClick = { onRetract(item.id) }) {
@@ -2076,11 +2096,16 @@ fun QueueCard(
 @Composable
 fun EditQueueDialog(
     original: String,
+    /** 上次没保存完的修改（有就恢复，并明说）。 */
+    restored: String? = null,
     onDismiss: () -> Unit,
+    onChange: (String) -> Unit = {},
+    onDiscard: () -> Unit = {},
     onConfirm: (String) -> Unit,
 ) {
-    var text by remember(original) { mutableStateOf(original) }
+    var text by remember(original, restored) { mutableStateOf(restored ?: original) }
     AlertDialog(
+        // 返回手势/点外面 = 意外：**留着草稿**，下次打开自动恢复
         onDismissRequest = onDismiss,
         title = { Text("改这条排队消息") },
         text = {
@@ -2090,10 +2115,19 @@ fun EditQueueDialog(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (restored != null && restored != original) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "已恢复上次没保存的修改（返回手势不会丢）",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = text,
-                    onValueChange = { text = it },
+                    // 每敲一下都落盘：被电话/返回手势打断也能捡回来
+                    onValueChange = { text = it; onChange(it) },
                     modifier = Modifier.fillMaxWidth(),
                     maxLines = 8,
                 )
@@ -2102,7 +2136,8 @@ fun EditQueueDialog(
         confirmButton = {
             TextButton(onClick = { onConfirm(text) }, enabled = text.isNotBlank()) { Text("保存") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+        // 「放弃」是明确表态：把草稿也删掉，免得下次又被恢复出来
+        dismissButton = { TextButton(onClick = onDiscard) { Text("放弃修改") } },
     )
 }
 

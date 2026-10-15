@@ -117,7 +117,7 @@ git ls-files | xargs grep -n "/home/\|/Users/\|\.ts\.net" 2>/dev/null
 ## 6. 提交纪律
 
 - 一个功能一个提交，message 写**为什么**，不写"update"。
-- 提交前跑 `scripts/test-offline.sh`（188 项）+ `scripts/verify.sh`（15 项）；红的不要提交。
+- 提交前跑 `scripts/test-offline.sh`（195 项）+ `scripts/verify.sh`（15 项）；红的不要提交。
 - 动过什么就写进 `CHANGELOG.md`：**最新的加在最上面**，写「为什么」不写「改了什么」。
 - 涉及 UI 的改动，用 `adb shell uiautomator dump` 把屏上的文字读出来核对，
   **不要用截图**（会把用户屏幕上的隐私内容带进上下文）。

@@ -881,3 +881,24 @@ fun goalWorthShowing(goal: GoalInfo?, now: Long, graceMs: Long = 10 * 60 * 1000L
         else -> true
     }
 }
+
+/* ---------- 排队消息"改到一半"的草稿：编码与解码 ---------- */
+
+/**
+ * 草稿存成「itemId + 换行 + 正文」。
+ *
+ * 为什么把编解码单独拎出来：**正文自己就可能带换行**（用户改的是一段多行命令），
+ * 所以只能按**第一个**换行切分 —— 按最后一个切、或者 split 全部，
+ * 多行修改就会被切坏（而且坏得很隐蔽：单行的时候完全正常）。
+ */
+fun formatQueueEditDraft(itemId: String, text: String): String = itemId + "\n" + text
+
+/** 解不出来就返回 null（宁可当没有草稿，也不要拿半截内容去覆盖用户的输入框）。 */
+fun parseQueueEditDraft(raw: String?): Pair<String, String>? {
+    if (raw.isNullOrBlank()) return null
+    val i = raw.indexOf('\n')
+    if (i <= 0) return null
+    val id = raw.substring(0, i)
+    if (id.isBlank()) return null
+    return id to raw.substring(i + 1)
+}

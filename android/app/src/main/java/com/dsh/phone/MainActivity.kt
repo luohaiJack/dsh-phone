@@ -230,6 +230,7 @@ fun AppRoot(
     val termFollowTail by vm.termFollowTail.collectAsState()
     val queue by vm.queue.collectAsState()
     val progress by vm.progress.collectAsState()
+    val queueEditDraft by vm.queueEditDraft.collectAsState()
     val hasMoreHistory by vm.hasMoreHistory.collectAsState()
     val loadingOlder by vm.loadingOlder.collectAsState()
     val liveRunning by vm.liveRunning.collectAsState()
@@ -397,6 +398,9 @@ fun AppRoot(
                 vm.setShowInjected(it)
             },
             queue = queue,
+            queueEditDraft = queueEditDraft,
+            onQueueEditChange = { id, text -> vm.setQueueEditDraft(id, text) },
+            onQueueEditDiscard = { vm.discardQueueEditDraft() },
             hasMoreHistory = hasMoreHistory,
             loadingOlder = loadingOlder,
             onLoadOlder = { vm.loadOlder() },

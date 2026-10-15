@@ -83,6 +83,29 @@ class Settings(context: Context) {
     }
 
     /**
+     * 正在改的那条排队消息（还没保存的修改）。
+     *
+     * 为什么落盘：改排队消息时被电话/返回手势打断是常事，而那段文字是用户
+     * **刚打出来的**，丢了最气人。存成「itemId + 换行 + 正文」——
+     * 一个会话同时只可能在改一条。
+     */
+    fun queueEditDraft(sessionId: String): Pair<String, String>? {
+        if (sessionId.isBlank()) return null
+        // 编解码在 Models.kt（纯函数，有单测：正文自己带换行时也不能切坏）
+        return parseQueueEditDraft(prefs.getString(QUEUE_EDIT_PREFIX + sessionId, null))
+    }
+
+    fun setQueueEditDraft(sessionId: String, itemId: String, text: String) {
+        if (sessionId.isBlank() || itemId.isBlank()) return
+        prefs.edit().putString(QUEUE_EDIT_PREFIX + sessionId, formatQueueEditDraft(itemId, text)).apply()
+    }
+
+    fun clearQueueEditDraft(sessionId: String) {
+        if (sessionId.isBlank()) return
+        prefs.edit().remove(QUEUE_EDIT_PREFIX + sessionId).apply()
+    }
+
+    /**
      * 用户手动展开（没收起）的工作区 id。
      *
      * 落盘原因：展开状态原本是聊天页列表里的 remember，一进会话就被销毁，
@@ -194,6 +217,7 @@ class Settings(context: Context) {
         /** 超过 30 天没点开过的自动忘掉。 */
         private const val RECENT_TTL_MS = 30L * 24 * 3600 * 1000
         private const val DRAFT_PREFIX = "draft_"
+        private const val QUEUE_EDIT_PREFIX = "queue_edit_"
         private const val SEEN_PREFIX = "seen_"
 
         /** 在家：USB 反向映射，手机回环就是电脑。 */
