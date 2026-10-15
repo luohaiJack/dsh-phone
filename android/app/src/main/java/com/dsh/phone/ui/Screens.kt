@@ -63,8 +63,11 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
@@ -392,6 +395,8 @@ fun SessionsScreen(
     var archiveTarget by remember { mutableStateOf<WorkspaceSession?>(null) }
     var renameWorkspaceTarget by remember { mutableStateOf<WorkspaceInfo?>(null) }
     var deleteWorkspaceTarget by remember { mutableStateOf<WorkspaceInfo?>(null) }
+    // 长按菜单里「查看 session id」的目标
+    var idTarget by remember { mutableStateOf<WorkspaceSession?>(null) }
 
     // 三个板块的分类规则（互斥，一个会话只出现在一块里）：
     //   正在工作 = 电脑上还在跑（或手机正开着且实时流说在跑）
@@ -470,6 +475,7 @@ fun SessionsScreen(
                             onRename = { menuSession = null; renameSessionTarget = sess },
                             onFork = { menuSession = null; actions.forkSession(sess.id) },
                             onArchive = { menuSession = null; archiveTarget = sess },
+                            onShowId = { menuSession = null; idTarget = sess },
                         )
                     },
                 )
@@ -504,6 +510,7 @@ fun SessionsScreen(
                             onRename = { menuSession = null; renameSessionTarget = sess },
                             onFork = { menuSession = null; actions.forkSession(sess.id) },
                             onArchive = { menuSession = null; archiveTarget = sess },
+                            onShowId = { menuSession = null; idTarget = sess },
                         )
                     },
                 )
@@ -554,6 +561,7 @@ fun SessionsScreen(
                             onRename = { menuSession = null; renameSessionTarget = sess },
                             onFork = { menuSession = null; actions.forkSession(sess.id) },
                             onArchive = { menuSession = null; archiveTarget = sess },
+                            onShowId = { menuSession = null; idTarget = sess },
                         )
                     },
                 )
@@ -668,6 +676,7 @@ fun SessionsScreen(
                                         onRename = { menuSession = null; renameSessionTarget = sess },
                                         onFork = { menuSession = null; actions.forkSession(sess.id) },
                                         onArchive = { menuSession = null; archiveTarget = sess },
+                                        onShowId = { menuSession = null; idTarget = sess },
                                     )
                                 }
                             }
@@ -691,6 +700,10 @@ fun SessionsScreen(
     }
 
     /* ------------------------------ 对话框 ------------------------------ */
+
+    idTarget?.let { target ->
+        SessionIdDialog(session = target, onDismiss = { idTarget = null })
+    }
 
     renameSessionTarget?.let { sess ->
         RenameDialog(
@@ -767,11 +780,15 @@ private fun SessionMenu(
     onRename: () -> Unit,
     onFork: () -> Unit,
     onArchive: () -> Unit,
+    onShowId: () -> Unit,
 ) {
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
         DropdownMenuItem(text = { Text("打开") }, onClick = onOpen)
         DropdownMenuItem(text = { Text("重命名") }, onClick = onRename)
         DropdownMenuItem(text = { Text("分支会话") }, onClick = onFork)
+        // session id 平时不露脸（列表里显示标题），但"要去电脑上找这个会话"时
+        // 它是唯一准确的抓手：命令行、日志、别的工具里都得用它
+        DropdownMenuItem(text = { Text("查看 session id") }, onClick = onShowId)
         HorizontalDivider()
         DropdownMenuItem(
             text = { Text("归档", color = MaterialTheme.colorScheme.error) },
@@ -1079,6 +1096,7 @@ fun DocumentScreen(
 @Composable
 fun ChatScreen(
     title: String,
+    sessionId: String = "",
     messages: List<ChatMessage>,
     streamText: String,
     streamReasoning: String,
@@ -1121,6 +1139,8 @@ fun ChatScreen(
 ) {
     var showModels by remember { mutableStateOf(false) }
     var editQueueTarget by remember { mutableStateOf<QueuedMessage?>(null) }
+    // 点标题看 session id：列表里显示的是标题，而要去电脑上找这个会话时用的是 id
+    var showSessionId by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     val visible = remember(messages, showInjected) {
@@ -1184,6 +1204,20 @@ fun ChatScreen(
             }
     }
 
+    if (showSessionId && sessionId.isNotEmpty()) {
+        SessionIdDialog(
+            session = WorkspaceSession(
+                id = sessionId,
+                title = title,
+                running = false,
+                blank = false,
+                updatedAt = 0L,
+                cwd = null,
+            ),
+            onDismiss = { showSessionId = false },
+        )
+    }
+
     editQueueTarget?.let { target ->
         EditQueueDialog(
             original = target.text,
@@ -1199,7 +1233,7 @@ fun ChatScreen(
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
+                    Column(Modifier.clickable { if (sessionId.isNotEmpty()) showSessionId = true }) {
                         Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
                             if (running) "运行中" else "空闲",
@@ -2374,4 +2408,63 @@ private fun contextColor(ratio: Float): Color = when {
     ratio >= 0.85f -> MaterialTheme.colorScheme.error
     ratio >= 0.6f -> Color(0xFFE5C07B)
     else -> MaterialTheme.colorScheme.primary
+}
+
+/**
+ * 「查看 session id」。
+ *
+ * 为什么值得给一个入口：列表上显示的是**标题**，而标题可以重名、可以随时改；
+ * session id 才是唯一准确的抓手 —— 去电脑上查日志、在命令行里 `dsh` 打开、
+ * 或者在电脑端搜索时，要的都是它。
+ *
+ * 顺带**一键复制**：这种字符串在手机上手动划选是折磨。
+ */
+@Composable
+private fun SessionIdDialog(
+    session: WorkspaceSession,
+    onDismiss: () -> Unit,
+) {
+    val clipboard = LocalClipboardManager.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("session id") },
+        text = {
+            Column {
+                Text(
+                    session.displayTitle,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(8.dp))
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        session.id,
+                        style = TextStyle(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 13.sp,
+                        ),
+                        modifier = Modifier.padding(10.dp),
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "电脑上按这个 id 可以找回这个会话（列表里显示的是标题，标题可以重名）。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                clipboard.setText(AnnotatedString(session.id))
+                onDismiss()
+            }) { Text("复制") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+    )
 }

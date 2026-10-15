@@ -364,6 +364,7 @@ fun AppRoot(
         val session = state.sessions.firstOrNull { it.id == openId }
         ChatScreen(
             title = session?.displayTitle ?: openId.take(12),
+            sessionId = openId,
             messages = messages,
             streamText = streamText,
             streamReasoning = streamReasoning,
