@@ -65,6 +65,7 @@ data class SessionInfo(
     val live: Boolean,
     val jobs: List<JobInfo>,
     val goal: GoalInfo?,
+    val progress: SessionProgress = SessionProgress(),
     val activity: ActivityInfo = ActivityInfo.NONE,
 ) {
     val displayTitle: String
@@ -106,6 +107,11 @@ data class ChatMessage(
     val titlePath: String? = null,
     /** 助手的思考过程，独立于正文 —— 电脑上是折叠区块，手机上也分开渲染。 */
     val reasoning: String? = null,
+    /** 这条消息属于第几轮第几步（仪表盘的"累计轮数"就是从这儿来的）。 */
+    val turn: Int = 0,
+    val step: Int = 0,
+    /** 这条助手回复那次请求实际用了多少输入 token（= 当时的上下文占用）。 */
+    val contextUsed: Int = 0,
     val isError: Boolean = false,
     val interrupted: Boolean = false,
     val usageIn: Int? = null,
@@ -152,6 +158,17 @@ internal fun parseJobs(arr: JSONArray?): List<JobInfo> {
     return out
 }
 
+internal fun parseProgress(o: JSONObject?): SessionProgress {
+    if (o == null || o == JSONObject.NULL) return SessionProgress()
+    return SessionProgress(
+        turn = o.optInt("turn", 0),
+        step = o.optInt("step", 0),
+        turns = o.optInt("turns", 0),
+        contextWindow = o.optInt("contextWindow", 0),
+        contextUsed = o.optInt("contextUsed", 0),
+    )
+}
+
 internal fun parseGoal(o: JSONObject?): GoalInfo? {
     if (o == null || o == JSONObject.NULL) return null
     val objective = o.optString("objective", "")
@@ -184,6 +201,7 @@ internal fun parseState(root: JSONObject): HarnessState {
                     live = o.optBoolean("live", false),
                     jobs = parseJobs(o.optJSONArray("jobs")),
                     goal = parseGoal(if (o.isNull("goal")) null else o.optJSONObject("goal")),
+                    progress = parseProgress(o.optJSONObject("progress")),
                     activity = parseActivity(o.optJSONObject("activity")),
                 )
             )
@@ -217,6 +235,9 @@ internal fun parseMessages(arr: JSONArray?): List<ChatMessage> {
                 title = o.optStringOrNull("title"),
                 titlePath = o.optStringOrNull("titlePath"),
                 reasoning = o.optStringOrNull("reasoning"),
+                turn = o.optInt("turn", 0),
+                step = o.optInt("step", 0),
+                contextUsed = usage?.optInt("input", 0) ?: 0,
                 isError = o.optBoolean("isError", false),
                 interrupted = o.optBoolean("interrupted", false),
                 usageIn = usage?.let { if (it.isNull("input")) null else it.optInt("input") },
@@ -698,4 +719,107 @@ fun sessionActivity(state: HarnessState, sessionId: String): SessionActivity {
     // 在跑的排前面，其次按最近活动
     out.sortWith(compareByDescending<SubagentInfo> { it.running }.thenByDescending { it.updatedAt })
     return SessionActivity(jobs = jobs, subagents = out)
+}
+
+/* ==================== 会话仪表盘：轮/步、目标、上下文 ==================== */
+
+/**
+ * 会话进度。
+ *
+ * 三个来源，取"最全"的合并（见 [mergeProgress]）：
+ *   1. `/phone/state` 里桥接镜像的那份 —— 冷会话也有（桥接挂载后攒的）；
+ *   2. 会话实时流推的 `progress` 事件 —— 正在看的时候最即时；
+ *   3. **历史消息自带的 turn/step/usage** —— 最可靠，
+ *      因为它读的是会话日志本身，App 重开、桥接重启都不受影响。
+ *
+ * 为什么轮号要取"累计最大值"：`turn/start` 里的 turn 是 1 起递增的，
+ * 所以历史里最大的 turn 就是"一共跑了多少轮"；而当前轮的"第几步"看 step。
+ */
+data class SessionProgress(
+    /** 当前轮（1 起；0 = 还没有过）。 */
+    val turn: Int = 0,
+    /** 当前轮里的第几步。 */
+    val step: Int = 0,
+    /** 累计轮数。 */
+    val turns: Int = 0,
+    /** 模型这次可用的上下文窗口（0 = 还不知道）。 */
+    val contextWindow: Int = 0,
+    /** 上一次请求实际用了多少输入 token。 */
+    val contextUsed: Int = 0,
+) {
+    val hasAnything: Boolean get() = turn > 0 || turns > 0 || contextUsed > 0
+
+    /** 上下文占用比例（0..1）；窗口未知时返回 null —— 不要瞎画进度条。 */
+    val contextRatio: Float?
+        get() = if (contextWindow > 0 && contextUsed > 0) {
+            (contextUsed.toFloat() / contextWindow.toFloat()).coerceIn(0f, 1f)
+        } else {
+            null
+        }
+
+    /** 一句话摘要：`第 3 轮 · 第 7 步 · 累计 12 轮`。 */
+    val text: String
+        get() = buildString {
+            if (turn > 0) append("第 ").append(turn).append(" 轮")
+            if (step > 0) {
+                if (isNotEmpty()) append(" · ")
+                append("第 ").append(step).append(" 步")
+            }
+            val total = maxOf(turns, turn)
+            if (total > 1) {
+                if (isNotEmpty()) append(" · ")
+                append("累计 ").append(total).append(" 轮")
+            }
+            if (isEmpty()) append("还没开始跑")
+        }
+}
+
+/**
+ * 合并三个来源的进度。
+ *
+ * 规则是一句话：**每个字段取"更完整"的那个**。
+ * 桥接镜像可能是刚挂载的空壳（turns=0），历史里的 turn 却是真的；
+ * 而 contextWindow 只有实时事件里才有。所以不能整体二选一，要逐字段取。
+ */
+fun mergeProgress(vararg sources: SessionProgress?): SessionProgress {
+    var turn = 0
+    var step = 0
+    var turns = 0
+    var window = 0
+    var used = 0
+    sources.forEach { p ->
+        if (p == null) return@forEach
+        if (p.turn > turn) turn = p.turn
+        if (p.step > step) step = p.step
+        if (p.turns > turns) turns = p.turns
+        if (p.contextWindow > window) window = p.contextWindow
+        if (p.contextUsed > used) used = p.contextUsed
+    }
+    return SessionProgress(turn, step, turns, window, used)
+}
+
+/**
+ * 从历史消息里读进度：**最大的 turn** 就是累计轮数，最后一条的 step 是当前步，
+ * 最后一条助手消息的 usage.input 是那次请求的上下文占用。
+ *
+ * 为什么以它为准：这些数字是会话日志里本来就有的（`assistant/message` 事件带
+ * turn/step/usage），App 重开、桥接重载都不影响 —— 而桥接自己攒的计数会丢。
+ */
+fun progressFromMessages(messages: List<ChatMessage>): SessionProgress? {
+    if (messages.isEmpty()) return null
+    var maxTurn = 0
+    var lastStep = 0
+    var lastUsed = 0
+    messages.forEach { m ->
+        if (m.turn > maxTurn) maxTurn = m.turn
+        if (m.turn >= maxTurn && m.step > 0) lastStep = m.step
+        if (m.turn >= maxTurn && m.contextUsed > 0) lastUsed = m.contextUsed
+    }
+    val cur = messages.lastOrNull { it.turn > 0 }
+    return SessionProgress(
+        turn = cur?.turn ?: maxTurn,
+        step = cur?.step ?: lastStep,
+        turns = maxTurn,
+        contextUsed = lastUsed,
+    )
 }

@@ -1,9 +1,13 @@
 import com.dsh.phone.AnsiSpan
+import com.dsh.phone.ChatMessage
+import com.dsh.phone.mergeProgress
+import com.dsh.phone.progressFromMessages
 import com.dsh.phone.CursorKind
 import com.dsh.phone.HarnessState
 import com.dsh.phone.JobInfo
 import com.dsh.phone.SessionActivity
 import com.dsh.phone.SessionInfo
+import com.dsh.phone.SessionProgress
 import com.dsh.phone.SubagentInfo
 import com.dsh.phone.TermState
 import com.dsh.phone.sessionActivity
@@ -190,6 +194,48 @@ fun main() {
         check("刚结束的还显示一会儿", fresh.worthShowing(now))
     }
 
-    println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动）：$pass 项通过，$fail 项失败 ====")
+    /* ---------- 仪表盘：进度合并、从历史推、上下文比例 ---------- */
+
+    run {
+        // 桥接刚重载 → 它的镜像可能是空壳；历史里的轮号是真的；窗口只有实时事件才有
+        val fromBridge = SessionProgress(turn = 1, step = 1, turns = 1, contextUsed = 144)
+        val fromHistory = SessionProgress(turn = 42, step = 3, turns = 42, contextUsed = 90000)
+        val fromLive = SessionProgress(contextWindow = 1_000_000)
+        val m = mergeProgress(fromBridge, fromHistory, fromLive)
+        check("逐字段取最全（不是整体覆盖）", m.turn == 42 && m.step == 3 && m.turns == 42, m.toString())
+        check("窗口从实时那份来", m.contextWindow == 1_000_000)
+        check("用量取更大的那个", m.contextUsed == 90000, m.contextUsed.toString())
+        check("空输入不炸", mergeProgress(null, null) == SessionProgress())
+        // 只有"窗口大小"没有意义：那种情况下仪表盘没什么可说的，不该占一行
+        check("只知道窗口不算有内容", !mergeProgress(fromLive).hasAnything)
+
+        // 历史推进度：最大 turn = 累计轮数
+        val msgs = listOf(
+            ChatMessage(1, 0, "user", "a", turn = 1),
+            ChatMessage(2, 0, "assistant", "b", turn = 1, step = 3, contextUsed = 5000),
+            ChatMessage(3, 0, "user", "c", turn = 2),
+            ChatMessage(4, 0, "assistant", "d", turn = 2, step = 2, contextUsed = 8000),
+        )
+        val hp = progressFromMessages(msgs)!!
+        check("累计轮数 = 最大 turn", hp.turns == 2 && hp.turn == 2, hp.toString())
+        check("当前步取最新那条", hp.step == 2, hp.step.toString())
+        check("上下文用量取最新那次", hp.contextUsed == 8000, hp.contextUsed.toString())
+        check("空历史返回 null", progressFromMessages(emptyList()) == null)
+        check("没有 turn 的消息不瞎算", progressFromMessages(listOf(ChatMessage(1, 0L, "user", "x")))!!.turns == 0)
+
+        // 上下文比例：窗口未知就不给比例（宁可只显示数字，也不画瞎猜的进度条）
+        check("知道窗口才算比例", SessionProgress(contextUsed = 250_000, contextWindow = 1_000_000).contextRatio == 0.25f)
+        check("窗口未知 → null", SessionProgress(contextUsed = 250_000).contextRatio == null)
+        check("超了也不超过 1", SessionProgress(contextUsed = 9_000_000, contextWindow = 1_000_000).contextRatio == 1f)
+
+        // 文案
+        check("文案：轮+步+累计",
+            SessionProgress(turn = 3, step = 7, turns = 12).text == "第 3 轮 · 第 7 步 · 累计 12 轮",
+            SessionProgress(turn = 3, step = 7, turns = 12).text)
+        check("第一轮不写累计", SessionProgress(turn = 1, step = 1, turns = 1).text == "第 1 轮 · 第 1 步")
+        check("啥都没有时说清楚", SessionProgress().text == "还没开始跑")
+    }
+
+    println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")
     if (fail > 0) throw RuntimeException("有失败项")
 }

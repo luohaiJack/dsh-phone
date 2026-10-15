@@ -238,6 +238,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _queue = MutableStateFlow<List<QueuedMessage>>(emptyList())
     val queue: StateFlow<List<QueuedMessage>> = _queue.asStateFlow()
 
+    /**
+     * 当前会话的仪表盘进度（轮/步、上下文窗口与占用）。
+     *
+     * 三个来源合并（见 [mergeProgress]）：state 里桥接镜像的那份、实时流推的、
+     * 以及历史消息自带的 turn/usage。取最全的那份，而不是"后者覆盖前者" ——
+     * 桥接刚重载时它的镜像可能是空的，而历史里的轮号是真的。
+     */
+    private val _progress = MutableStateFlow(SessionProgress())
+    val progress: StateFlow<SessionProgress> = _progress.asStateFlow()
+
     /** 主机侧可路由的模型目录。 */
     private val _models = MutableStateFlow(ModelCatalog.EMPTY)
     val models: StateFlow<ModelCatalog> = _models.asStateFlow()
@@ -336,6 +346,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         _unread.value = out
+        refreshProgress()
     }
 
     /** 打开一个会话时记一笔（工作区树、未读卡片、通知点进来都走 openSession）。 */
@@ -359,6 +370,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (_recentAt.value.keys.all { existing.contains(it) }) return
         settings.pruneRecent(existing)
         _recentAt.value = settings.recentOpenedAt()
+    }
+
+    /** 从整机快照里取某个会话的进度（桥接镜像的那份）。 */
+    private fun stateProgress(sessionId: String): SessionProgress {
+        if (sessionId.isEmpty()) return SessionProgress()
+        return _state.value.sessions.firstOrNull { it.id == sessionId }?.progress ?: SessionProgress()
+    }
+
+    /** 每次状态刷新时把当前会话的进度补进来。 */
+    private fun refreshProgress() {
+        val sid = _openSessionId.value
+        if (sid.isEmpty()) return
+        _progress.value = mergeProgress(_progress.value, stateProgress(sid))
     }
 
     /** 从已知表 / 状态 / 工作区里找某个会话的 activity。 */
@@ -469,6 +493,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         setLiveRunning(false)
         _doc.value = null
         _queue.value = emptyList()
+        _progress.value = SessionProgress()
         refreshUnread()
     }
 
@@ -590,6 +615,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _question.value = null
         setLiveRunning(false)
         _draft.value = settings.draft(sessionId)
+        _progress.value = stateProgress(sessionId)
         _queue.value = emptyList()
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { resolveClient().queue(sessionId) }.onSuccess { _queue.value = it }
@@ -620,6 +646,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 .onSuccess { msgs ->
                     _messages.value = msgs
                     _chatError.value = null
+                    // 历史里的轮/步/用量最可靠（读的就是会话日志），拿来校正仪表盘
+                    val fromHistory = progressFromMessages(msgs)
+                    if (fromHistory != null) {
+                        _progress.value = mergeProgress(_progress.value, fromHistory)
+                    }
                     // 必须等消息到位再滚：列表还空着时滚，索引会被夹到 0，位置就丢了
                     pendingScrollRestore?.let { r ->
                         pendingScrollRestore = null
@@ -702,6 +733,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             "turn" -> {
                 // 即时切换运行态，停止按钮据此显隐
                 setLiveRunning(data.optString("phase") == "start")
+            }
+            "progress" -> {
+                _progress.value = mergeProgress(_progress.value, parseProgress(data))
             }
             "queue" -> {
                 _queue.value = parseQueue(data.optJSONArray("items"))
@@ -1099,6 +1133,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 .onSuccess {
                     _state.value = it
                     refreshUnread()
+                    refreshProgress()
                 }
         }
     }

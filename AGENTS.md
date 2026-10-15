@@ -102,15 +102,18 @@ git ls-files | xargs grep -n "/home/\|/Users/\|\.ts\.net" 2>/dev/null
    同步更新 README 的接口表，并往 `tests/bridge/routes-harness.mjs` 里加一行 ——
    出过一次事故：App 调 `/phone/model`、桥接实现的是 `/phone/models`，
    两边各自看着都对，切模型就一直是 404。
-4. 任何"主机上的副作用"（PTY、监听、临时文件）都要在插件卸载时清理干净：
+4. 进度/未读这类"按会话累计"的东西，**别只依赖根监听器** ——
+   实测 `session/event` 只覆盖一部分会话（桥接自己 create 的会话到不了根），
+   而单会话的 `follow()` 流对任何会话都成立。`diag` 里的事件类型直方图就是查这个的。
+5. 任何"主机上的副作用"（PTY、监听、临时文件）都要在插件卸载时清理干净：
    见 `bridge-core.js` 里的 `dispose()`。
-5. 前端/手机的滚动与跟随逻辑动之前先看 `docs/技术路线.md` §22/§23/§25.5 ——
+6. 前端/手机的滚动与跟随逻辑动之前先看 `docs/技术路线.md` §22/§23/§25.5 ——
    同一个坑踩过三次（"布局在动"和"人在动"分不清）。
 
 ## 6. 提交纪律
 
 - 一个功能一个提交，message 写**为什么**，不写"update"。
-- 提交前跑 `scripts/test-offline.sh`（145 项）+ `scripts/verify.sh`（15 项）；红的不要提交。
+- 提交前跑 `scripts/test-offline.sh`（161 项）+ `scripts/verify.sh`（15 项）；红的不要提交。
 - 动过什么就写进 `CHANGELOG.md`：**最新的加在最上面**，写「为什么」不写「改了什么」。
 - 涉及 UI 的改动，用 `adb shell uiautomator dump` 把屏上的文字读出来核对，
   **不要用截图**（会把用户屏幕上的隐私内容带进上下文）。

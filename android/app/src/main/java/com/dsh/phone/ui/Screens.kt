@@ -77,6 +77,8 @@ import com.dsh.phone.ConnPhase
 import com.dsh.phone.ConnStatus
 import com.dsh.phone.DirListing
 import com.dsh.phone.DocState
+import com.dsh.phone.GoalInfo
+import com.dsh.phone.SessionProgress
 import com.dsh.phone.PendingQuestion
 import com.dsh.phone.SessionActivity
 import com.dsh.phone.QueuedMessage
@@ -1104,6 +1106,8 @@ fun ChatScreen(
     onToggleInjected: (Boolean) -> Unit,
     queue: List<QueuedMessage>,
     activity: SessionActivity,
+    progress: SessionProgress,
+    goal: GoalInfo?,
     onOpenSession: (String) -> Unit,
     onEditQueued: (String, String) -> Unit,
     onRetractQueued: (String) -> Unit,
@@ -1211,6 +1215,9 @@ fun ChatScreen(
         },
     ) { inner ->
         Column(Modifier.fillMaxSize().padding(inner)) {
+            // 仪表盘：轮/步 + 目标（有才显示）+ 上下文进度
+            SessionDashboard(progress = progress, goal = goal)
+
             // 掉线横幅：USB 通道（adb reverse）会因拔插线/系统重协商而失效，
             // 这时聊天页如果只是空白，用户无法区分"没有消息"和"没连上"。
             val warn = chatError
@@ -2153,4 +2160,146 @@ fun ActivityCard(
             }
         }
     }
+}
+
+/* ============================ 会话仪表盘 ============================ */
+
+/** 目标的阶段 → 中文（认不出来就原样显示，别装作懂）。 */
+private fun goalPhaseText(phase: String): String = when (phase) {
+    "active" -> "进行中"
+    "blocked" -> "受阻"
+    "paused" -> "已暂停"
+    "complete", "completed" -> "已完成"
+    else -> phase.ifBlank { "—" }
+}
+
+/**
+ * 聊天页顶上那条仪表盘：跑到第几轮第几步、上下文用了多少、有没有目标在推进。
+ *
+ * 为什么放在聊天页最上面而不是塞进消息流：这些是**随时要瞄一眼**的状态，
+ * 不是历史。收在一条窄条里，点开才展开细节 —— 不抢聊天的地方。
+ *
+ * 目标**有才显示**（用户明确要求）：没有目标的时候不该出现一行"无目标"。
+ */
+@Composable
+fun SessionDashboard(
+    progress: SessionProgress,
+    goal: GoalInfo?,
+    fullScreen: Boolean = false,
+) {
+    if (!progress.hasAnything && goal == null) return
+    var expanded by remember { mutableStateOf(false) }
+    val ratio = progress.contextRatio
+
+    Surface(
+        modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded },
+        color = MaterialTheme.colorScheme.surfaceVariant,
+    ) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("🔄", style = MaterialTheme.typography.labelMedium)
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    progress.text,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (goal != null) {
+                    val blocked = goal.phase == "blocked"
+                    Text(
+                        "🎯 " + goalPhaseText(goal.phase) +
+                            if (goal.maxGoalRounds != null && goal.maxGoalRounds > 0) {
+                                " ${goal.roundsStarted}/${goal.maxGoalRounds}"
+                            } else if (goal.roundsStarted > 0) {
+                                " ${goal.roundsStarted} 轮"
+                            } else {
+                                ""
+                            },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (blocked) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
+                if (ratio != null) {
+                    // 刚开场时是 0.02%，写"0%"会让人以为没在统计 —— 小于 1% 就写 <1%
+                    val pct = (ratio * 100).toInt()
+                    Text(
+                        "📊 " + if (pct <= 0 && ratio > 0f) "<1%" else "$pct%",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = contextColor(ratio),
+                    )
+                }
+            }
+
+            // 上下文进度条：只在**知道窗口**的时候画 —— 不知道就只显示数字，
+            // 画一根瞎猜的条比不画更糟
+            if (ratio != null) {
+                Spacer(Modifier.height(4.dp))
+                LinearProgressIndicator(
+                    progress = { ratio },
+                    modifier = Modifier.fillMaxWidth().height(4.dp),
+                    color = contextColor(ratio),
+                    trackColor = MaterialTheme.colorScheme.surface,
+                )
+            }
+
+            if (expanded) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    buildString {
+                        append("当前：第 ").append(progress.turn).append(" 轮")
+                        if (progress.step > 0) append("，第 ").append(progress.step).append(" 步")
+                        append("（累计 ").append(maxOf(progress.turns, progress.turn)).append(" 轮）")
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (progress.contextUsed > 0) {
+                    Text(
+                        if (progress.contextWindow > 0) {
+                            "上下文：${progress.contextUsed} / ${progress.contextWindow} tokens"
+                        } else {
+                            "上下文：已用 ${progress.contextUsed} tokens（窗口大小未知）"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                goal?.let { g ->
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "🎯 目标（${goalPhaseText(g.phase)}）",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (g.phase == "blocked") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                    )
+                    Text(
+                        g.objective,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = if (expanded) 8 else 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (g.phase == "blocked" && !g.blockedReason.isNullOrBlank()) {
+                        Text(
+                            "受阻原因：" + g.blockedReason,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 上下文占用越高越显眼：过半转黄、八成转红。 */
+@Composable
+private fun contextColor(ratio: Float): Color = when {
+    ratio >= 0.85f -> MaterialTheme.colorScheme.error
+    ratio >= 0.6f -> Color(0xFFE5C07B)
+    else -> MaterialTheme.colorScheme.primary
 }

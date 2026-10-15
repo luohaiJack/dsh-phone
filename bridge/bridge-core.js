@@ -386,6 +386,9 @@ export function createBridge(ctx, opts) {
             parent: it.parentSessionId !== undefined && it.parentSessionId !== null ? String(it.parentSessionId) : null,
             live: !!liveSession,
             activity: activityOf(id),
+            // 进度（轮/步/上下文）—— 和 workspaces 那份是**同一份镜像**，
+            // 只是两处都要带上：手机既看 state 也看工作区树
+            progress: progressView(id),
             model: projectionModel(it),
             workspaceId: it.cwd && wsByPath[String(it.cwd)] ? wsByPath[String(it.cwd)] : null,
             jobs: owned,
@@ -510,6 +513,10 @@ export function createBridge(ctx, opts) {
           seq: seq,
           time: time,
           role: 'assistant',
+          // turn/step 一定要带上：手机端"累计跑了多少轮"就是取历史里最大的 turn ——
+          // 这比桥接自己攒的计数可靠（桥接重载、App 重开都不影响）
+          turn: typeof data.turn === 'number' ? data.turn : 0,
+          step: typeof data.step === 'number' ? data.step : 0,
           text: clip(parts.text, 12000),
           reasoning: parts.reasoning ? clip(parts.reasoning, 8000) : null,
           interrupted: data.interrupted === true,
@@ -612,17 +619,98 @@ export function createBridge(ctx, opts) {
     return activity[sid]
   }
 
+  /* ------------------------------------------------------------------ *
+   * 5bis. 会话进度：跑到第几轮第几步、上下文用了多少
+   *
+   * 数据全在会话事件里，不用额外接口：
+   *   turn/start       → 轮号（轮号是 1 起递增的，所以最大值 = 累计轮数）
+   *   step/start       → 步号
+   *   assistant/message→ 这一轮这一轮的 usage.inputTokens（上一次请求实际塞了多少上下文）
+   *   request/context  → contextWindow（模型这次可用的上下文窗口）
+   *
+   * 手机端只在自己开着的会话上收实时事件，冷会话看不到 ——
+   * 所以桥接**镜像一份**放进 /phone/state，任何会话都能显示。
+   * 这份镜像从桥接挂载时开始攒；历史里的轮号另有来源（消息自带 turn）。
+   * ------------------------------------------------------------------ */
+
+  const progress = {}
+  const eventTypeCounts = {}
+
+  function progOf(sid) {
+    if (!progress[sid]) {
+      progress[sid] = {
+        turn: 0,
+        step: 0,
+        turns: 0,
+        contextWindow: 0,
+        contextUsed: 0,
+        provider: '',
+        model: '',
+      }
+    }
+    return progress[sid]
+  }
+
+  function progressView(sid) {
+    const p = progress[sid]
+    if (!p) return null
+    return {
+      turn: p.turn,
+      step: p.step,
+      turns: p.turns,
+      contextWindow: p.contextWindow,
+      contextUsed: p.contextUsed,
+      provider: p.provider,
+      model: p.model,
+    }
+  }
+
   function trackEvent(sid, event) {
     if (!sid || !event || typeof event.type !== 'string') return
+    eventTypeCounts[event.type] = (eventTypeCounts[event.type] || 0) + 1
     const a = actOf(sid)
     const seq = typeof event.seq === 'number' ? event.seq : 0
     if (seq > a.lastSeq) a.lastSeq = seq
     const t = typeof event.time === 'number' ? event.time : Date.now()
     if (event.type === 'assistant/message') {
+      const p = progOf(sid)
+      const d = event.data || {}
+      if (typeof d.turn === 'number' && d.turn > 0) {
+        p.turn = d.turn
+        if (d.turn > p.turns) p.turns = d.turn
+      }
+      if (typeof d.step === 'number' && d.step > 0) p.step = d.step
+      if (d.usage && typeof d.usage === 'object' && typeof d.usage.inputTokens === 'number') {
+        p.contextUsed = d.usage.inputTokens
+      }
       if (seq >= a.lastReplySeq) {
         a.lastReplySeq = seq
         a.lastReplyAt = t
       }
+    } else if (event.type === 'turn/start') {
+      const p = progOf(sid)
+      const t = typeof event.data?.turn === 'number' ? event.data.turn : 0
+      if (t > 0) {
+        p.turn = t
+        if (t > p.turns) p.turns = t
+        p.step = 0
+      }
+    } else if (event.type === 'step/start') {
+      const p = progOf(sid)
+      const st = typeof event.data?.step === 'number' ? event.data.step : 0
+      const t = typeof event.data?.turn === 'number' ? event.data.turn : 0
+      if (st > 0) p.step = st
+      if (t > 0) {
+        p.turn = t
+        if (t > p.turns) p.turns = t
+      }
+    } else if (event.type === 'request/context') {
+      const p = progOf(sid)
+      const d = event.data || {}
+      lastContextEventDebug = { at: Date.now(), keys: Object.keys(d).join(','), contextWindow: d.contextWindow }
+      if (typeof d.contextWindow === 'number' && d.contextWindow > 0) p.contextWindow = d.contextWindow
+      if (typeof d.provider === 'string') p.provider = d.provider
+      if (typeof d.model === 'string') p.model = d.model
     } else if (event.type === 'user/message') {
       const kind = safe(function () {
         const d = event.data || {}
@@ -736,6 +824,7 @@ export function createBridge(ctx, opts) {
   let lastQuestionDebug = null
   let sessionEventCount = 0
   let lastSessionEventDebug = null
+  let lastContextEventDebug = null
 
   /**
    * 「手机正在看这个会话」= 最近一次心跳足够新。
@@ -1119,9 +1208,21 @@ export function createBridge(ctx, opts) {
               }
             } else if (frame && frame.type === 'event') {
               const ev = frame.event || {}
+              // ★ 进度也从这里记：根监听器（session/event）实测只覆盖**一部分**会话 ——
+              //   从 bridge 自己 create 出来的会话，它的事件到不了根。
+              //   而这条 follow 流对**任何**会话都成立（聊天页本来就是靠它渲染的），
+              //   所以"手机在看哪个会话，那个会话的进度就一定记得上"。
+              safe(function () {
+                trackEvent(sessionId, ev)
+              }, undefined)
               if (ev.type === 'user/message' || ev.type === 'assistant/message' || ev.type === 'tool/call' || ev.type === 'tool/result') {
                 sseSend(res, 'messages', { messages: deriveMessages([frame]) })
                 markStateDirty()
+              } else if (ev.type === 'request/context' || ev.type === 'turn/start' || ev.type === 'step/start') {
+                sseSend(res, 'progress', progressView(sessionId) || {})
+                if (ev.type === 'turn/start' || ev.type === 'turn/end') {
+                  sseSend(res, 'turn', { phase: ev.type === 'turn/start' ? 'start' : 'end', turn: ev.data?.turn })
+                }
               } else if (ev.type === 'turn/start' || ev.type === 'turn/end') {
                 // 转播出去：App 靠它即时切换"停止按钮"的显隐，
                 // 不用等 5 秒一次的状态轮询（那会让按钮该出的时候不出）
@@ -1536,6 +1637,7 @@ export function createBridge(ctx, opts) {
             blank: !!(summary && summary.blank),
             updatedAt: summary && typeof summary.updatedAt === 'number' ? summary.updatedAt : 0,
             activity: activityOf(sid),
+            progress: progressView(sid),
             cwd: summary && typeof summary.cwd === 'string' ? summary.cwd : String(w.path),
           })
         }
@@ -2390,6 +2492,13 @@ export function createBridge(ctx, opts) {
         stateClients: Object.keys(stateClients).length,
         terminals: termList(),
         queue: { controlRunning: controlRunning, frames: controlFrames, sessions: Object.keys(queues).length },
+        progress: {
+          sessions: Object.keys(progress).length,
+          // 事件类型直方图：排查"某个事件到底有没有到桥接"时最有用 ——
+          // 实测根监听器只覆盖一部分会话，这份计数一眼就能看出来
+          eventTypes: eventTypeCounts,
+          lastContextEvent: lastContextEventDebug,
+        },
       })
       return
     }
@@ -2800,6 +2909,8 @@ export function createBridge(ctx, opts) {
     safe(termKillAll, undefined)
     const qids = Object.keys(queues)
     for (let i = 0; i < qids.length; i += 1) delete queues[qids[i]]
+    const pids = Object.keys(progress)
+    for (let i = 0; i < pids.length; i += 1) delete progress[pids[i]]
     const ids = Object.keys(stateClients)
     for (let i = 0; i < ids.length; i += 1) {
       try {
