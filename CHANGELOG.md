@@ -26,6 +26,21 @@
 - `diag` 新增 `lastQuestion.streamClients`（推的时候到底有没有人在听）与
   `settledReason`/`settledAgeMs`，下次再出这类问题一眼能看出原因。
 
+### 部署：桥接改成 profile bundle（"连不上"出现了两次的真正原因）
+- 用户第二次报连不上。本机回环 `/phone/health` 都是 **404** —— 不是网络问题，
+  是桥接**根本没挂载**：`dsh web` 在 23:29 重启过一次，而桥接一直是「动态插件」，
+  定义只存在进程内存里（`~/.dsh` 下搜不到任何持久化存储），重启即消失。
+- **"出现过两次"就是这么来的**：只要 harness 重启一次（更新、改配置、手滑），
+  手机端就断一次 —— 而现场看起来像"小程序 bug"。
+- 现在把 `dsh-phone-bridge` 登记进 web profile 的 `dependencies` 与
+  `dsh.profile.bundles`，`node_modules` 里放符号链接指向本仓库 `bridge/`
+  （不跑 pnpm，避免重写 node_modules 打扰正在跑的进程）。**它随 harness 常驻。**
+- 实测改完**当场热挂上**：`/phone/health` 立刻 200，手机马上连回来
+  （当时数据线是拔的 → 只能走 tailnet，`stateClients: 1`），不需要重启。
+- AGENTS 里写下了排查口径：本机回环 **404 = 桥接没挂载**（部署问题），
+  **超时 = 网络/tailnet 问题**；拔线时看 `tailscale serve status` 与
+  `/phone/diag` 的 `stateClients`。
+
 验证：新增 `tests/bridge/question-harness.mjs`（24 项），假宿主按真实契约接管
 `userQuestions.ask`，真的验"扣住 / 交还 / 回答"三条路径。
 **反向验证**：改动前跑同一份用例 → 15 项红。离线合计 8 组 266 项全过。
