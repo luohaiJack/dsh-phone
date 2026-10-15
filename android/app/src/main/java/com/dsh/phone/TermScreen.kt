@@ -690,3 +690,59 @@ class TermScreen(val cols: Int, val rows: Int, private val scrollbackMax: Int = 
         }
     }
 }
+
+/**
+ * 渲染一行时要画的格子：字符 + 它落在第几列 + 样式 + 是不是光标那一格。
+ *
+ * 单独拎出来是为了**能测**：光标位置算错（尤其行内有中文时，
+ * 一个汉字占两列、列号和字符数不是一回事）只有真跑一遍才知道，
+ * 靠肉眼看屏幕很难发现偏了一格。
+ */
+class RenderCell(val ch: Char, val col: Int, val style: AnsiSpan, val onCursor: Boolean)
+
+/**
+ * 把一行拆成"带列号的格子"，并按 [cursorCol] 标出光标那一格。
+ *
+ * 光标停在行尾之后是常态（提示符后面、vim 的行尾），这时要先补空格再放光标块。
+ */
+fun renderCells(line: AnsiLine, cursorCol: Int?): List<RenderCell> {
+    val out = ArrayList<RenderCell>(64)
+    var col = 0
+    for (span in line) {
+        for (ch in span.text) {
+            val w = AnsiPalette.charWidth(ch)
+            val on = cursorCol != null && cursorCol >= col && cursorCol < col + w
+            out.add(RenderCell(ch, col, span, on))
+            col += w
+        }
+    }
+    if (cursorCol != null) {
+        var padded = col
+        while (padded < cursorCol) {
+            out.add(RenderCell(' ', padded, DEFAULT_STYLE, false))
+            padded += 1
+        }
+        if (out.none { it.onCursor }) {
+            out.add(RenderCell(' ', cursorCol, DEFAULT_STYLE, true))
+        }
+    }
+    return out
+}
+
+/** 光标该画成什么样。 */
+enum class CursorKind { NONE, SOLID, DIM }
+
+/**
+ * 这一行该不该画光标、画实心还是淡的。
+ *
+ * - 终端说"光标可见" → 实心块（正常情况，vim 编辑时就是它）；
+ * - 终端说"隐藏" → 通常意味着程序正在重绘（vim 执行命令时会 `?25l`），
+ *   命令行模式下不画（免得干扰）；但**全屏程序里仍然画一个淡的** ——
+ *   否则用户会看到"vim 里没有光标"，然后盲操作。这是实测踩到的坑（见 §30）。
+ */
+fun cursorKind(index: Int, cursorLine: Int?, fullScreen: Boolean, visible: Boolean): CursorKind = when {
+    cursorLine == null || index != cursorLine -> CursorKind.NONE
+    visible -> CursorKind.SOLID
+    fullScreen -> CursorKind.DIM
+    else -> CursorKind.NONE
+}

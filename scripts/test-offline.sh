@@ -62,7 +62,7 @@ else
     fail=$((fail + 1))
   fi
 
-  # 终端状态文案：要连 Models.kt 一起编（TermState 在那儿），
+  # 终端状态文案 + 光标格子：要连 Models.kt 一起编（TermState 在那儿），
   # 它引用了 org.json，所以拿 android.jar 当编译期 classpath
   ANDROID_JAR="$(ls "$HOME"/android-sdk/platforms/*/android.jar 2>/dev/null | tail -1)"
   if [ -n "$ANDROID_JAR" ]; then
@@ -70,9 +70,9 @@ else
     java -cp "$KC:$STDLIB:$COROUTINES:$DAEMON:$ANNOT" \
       org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
       -classpath "$STDLIB:$ANDROID_JAR" \
-      "$SRC/Ansi.kt" "$SRC/TermScreen.kt" "$SRC/Models.kt" "$ROOT/tests/ansi/StateTest.kt" -d "$OUT2" -nowarn 2>&1 \
+      "$SRC/Ansi.kt" "$SRC/TermScreen.kt" "$SRC/Models.kt" "$ROOT/tests/ansi/LogicTest.kt" -d "$OUT2" -nowarn 2>&1 \
       | grep -E "error:|exception" || true
-    if java -cp "$OUT2:$STDLIB:$ANDROID_JAR" StateTestKt; then
+    if java -cp "$OUT2:$STDLIB:$ANDROID_JAR" LogicTestKt; then
       pass=$((pass + 1))
     else
       fail=$((fail + 1))

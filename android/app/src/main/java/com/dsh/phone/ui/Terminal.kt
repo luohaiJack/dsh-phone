@@ -66,12 +66,19 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dsh.phone.AnsiLine
+import com.dsh.phone.AnsiSpan
+import com.dsh.phone.CursorKind
+import com.dsh.phone.cursorKind
+import com.dsh.phone.renderCells
 import com.dsh.phone.TermState
 import com.dsh.phone.shortPath
 
 /** 终端底色固定用深色：ANSI 的 16 色是按深底配的，跟着系统主题走会读不清。 */
 private val TermBg = Color(0xFF10131A)
 private val TermFg = Color(0xFFD7DAE0)
+
+/** 光标块的颜色：亮一档，在深底上任何时候都看得见。 */
+private val TermCursor = Color(0xFFE8ECF2)
 
 /** 一行等宽字体的样式（列宽测量也必须用同一份）。 */
 private val TermTextStyle = TextStyle(
@@ -253,7 +260,16 @@ fun TerminalScreen(
                         state = listState,
                         modifier = Modifier.fillMaxSize().padding(6.dp),
                     ) {
-                        items(term.lines.size) { i -> TermLine(term.lines[i]) }
+                        // 光标那一行要把列号传下去 —— 不然 vim 里根本看不出光标在哪
+                        val cursorRow = term.cursorLine
+                        items(term.lines.size) { i ->
+                            val kind = cursorKind(i, cursorRow, term.fullScreen, term.cursorVisible)
+                            TermLine(
+                                line = term.lines[i],
+                                cursorCol = if (kind == CursorKind.NONE) null else term.cursorCol,
+                                dimCursor = kind == CursorKind.DIM,
+                            )
+                        }
                     }
                 }
 
@@ -448,23 +464,49 @@ private fun KeyChip(label: String, onClick: () -> Unit) {
     }
 }
 
-/** 把一行 AnsiSpan 画成等宽文本。 */
 @Composable
-private fun TermLine(line: AnsiLine) {
-    if (line.isEmpty()) {
+private fun spanStyle(span: AnsiSpan, cursor: Boolean = false, dimCursor: Boolean = false): SpanStyle = when {
+    // 光标 = 反显块：底色用前景色，字色用终端底色
+    cursor -> SpanStyle(color = TermBg, background = TermCursor)
+    // 全屏程序报告"隐藏光标"时的位置提示：描个边，不抢注意力
+    dimCursor -> SpanStyle(
+        color = span.fg?.let { Color(it) } ?: TermFg,
+        background = TermBg,
+        textDecoration = TextDecoration.Underline,
+    )
+    else -> SpanStyle(
+        color = span.fg?.let { Color(it) } ?: TermFg,
+        background = span.bg?.let { Color(it) } ?: Color.Unspecified,
+        fontWeight = if (span.bold) FontWeight.Bold else null,
+        textDecoration = if (span.underline) TextDecoration.Underline else null,
+    )
+}
+
+/**
+ * 把一行 AnsiSpan 画成等宽文本，并在 [cursorCol] 那一格画光标块。
+ *
+ * 光标为什么必须画：vim 全靠它 —— 没有光标块，"我在第几个字"、"按 i 会插到哪"
+ * 全都看不出来，编辑就成了盲操作。位置由屏幕模型给（[TermState.cursorLine] /
+ * [TermState.cursorCol]），不是猜的。
+ *
+ * 注意**列 ≠ 字符数**：一个汉字占两列。所以先把这一行摊成"带起始列的格子"，
+ * 再按列找光标那一格，否则行内有中文时光标会偏。
+ */
+@Composable
+private fun TermLine(line: AnsiLine, cursorCol: Int?, dimCursor: Boolean = false) {
+    if (line.isEmpty() && cursorCol == null) {
         // 空行也要占一行的高度，否则整屏行号会错位
         Text(" ", style = TermTextStyle, modifier = Modifier.fillMaxWidth())
         return
     }
+
+    // 格子与"哪一格是光标"由 TermScreen.kt 里的 renderCells() 算 —— 那是纯逻辑，
+    // 有单元测试盯着（含中文的列号换算），这里只负责画。
+    val cells = renderCells(line, cursorCol)
+
     val text = buildAnnotatedString {
-        line.forEach { span ->
-            val style = SpanStyle(
-                color = span.fg?.let { Color(it) } ?: TermFg,
-                background = span.bg?.let { Color(it) } ?: Color.Unspecified,
-                fontWeight = if (span.bold) FontWeight.Bold else null,
-                textDecoration = if (span.underline) TextDecoration.Underline else null,
-            )
-            withStyle(style) { append(span.text) }
+        cells.forEach { c ->
+            withStyle(spanStyle(c.style, c.onCursor, dimCursor && c.onCursor)) { append(c.ch) }
         }
     }
     // ★ 不能软换行：PTY 的列数是按屏幕宽度算好的，一行本来就该放得下。

@@ -978,7 +978,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _term.value = _term.value.copy(
             rev = termRev,
             lines = combined,
-            cursorLine = screen.cursorLine(),
+            // 全屏程序即使隐藏光标也给出行号：界面要画一个淡的提示，
+            // 否则"vim 里看不见光标"就变成盲操作
+            cursorLine = screen.cursorLine()
+                ?: if (screen.usingAltScreen) screen.scrollbackSize + screen.cursorRow else null,
+            cursorVisible = screen.cursorVisible,
             cursorCol = screen.cursorCol,
             fullScreen = screen.usingAltScreen,
             cols = screen.cols,

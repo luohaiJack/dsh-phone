@@ -526,10 +526,17 @@ data class TermState(
     val rows: Int = 0,
     /** 渲染列表 = 历史滚动 + 当前屏幕（`TermScreen` 拼好给界面的那份）。 */
     val lines: List<AnsiLine> = emptyList(),
-    /** 光标在 [lines] 里的下标（不可见时为 null）—— 自动滚动就跟着它走。 */
+    /**
+     * 光标在 [lines] 里的下标（没有光标时为 null）—— 自动滚动就跟着它走。
+     *
+     * 全屏程序里即使终端报告"隐藏光标"（`?25l`）也会给出行号，
+     * 好让界面画一个淡的光标位置提示（见 TermScreen.cursorKind 的说明）。
+     */
     val cursorLine: Int? = null,
     /** 光标列（0 基）。 */
     val cursorCol: Int = 0,
+    /** 终端自己说光标可见吗（`?25h` / `?25l`）。 */
+    val cursorVisible: Boolean = true,
     /**
      * 正在跑全屏程序（vim/htop/less 用的是备用屏）。
      *
