@@ -68,6 +68,12 @@ class MainActivity : ComponentActivity() {
      */
     private val terminalRequest = mutableStateOf(0)
 
+    /** 深链复制请求的序号：每次请求都换一个值，好让界面上的 LaunchedEffect 再触发一次。 */
+    private var termCopySeq = 0
+
+    /** 深链要求复制的行数（null = 没有请求）。 */
+    private val termCopyReq = mutableStateOf<Pair<Int, Int>?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -90,6 +96,8 @@ class MainActivity : ComponentActivity() {
                     startTab = startTab,
                     startNewSession = startNewSession,
                     terminalRequest = terminalRequest.value,
+                    termCopyRequest = termCopyReq.value,
+                    onTermCopyHandled = { termCopyReq.value = null },
                     onNeedNotifPermission = { requestNotif.launch(Manifest.permission.POST_NOTIFICATIONS) },
                     onExit = { finish() },
                 )
@@ -155,6 +163,13 @@ class MainActivity : ComponentActivity() {
         }
         if (!termSend.isNullOrBlank()) vm.sendTermWhenReady(termSend)
 
+        // --es termCopy N  → 复制终端最近 N 行到剪贴板（也用于无人值守验证）
+        val termCopy = intent.getStringExtra(EXTRA_TERM_COPY)?.trim()?.toIntOrNull() ?: 0
+        if (termCopy > 0 && screen == "terminal") {
+            termCopySeq += 1
+            termCopyReq.value = termCopySeq to termCopy
+        }
+
         val send = intent.getStringExtra(EXTRA_SEND)
         if (!sid.isNullOrBlank() && !send.isNullOrBlank()) {
             lifecycleScope.launch {
@@ -168,6 +183,7 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_SESSION_ID = "sessionId"
         const val EXTRA_SCREEN = "screen"
         const val EXTRA_TERM_SEND = "termSend"
+        const val EXTRA_TERM_COPY = "termCopy"
         const val EXTRA_ENDPOINTS = "endpoints"
         const val EXTRA_TOKEN = "token"
         const val EXTRA_SEND = "send"
@@ -186,6 +202,9 @@ fun AppRoot(
     startNewSession: Boolean = false,
     /** 每次"要求打开终端"就 +1：冷启动与热启动（onNewIntent）走同一条路。 */
     terminalRequest: Int = 0,
+    /** 深链要求复制终端最近 N 行：(seq, n)。 */
+    termCopyRequest: Pair<Int, Int>? = null,
+    onTermCopyHandled: () -> Unit = {},
     onNeedNotifPermission: () -> Unit,
     onExit: () -> Unit = {},
 ) {
@@ -312,6 +331,8 @@ fun AppRoot(
             onClear = { vm.clearTerminal() },
             onKill = { vm.killTerminal(); showTerminal = false },
             onReopen = { vm.reopenTerminal() },
+            copyRequest = termCopyRequest,
+            onCopyHandled = onTermCopyHandled,
             onBack = { showTerminal = false },
         )
         // 这一页不再需要"输出流"时就断开：重进会拿桥接的滚动缓冲补上

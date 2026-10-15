@@ -746,3 +746,52 @@ fun cursorKind(index: Int, cursorLine: Int?, fullScreen: Boolean, visible: Boole
     fullScreen -> CursorKind.DIM
     else -> CursorKind.NONE
 }
+
+/**
+ * 一行拼成纯文本（复制用）：**去掉行尾空白**，行内的空格原样保留。
+ *
+ * 去行尾是必须的：终端的每一行都是按列数补齐的，不去掉的话复制出来
+ * 每条后面都拖一串空格，粘到别处全是空档。
+ */
+fun lineText(line: AnsiLine): String = line.joinToString("") { it.text }.trimEnd()
+
+/**
+ * 取 [from]..[to] 这些行的纯文本（含两端）。
+ *
+ * 越界会被夹住；`from > to` 时自动交换 —— 用户先点下面再点上面是常态，
+ * 不该因此复制到空内容。
+ */
+fun linesText(lines: List<AnsiLine>, from: Int, to: Int): String {
+    if (lines.isEmpty()) return ""
+    var a = from
+    var b = to
+    if (a > b) { val t = a; a = b; b = t }
+    a = a.coerceIn(0, lines.size - 1)
+    b = b.coerceIn(0, lines.size - 1)
+    val sb = StringBuilder()
+    for (i in a..b) {
+        if (sb.isNotEmpty()) sb.append('\n')
+        sb.append(lineText(lines[i]))
+    }
+    return sb.toString()
+}
+
+/**
+ * 从底部往上找 [n] 行**非空**的行，返回它们的行号区间（含两端）；找不到返回 null。
+ *
+ * 为什么不是"最后 n 行"：终端屏幕是 47 行，大部分是空白 ——
+ * 直接取最后 3 行会得到 0 个字（实测踩到）。用户说"复制最近 3 行"，
+ * 意思显然是**最近的 3 行内容**。中间夹着的空行会一并带上，保持版面可读。
+ */
+fun lastNonBlankRange(lines: List<AnsiLine>, n: Int): Pair<Int, Int>? {
+    if (lines.isEmpty() || n <= 0) return null
+    var first = -1
+    var count = 0
+    for (i in lines.indices.reversed()) {
+        if (lineText(lines[i]).isEmpty()) continue
+        if (first < 0) first = i
+        count += 1
+        if (count >= n) return i to first
+    }
+    return if (first >= 0) 0 to first else null
+}

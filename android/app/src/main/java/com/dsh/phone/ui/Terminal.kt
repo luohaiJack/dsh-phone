@@ -1,6 +1,12 @@
 package com.dsh.phone.ui
 
 import androidx.compose.foundation.background
+import com.dsh.phone.lastNonBlankRange
+import com.dsh.phone.linesText
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -80,6 +86,9 @@ private val TermFg = Color(0xFFD7DAE0)
 /** 光标块的颜色：亮一档，在深底上任何时候都看得见。 */
 private val TermCursor = Color(0xFFE8ECF2)
 
+/** 选中行的底色（兼容深色终端的半透明蓝）。 */
+private val SelectionBg = Color(0x553B6EA5)
+
 /** 一行等宽字体的样式（列宽测量也必须用同一份）。 */
 private val TermTextStyle = TextStyle(
     fontFamily = FontFamily.Monospace,
@@ -105,7 +114,7 @@ private val TermTextStyle = TextStyle(
  * 光标：屏幕模型知道光标在第几行（[TermState.cursorLine]），滚动跟着它走 ——
  * 这是"键盘弹起来把正在编辑的那一行盖住"的根治办法。
  */
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun TerminalScreen(
     term: TermState,
@@ -119,6 +128,10 @@ fun TerminalScreen(
     onKill: () -> Unit,
     onReopen: () -> Unit,
     onBack: () -> Unit,
+    /** 外部请求（深链 `--es termCopy N`）：复制最近 N 行。(seq, n)，seq 变就触发一次。 */
+    copyRequest: Pair<Int, Int>? = null,
+    /** 处理完通知外面清掉请求 —— 否则离开再进来会重放一次（复制到莫名其妙的内容）。 */
+    onCopyHandled: () -> Unit = {},
 ) {
     val listState = rememberLazyListState()
     val clipboard = LocalClipboardManager.current
@@ -126,6 +139,10 @@ fun TerminalScreen(
     val measurer = rememberTextMeasurer()
     var note by remember { mutableStateOf<String?>(null) }
     var ctrlLatch by remember { mutableStateOf(false) }
+    // 选择模式：点第一行定起点、点第二行定终点（再点就重新开一段）
+    var selecting by remember { mutableStateOf(false) }
+    var selAnchor by remember { mutableStateOf<Int?>(null) }
+    var selEnd by remember { mutableStateOf<Int?>(null) }
     var raw by remember { mutableStateOf(TextFieldValue("")) }
     val rawFocus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
@@ -146,6 +163,25 @@ fun TerminalScreen(
         val cols = ((availW - with(density) { 16.dp.toPx() }) / charWidthPx).toInt().coerceIn(20, 200)
         val rows = ((availH - chromePx) / lineHeightPx).toInt().coerceIn(8, 100)
         LaunchedEffect(cols, rows) { onEnsure(cols, rows) }
+    }
+
+    // 深链请求：把最近 N 行复制走（等于自动走一遍"选择 → 复制"）
+    LaunchedEffect(copyRequest, term.lines.size) {
+        val req = copyRequest ?: return@LaunchedEffect
+        if (term.lines.isEmpty()) return@LaunchedEffect
+        // "最近 N 行" = 最近的 N 行**内容**（跳过屏幕下方的空白，见 lastNonBlankRange）
+        onCopyHandled()
+        val range = lastNonBlankRange(term.lines, req.second.coerceAtLeast(1))
+        if (range == null) {
+            note = "屏幕上还没有内容可复制"
+            return@LaunchedEffect
+        }
+        val text = linesText(term.lines, range.first, range.second)
+        clipboard.setText(AnnotatedString(text))
+        val rows = kotlin.math.abs(range.second - range.first) + 1
+        val head = text.replace("\n", " ⏎ ").take(40)
+        note = "已复制 $rows 行（${text.length} 字）：$head" +
+            if (text.length > 40) " …" else ""
     }
 
     // 进了全屏程序就把软键盘拉起来：用户按了 vim 的 i，接下来就是要打字
@@ -264,12 +300,38 @@ fun TerminalScreen(
                     ) {
                         // 光标那一行要把列号传下去 —— 不然 vim 里根本看不出光标在哪
                         val cursorRow = term.cursorLine
+                        val a = selAnchor
+                        val b = selEnd
+                        val lo = if (a != null && b != null) minOf(a, b) else -1
+                        val hi = if (a != null && b != null) maxOf(a, b) else -1
                         items(term.lines.size) { i ->
                             val kind = cursorKind(i, cursorRow, term.fullScreen, term.cursorVisible)
+                            val selected = selecting && a != null && i in lo..hi
                             TermLine(
                                 line = term.lines[i],
                                 cursorCol = if (kind == CursorKind.NONE) null else term.cursorCol,
                                 dimCursor = kind == CursorKind.DIM,
+                                selected = selected,
+                                onClick = if (!selecting) null else {
+                                    {
+                                        // 第一次点定起点，第二次点定终点，第三次重新开一段
+                                        if (selAnchor == null || selEnd != selAnchor) {
+                                            selAnchor = i
+                                            selEnd = i
+                                        } else {
+                                            selEnd = i
+                                        }
+                                    }
+                                },
+                                onLongClick = if (selecting) null else {
+                                    {
+                                        selecting = true
+                                        selAnchor = i
+                                        selEnd = i
+                                        onFollowTailChange(false)
+                                        note = "再点一行选到那里，然后按「复制」"
+                                    }
+                                },
                             )
                         }
                     }
@@ -292,9 +354,59 @@ fun TerminalScreen(
                 )
             }
 
+            // 选择模式：把按键条和输入框换成"复制 / 全选 / 取消"
+            if (selecting) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        val a = selAnchor
+                        val b = selEnd
+                        val count = if (a != null && b != null) kotlin.math.abs(b - a) + 1 else 0
+                        Text(
+                            if (count > 0) "已选 $count 行" else "点一行开始选",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(
+                            enabled = count > 0,
+                            onClick = {
+                                val text = linesText(term.lines, a ?: 0, b ?: 0)
+                                clipboard.setText(AnnotatedString(text))
+                                // 回显开头一小段：用户一眼能看出"抄对了没"，
+                                // 也让这条链路可以被无人值守核对（读屏上的文字即可）
+                                val head = text.replace("\n", " ⏎ ").take(40)
+                                note = "已复制 $count 行（${text.length} 字）：$head" +
+                                    if (text.length > 40) " …" else ""
+                                selecting = false
+                                selAnchor = null
+                                selEnd = null
+                            },
+                        ) { Text("复制") }
+                        TextButton(onClick = {
+                            selAnchor = 0
+                            selEnd = term.lines.size - 1
+                            note = "已全选（${term.lines.size} 行），按「复制」"
+                        }) { Text("全选") }
+                        TextButton(onClick = {
+                            selecting = false
+                            selAnchor = null
+                            selEnd = null
+                            note = null
+                        }) { Text("取消") }
+                    }
+                }
+            }
+
             // 电脑上没有活终端时（已退出 / 开失败），按键和输入框都是死控件 ——
             // 藏起来，只留上面那个「重新开一个终端」
-            if (term.alive || term.opening) {
+            if (!selecting && (term.alive || term.opening)) {
             // ---------------- 按键条 ----------------
             //
             // 用 FlowRow 自动换行，**不要**用横向滚动的 Row：
@@ -340,6 +452,13 @@ fun TerminalScreen(
                 KeyChip("Ctrl-C") { onInterrupt() }
                 KeyChip(if (ctrlLatch) "Ctrl ●" else "Ctrl") { ctrlLatch = !ctrlLatch }
                 KeyChip("清屏") { onClear() }
+                KeyChip("选择") {
+                    selecting = true
+                    selAnchor = null
+                    selEnd = null
+                    onFollowTailChange(false)
+                    note = "点一行定起点，再点一行定终点"
+                }
             }
 
             // ---------------- 输入区 ----------------
@@ -453,7 +572,14 @@ private fun spanStyle(span: AnsiSpan, cursor: Boolean = false, dimCursor: Boolea
  * 再按列找光标那一格，否则行内有中文时光标会偏。
  */
 @Composable
-private fun TermLine(line: AnsiLine, cursorCol: Int?, dimCursor: Boolean = false) {
+private fun TermLine(
+    line: AnsiLine,
+    cursorCol: Int?,
+    dimCursor: Boolean = false,
+    selected: Boolean = false,
+    onClick: (() -> Unit)? = null,
+    onLongClick: (() -> Unit)? = null,
+) {
     if (line.isEmpty() && cursorCol == null) {
         // 空行也要占一行的高度，否则整屏行号会错位
         Text(" ", style = TermTextStyle, modifier = Modifier.fillMaxWidth())
@@ -472,12 +598,24 @@ private fun TermLine(line: AnsiLine, cursorCol: Int?, dimCursor: Boolean = false
     // ★ 不能软换行：PTY 的列数是按屏幕宽度算好的，一行本来就该放得下。
     //   真换行会把下面所有行整体挤下去 —— 全屏程序（vim）的网格当场错位。
     //   宁可把超出的最后几个字符裁掉。
+    val base = Modifier
+        .fillMaxWidth()
+        .let { if (selected) it.background(SelectionBg) else it }
+        .let {
+            when {
+                onClick != null && onLongClick != null ->
+                    it.combinedClickable(onClick = onClick, onLongClick = onLongClick)
+                onClick != null -> it.clickable(onClick = onClick)
+                onLongClick != null -> it.combinedClickable(onClick = {}, onLongClick = onLongClick)
+                else -> it
+            }
+        }
     Text(
         text = text,
         style = TermTextStyle,
         softWrap = false,
         maxLines = 1,
         overflow = TextOverflow.Clip,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = base,
     )
 }

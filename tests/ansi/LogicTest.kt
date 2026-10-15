@@ -2,6 +2,9 @@ import com.dsh.phone.AnsiSpan
 import com.dsh.phone.CursorKind
 import com.dsh.phone.TermState
 import com.dsh.phone.cursorKind
+import com.dsh.phone.lastNonBlankRange
+import com.dsh.phone.linesText
+import com.dsh.phone.lineText
 import com.dsh.phone.renderCells
 
 /**
@@ -85,6 +88,46 @@ fun main() {
         cursorKind(3, 3, fullScreen = true, visible = false) == CursorKind.DIM)
     check("全屏程序可见时是实心",
         cursorKind(3, 3, fullScreen = true, visible = true) == CursorKind.SOLID)
+
+    /* ---------- 复制：选择范围取文本 ---------- */
+
+    run {
+        val lines = listOf(
+            listOf(AnsiSpan("hello"), AnsiSpan(" world   ")),
+            listOf(AnsiSpan("   ")),                       // 全空白行
+            listOf(AnsiSpan("中文"), AnsiSpan("abc")),
+        )
+        check("去行尾空白、留行内空格", lineText(lines[0]) == "hello world", "得到=${lineText(lines[0])}")
+        check("全空白行变空串", lineText(lines[1]) == "", "得到=${lineText(lines[1])}")
+        check("跨 span 拼接", lineText(lines[2]) == "中文abc", "得到=${lineText(lines[2])}")
+
+        check("取一段", linesText(lines, 0, 1) == "hello world\n", "得到=${linesText(lines, 0, 1).replace("\n","\\n")}")
+        check("倒着选也对（先点下面再点上面）",
+            linesText(lines, 2, 0) == linesText(lines, 0, 2), linesText(lines, 2, 0).replace("\n","\\n"))
+        check("越界被夹住", linesText(lines, -5, 99) == linesText(lines, 0, 2))
+        check("空列表不炸", linesText(emptyList(), 0, 3) == "")
+        check("单行不带换行", !linesText(lines, 1, 1).contains("\n"))
+    }
+
+    /* ---------- "最近 N 行"要跳过屏幕下方的空白 ---------- */
+
+    run {
+        val screen = listOf(
+            listOf(AnsiSpan("one")),
+            listOf(AnsiSpan("two")),
+            listOf(AnsiSpan("three")),
+            emptyList(), listOf(AnsiSpan("   ")), emptyList(),   // 屏幕下方那些空行
+        )
+        val r = lastNonBlankRange(screen, 3)
+        check("最近 3 行 = 最近 3 行内容（不是 3 个空行）",
+            r != null && linesText(screen, r.first, r.second) == "one\ntwo\nthree",
+            r?.let { linesText(screen, it.first, it.second).replace("\n", "|") } ?: "null")
+        check("要多于现有内容时给全部", lastNonBlankRange(screen, 99)!!.first == 0)
+        check("n=0 返回 null", lastNonBlankRange(screen, 0) == null)
+        check("全空屏幕返回 null", lastNonBlankRange(listOf(emptyList(), emptyList()), 2) == null)
+        val tail = lastNonBlankRange(screen, 1)
+        check("最近 1 行是 three", tail != null && linesText(screen, tail.first, tail.second) == "three")
+    }
 
     println("\n==== 终端状态文案 + 光标格子验收：$pass 项通过，$fail 项失败 ====")
     if (fail > 0) throw RuntimeException("有失败项")
