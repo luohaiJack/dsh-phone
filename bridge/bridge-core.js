@@ -379,6 +379,8 @@ export function createBridge(ctx, opts) {
               })
             }
           }
+          const summaryModel = projectionModel(it)
+          if (summaryModel) sessionModelCache[id] = summaryModel
           state.sessions.push({
             id: id,
             title: titleOf(it, liveSession),
@@ -392,7 +394,7 @@ export function createBridge(ctx, opts) {
             activity: activityOf(id),
             // 进度（轮/步/上下文）—— 和 workspaces 那份是**同一份镜像**，
             // 只是两处都要带上：手机既看 state 也看工作区树
-            progress: progressView(id),
+            progress: progressView(id, summaryModel),
             model: projectionModel(it),
             workspaceId: it.cwd && wsByPath[String(it.cwd)] ? wsByPath[String(it.cwd)] : null,
             jobs: owned,
@@ -591,6 +593,9 @@ export function createBridge(ctx, opts) {
         .then(function (value) {
           const records = (value && value.records) || []
           const messages = deriveMessages(records)
+          safe(function () {
+            scanContext(sessionId, records)
+          }, undefined)
           return {
             messages: messages,
             hasMore: !!(value && value.hasMore),
@@ -621,6 +626,9 @@ export function createBridge(ctx, opts) {
         signal.abort('history snapshot taken')
         const frame = first && first.value
         if (!frame) return { messages: [], hasMore: false, cursor: 0, header: null }
+        safe(function () {
+          scanContext(sessionId, frame.records)
+        }, undefined)
         return {
           messages: deriveMessages(frame.records),
           // 快照里自带 hasMore = "还有更早的记录"，直接转给手机
@@ -680,6 +688,51 @@ export function createBridge(ctx, opts) {
   const progress = {}
   const eventTypeCounts = {}
 
+  /**
+   * 上下文窗口按**模型**记：`provider/model` → 窗口大小。
+   *
+   * 为什么不只记在会话上：窗口是模型的属性，不是会话的。
+   * 而且"某一轮"里 request/context 只在上下文**变化**时才写一条事件，
+   * 冷会话打开时可能根本碰不到 —— 按模型缓存住，
+   * 换个会话、甚至桥接重启后读一次历史（下面 scanContext）就能补上，
+   * 不会出现"窗口未知"。harness 自己的界面也是这么干的（从日志里翻最后一条）。
+   */
+  const modelWindows = {}
+
+  function modelKey(provider, model) {
+    return String(provider || '') + '/' + String(model || '')
+  }
+
+  /** 从一条 request/context 事件的数据里记下窗口（同时记到会话与模型两张表）。 */
+  function recordContext(sid, data) {
+    if (!sid || !data || typeof data !== 'object') return
+    const w = typeof data.contextWindow === 'number' && data.contextWindow > 0 ? data.contextWindow : 0
+    const p = progOf(sid)
+    if (typeof data.provider === 'string' && data.provider) p.provider = data.provider
+    if (typeof data.model === 'string' && data.model) p.model = data.model
+    if (w > 0) {
+      p.contextWindow = w
+      if (p.provider || p.model) modelWindows[modelKey(p.provider, p.model)] = w
+    }
+  }
+
+  /** 会话当前用的模型（跟 state 里给手机看的那个是同一份）。 */
+  function sessionModel(sessionId) {
+    if (sc === undefined || typeof sc.list !== 'function') return null
+    const cached = sessionModelCache[sessionId]
+    if (cached !== undefined) return cached
+    return null
+  }
+  const sessionModelCache = {}
+
+  function rememberSessionModels(summaries) {
+    const ids = Object.keys(summaries)
+    for (let i = 0; i < ids.length; i += 1) {
+      const m = projectionModel(summaries[ids[i]])
+      if (m) sessionModelCache[ids[i]] = m
+    }
+  }
+
   function progOf(sid) {
     if (!progress[sid]) {
       progress[sid] = {
@@ -695,17 +748,45 @@ export function createBridge(ctx, opts) {
     return progress[sid]
   }
 
-  function progressView(sid) {
+  function progressView(sid, modelHint) {
     const p = progress[sid]
     if (!p) return null
+    let win = p.contextWindow
+    // 会话上没记到窗口时，用"这个会话当前用的模型"去模型表里查 ——
+    // 同型号在别的会话见过一次就够了，不该让用户看到"窗口未知"
+    if (!win) {
+      const hint = modelHint || sessionModel(sid)
+      if (hint) win = modelWindows[modelKey(hint.provider, hint.model)] || 0
+    }
     return {
       turn: p.turn,
       step: p.step,
       turns: p.turns,
-      contextWindow: p.contextWindow,
+      contextWindow: win,
       contextUsed: p.contextUsed,
-      provider: p.provider,
-      model: p.model,
+      provider: p.provider || (modelHint ? String(modelHint.provider || '') : ''),
+      model: p.model || (modelHint ? String(modelHint.model || '') : ''),
+    }
+  }
+
+  /**
+   * 从一段记录里扫最后一条 request/context，补上窗口。
+   *
+   * 这就是 harness 自己界面的做法（它在日志里 findLast 一条 request/context）：
+   * 窗口不靠"恰好收到那条实时事件"，而是**从日志里翻出来**。
+   * 翻页返回的 records 里就带着它，白捡。
+   */
+  function scanContext(sid, records) {
+    if (!records || typeof records.length !== 'number') return
+    for (let i = records.length - 1; i >= 0; i -= 1) {
+      const rec = records[i]
+      const ev = rec && rec.type === 'event' ? rec.event : rec
+      if (ev && ev.type === 'request/context') {
+        safe(function () {
+          recordContext(sid, ev.data)
+        }, undefined)
+        return
+      }
     }
   }
 
@@ -749,12 +830,9 @@ export function createBridge(ctx, opts) {
         if (t > p.turns) p.turns = t
       }
     } else if (event.type === 'request/context') {
-      const p = progOf(sid)
       const d = event.data || {}
       lastContextEventDebug = { at: Date.now(), keys: Object.keys(d).join(','), contextWindow: d.contextWindow }
-      if (typeof d.contextWindow === 'number' && d.contextWindow > 0) p.contextWindow = d.contextWindow
-      if (typeof d.provider === 'string') p.provider = d.provider
-      if (typeof d.model === 'string') p.model = d.model
+      recordContext(sid, d)
     } else if (event.type === 'user/message') {
       const kind = safe(function () {
         const d = event.data || {}
@@ -2567,6 +2645,7 @@ export function createBridge(ctx, opts) {
         queue: { controlRunning: controlRunning, frames: controlFrames, sessions: Object.keys(queues).length },
         progress: {
           sessions: Object.keys(progress).length,
+          modelWindows: modelWindows,
           // 事件类型直方图：排查"某个事件到底有没有到桥接"时最有用 ——
           // 实测根监听器只覆盖一部分会话，这份计数一眼就能看出来
           eventTypes: eventTypeCounts,
@@ -3006,6 +3085,8 @@ export function createBridge(ctx, opts) {
     for (let i = 0; i < qids.length; i += 1) delete queues[qids[i]]
     const pids = Object.keys(progress)
     for (let i = 0; i < pids.length; i += 1) delete progress[pids[i]]
+    const mks = Object.keys(modelWindows)
+    for (let i = 0; i < mks.length; i += 1) delete modelWindows[mks[i]]
     const ids = Object.keys(stateClients)
     for (let i = 0; i < ids.length; i += 1) {
       try {
