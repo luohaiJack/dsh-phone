@@ -100,6 +100,8 @@ import com.dsh.phone.HarnessState
 import com.dsh.phone.ModelCatalog
 import com.dsh.phone.WorkspaceInfo
 import com.dsh.phone.WorkspaceSession
+import com.dsh.phone.contextPercent
+import com.dsh.phone.formatTokens
 import com.dsh.phone.formatClock
 import com.dsh.phone.formatDuration
 import com.dsh.phone.relativeTime
@@ -2474,11 +2476,15 @@ fun SessionDashboard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 if (progress.contextUsed > 0) {
+                    // 与电脑端右下角**同一个数、同一种写法**（~617.9K / 1M，62%）。
+                    // 以前这里只显示 inputTokens，也没算缓存命中，所以两边对不上
+                    val pct = contextPercent(progress.contextUsed, progress.contextWindow)
                     Text(
-                        if (progress.contextWindow > 0) {
-                            "上下文：${progress.contextUsed} / ${progress.contextWindow} tokens"
+                        if (pct != null) {
+                            "上下文：~${formatTokens(progress.contextUsed)} / " +
+                                "${formatTokens(progress.contextWindow)}（$pct%）"
                         } else {
-                            "上下文：已用 ${progress.contextUsed} tokens（窗口大小未知）"
+                            "上下文：~${formatTokens(progress.contextUsed)}（窗口大小未知）"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,

@@ -1,6 +1,9 @@
 import com.dsh.phone.AnsiSpan
 import com.dsh.phone.ChatMessage
 import com.dsh.phone.mergeProgress
+import com.dsh.phone.overlayProgress
+import com.dsh.phone.formatTokens
+import com.dsh.phone.contextPercent
 import com.dsh.phone.progressFromMessages
 import com.dsh.phone.CursorKind
 import com.dsh.phone.GoalInfo
@@ -210,10 +213,29 @@ fun main() {
         val m = mergeProgress(fromBridge, fromHistory, fromLive)
         check("逐字段取最全（不是整体覆盖）", m.turn == 42 && m.step == 3 && m.turns == 42, m.toString())
         check("窗口从实时那份来", m.contextWindow == 1_000_000)
-        check("用量取更大的那个", m.contextUsed == 90000, m.contextUsed.toString())
+        check("上下文取靠后那个非零值", m.contextUsed == 90000, m.contextUsed.toString())
+        check("0 不覆盖已有的值", mergeProgress(SessionProgress(contextUsed = 500), SessionProgress(contextUsed = 0)).contextUsed == 500)
+        // ★ 这条是"手机上显示的和电脑上不一样"的同族坑：上下文被压缩（compaction）后会变小，
+        //   取最大值就会永远卡在旧的大数字上
+        check("上下文被压缩后跟着变小",
+            mergeProgress(SessionProgress(contextUsed = 617879), SessionProgress(contextUsed = 20000)).contextUsed == 20000,
+            mergeProgress(SessionProgress(contextUsed = 617879), SessionProgress(contextUsed = 20000)).contextUsed.toString())
         check("空输入不炸", mergeProgress(null, null) == SessionProgress())
         // 只有"窗口大小"没有意义：那种情况下仪表盘没什么可说的，不该占一行
         check("只知道窗口不算有内容", !mergeProgress(fromLive).hasAnything)
+
+        /* ---------- 权威/兜底两层：桥接那个数就是电脑右下角的数 ---------- */
+
+        // 权威 = 桥接（宿主的 contextPressure 投影，含缓存命中）；兜底 = 老口径只算 input
+        val auth = SessionProgress(turn = 74, step = 10, turns = 74, contextWindow = 1_000_000, contextUsed = 617879)
+        val fb = SessionProgress(turn = 74, step = 10, turns = 74, contextUsed = 257)
+        val o = overlayProgress(auth, fb)
+        check("权威有值时压过兜底（257 不许顶上来）", o.contextUsed == 617879, o.contextUsed.toString())
+        check("轮/步照样取最全", o.turn == 74 && o.step == 10 && o.turns == 74)
+        val cold = overlayProgress(SessionProgress(), SessionProgress(turn = 3, step = 1, turns = 3, contextWindow = 1_000_000, contextUsed = 30000))
+        check("权威还是空的时用兜底（冷会话）", cold.contextUsed == 30000 && cold.contextWindow == 1_000_000 && cold.turns == 3)
+        check("权威窗口未知时用兜底窗口", overlayProgress(SessionProgress(contextUsed = 5), SessionProgress(contextWindow = 999)).contextWindow == 999)
+        check("两边都空不炸", overlayProgress(SessionProgress(), SessionProgress()) == SessionProgress())
 
         // 历史推进度：最大 turn = 累计轮数
         val msgs = listOf(
@@ -336,6 +358,25 @@ fun main() {
         check("空串 → null", parseQueueEditDraft("") == null)
         check("null → null", parseQueueEditDraft(null) == null)
         check("只有换行 → null", parseQueueEditDraft("\n正文") == null)
+    }
+
+    /* ---------- token 缩写 / 百分比：必须和电脑端右下角**一字不差** ---------- */
+
+    run {
+        // 电脑端 locale：number.thousand = "{value}K"、number.million = "{value}M"；
+        // 缩放后 ≥100 取整，否则留一位小数
+        check("1000 以下原样", formatTokens(257) == "257", formatTokens(257))
+        check("千级留一位小数", formatTokens(15400) == "15.4K", formatTokens(15400))
+        check("99.9K", formatTokens(99900) == "99.9K", formatTokens(99900))
+        check("到 100 就取整", formatTokens(100000) == "100K", formatTokens(100000))
+        check("61.8 万取整成 618K（和电脑一样舍精度）", formatTokens(617879) == "618K", formatTokens(617879))
+        check("正好一千 = 1K（去掉 .0）", formatTokens(1000) == "1K", formatTokens(1000))
+        check("百万级用 M", formatTokens(1000000) == "1M", formatTokens(1000000))
+        check("1048576 → 1M（1.048 缩到一位小数就是 1）", formatTokens(1048576) == "1M", formatTokens(1048576))
+
+        check("百分比取整", contextPercent(617879, 1000000) == 62, contextPercent(617879, 1000000).toString())
+        check("不知道用量/窗口就不给百分比", contextPercent(0, 1000000) == null && contextPercent(5, 0) == null)
+        check("超了封顶 100", contextPercent(9_000_000, 1_000_000) == 100, contextPercent(9_000_000, 1_000_000).toString())
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

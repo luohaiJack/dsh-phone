@@ -35,12 +35,36 @@ const contextRecord = (window, provider, model, seq) => ({
 const modelSel = (provider, model) => ({
   values: { modelSelection: { lastUsed: { provider, model } } },
 })
+/**
+ * 带 `contextPressure` 投影的会话（电脑端右下角读的就是它）。
+ *
+ * projectedTokens/pressureTokens 都给了，值刻意不一样：
+ * 投影的语义是"**下一次**请求会占多少"，事件推算只能说"上一次用了多少"。
+ */
+const pressureProj = (projected, pressure, window) => ({
+  values: {
+    modelSelection: { lastUsed: { provider: 'deepseek-official', model: 'deepseek-flash' } },
+    contextPressure: {
+      ...(projected === undefined ? {} : { projectedTokens: projected }),
+      ...(pressure === undefined ? {} : { pressureTokens: pressure }),
+      ...(window === undefined ? {} : { contextWindow: window }),
+    },
+  },
+})
+
 const summaries = {
   's1': { sessionId: 's1', updatedAt: Date.now(), running: false, blank: false, projections: modelSel('deepseek-official', 'deepseek-flash') },
   // 同型号的另一条会话：它自己没被读过日志，应该靠"按模型缓存"直接拿到窗口
   's2': { sessionId: 's2', updatedAt: Date.now(), running: false, blank: false, projections: modelSel('deepseek-official', 'deepseek-flash') },
   // 谁都没见过的型号：**不许**拿别的模型的窗口顶上 —— 不知道就说不知道
   's3': { sessionId: 's3', updatedAt: Date.now(), running: false, blank: false, projections: modelSel('some-vendor', 'brand-new-model') },
+  // s4：有完整投影。事件流里那条 assistant/message 只报了 257（旧口径会显示 257），
+  //     投影说 617879 —— 必须报 617879，这才和电脑上一致。
+  's4': { sessionId: 's4', updatedAt: Date.now(), running: false, blank: false, projections: pressureProj(617879, 617601, 1000000) },
+  // s5：投影只给了 pressureTokens（还没采样到"下一次"），退而求其次也必须是它
+  's5': { sessionId: 's5', updatedAt: Date.now(), running: false, blank: false, projections: pressureProj(undefined, 617601, 1000000) },
+  // s6：没有投影，只有事件 —— 兜底口径也必须把缓存命中的 617344 算进去
+  's6': { sessionId: 's6', updatedAt: Date.now(), running: false, blank: false, projections: modelSel('deepseek-official', 'deepseek-flash') },
 }
 
 const sessionController = {
@@ -50,9 +74,19 @@ const sessionController = {
   // 它那条 request/context **没有** contextWindow（适配器不认识这个模型）。
   follow: (request) => {
     const sid = request?.address?.sessionId || 's1'
+    const assistant = (usage, seq) => ({
+      type: 'event',
+      event: { type: 'assistant/message', seq, time: 1, data: { turn: 1, step: 1, usage } },
+    })
     const records = sid === 's3'
       ? [contextRecord(undefined, 'some-vendor', 'brand-new-model', 5)]
-      : [contextRecord(1000000, 'deepseek-official', 'deepseek-flash', 5)]
+      // s4/s5/s6 的真实形态：最后一条助手消息的 usage 就是"缓存命中为主"的那种
+      : (sid === 's4' || sid === 's5' || sid === 's6')
+        ? [
+            contextRecord(1000000, 'deepseek-official', 'deepseek-flash', 4),
+            assistant({ inputTokens: 257, outputTokens: 465, cacheReadTokens: 617344 }, 5),
+          ]
+        : [contextRecord(1000000, 'deepseek-official', 'deepseek-flash', 5)]
     return {
       [Symbol.asyncIterator]() {
         let sent = false
@@ -129,6 +163,18 @@ check('同型号的另一会话直接有窗口', s2 && s2.contextWindow === 1000
 // 3b. 没见过的型号：老老实实显示未知，不拿别的模型顶上
 const s3 = await stateProgress('s3')
 check('没见过的型号不瞎填', s3 && s3.contextWindow === 0, JSON.stringify(s3?.contextWindow))
+
+// ★ 上下文占用：以电脑端右下角那个投影为准（"手机上显示的和电脑上不一样"的回归钉）
+const s4 = await stateProgress('s4')
+check('上下文占用取投影的 projectedTokens', s4 && s4.contextUsed === 617879, JSON.stringify(s4?.contextUsed))
+check('窗口取投影里的 contextWindow', s4 && s4.contextWindow === 1000000, JSON.stringify(s4?.contextWindow))
+
+const s5 = await stateProgress('s5')
+check('没有 projectedTokens 时退到 pressureTokens', s5 && s5.contextUsed === 617601, JSON.stringify(s5?.contextUsed))
+
+const s6 = await stateProgress('s6')
+check('没有投影时兜底口径含缓存命中（257+617344）', s6 && s6.contextUsed === 617601, JSON.stringify(s6?.contextUsed))
+check('兜底也不能只报 inputTokens', s6 && s6.contextUsed !== 257, JSON.stringify(s6?.contextUsed))
 
 // 4. 窗口是模型的属性：diag 里能看到学到了哪些
 const diag = await (await fetch(`${base}/diag`, { headers: H })).json()

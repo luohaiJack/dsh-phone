@@ -381,6 +381,7 @@ export function createBridge(ctx, opts) {
           }
           const summaryModel = projectionModel(it)
           if (summaryModel) sessionModelCache[id] = summaryModel
+          const summaryPressure = projectionPressure(it)
           state.sessions.push({
             id: id,
             title: titleOf(it, liveSession),
@@ -394,7 +395,7 @@ export function createBridge(ctx, opts) {
             activity: activityOf(id),
             // 进度（轮/步/上下文）—— 和 workspaces 那份是**同一份镜像**，
             // 只是两处都要带上：手机既看 state 也看工作区树
-            progress: progressView(id, summaryModel),
+            progress: progressView(id, summaryModel, summaryPressure),
             model: projectionModel(it),
             workspaceId: it.cwd && wsByPath[String(it.cwd)] ? wsByPath[String(it.cwd)] : null,
             jobs: owned,
@@ -531,6 +532,10 @@ export function createBridge(ctx, opts) {
               ? {
                   input: typeof usage.inputTokens === 'number' ? usage.inputTokens : null,
                   output: typeof usage.outputTokens === 'number' ? usage.outputTokens : null,
+                  // 缓存命中/写入也要带上：宿主的"上下文压力"= input + cacheRead + cacheWrite，
+                  // 只算 input 会与电脑端差一个数量级
+                  cacheRead: typeof usage.cacheReadTokens === 'number' ? usage.cacheReadTokens : null,
+                  cacheWrite: typeof usage.cacheWriteTokens === 'number' ? usage.cacheWriteTokens : null,
                 }
               : null,
         })
@@ -748,10 +753,21 @@ export function createBridge(ctx, opts) {
     return progress[sid]
   }
 
-  function progressView(sid, modelHint) {
+  function progressView(sid, modelHint, pressure) {
     const p = progress[sid]
     if (!p) return null
     let win = p.contextWindow
+    let used = p.contextUsed
+    // ★ 投影优先：电脑端显示的就是它。事件推算只在投影缺失时兜底
+    if (pressure) {
+      if (pressure.contextWindow > 0) {
+        win = pressure.contextWindow
+        if (p.provider || p.model) modelWindows[modelKey(p.provider, p.model)] = win
+        if (modelHint) modelWindows[modelKey(modelHint.provider, modelHint.model)] = win
+      }
+      const u = pressure.projectedTokens >= 0 ? pressure.projectedTokens : pressure.pressureTokens
+      if (u >= 0) used = u
+    }
     // 会话上没记到窗口时，用"这个会话当前用的模型"去模型表里查 ——
     // 同型号在别的会话见过一次就够了，不该让用户看到"窗口未知"
     if (!win) {
@@ -763,7 +779,7 @@ export function createBridge(ctx, opts) {
       step: p.step,
       turns: p.turns,
       contextWindow: win,
-      contextUsed: p.contextUsed,
+      contextUsed: used,
       provider: p.provider || (modelHint ? String(modelHint.provider || '') : ''),
       model: p.model || (modelHint ? String(modelHint.model || '') : ''),
     }
@@ -805,8 +821,17 @@ export function createBridge(ctx, opts) {
         if (d.turn > p.turns) p.turns = d.turn
       }
       if (typeof d.step === 'number' && d.step > 0) p.step = d.step
-      if (d.usage && typeof d.usage === 'object' && typeof d.usage.inputTokens === 'number') {
-        p.contextUsed = d.usage.inputTokens
+      // 事件里的兜底口径也要和宿主一致：上下文压力 = 输入 + 缓存命中 + 缓存写入。
+      // 只取 inputTokens 会小两三个数量级（缓存命中往往是主体）—— 这正是
+      // "手机上显示的上下文和电脑上不一样"的根因。权威值仍是 contextPressure 投影。
+      if (d.usage && typeof d.usage === 'object') {
+        const u = d.usage
+        if (typeof u.inputTokens === 'number') {
+          p.contextUsed =
+            u.inputTokens +
+            (typeof u.cacheReadTokens === 'number' ? u.cacheReadTokens : 0) +
+            (typeof u.cacheWriteTokens === 'number' ? u.cacheWriteTokens : 0)
+        }
       }
       if (seq >= a.lastReplySeq) {
         a.lastReplySeq = seq
@@ -1583,6 +1608,30 @@ export function createBridge(ctx, opts) {
   /* ------------------------------ 模型 ------------------------------ */
 
   /** 从 list() 的投影里取该会话当前生效的模型选择。 */
+  /**
+   * 宿主的 `contextPressure` 投影 —— **电脑端右下角那个上下文表用的就是它**。
+   *
+   * 它的两个字段与我的"从事件里数"完全不同：
+   *   - `pressureTokens` = inputTokens + cacheReadTokens + cacheWriteTokens
+   *     （**缓存命中/写入也算进去**！我原来只算了 inputTokens，
+   *      所以和电脑显示的差一个数量级）
+   *   - `projectedTokens` = pressureTokens + 采样之后的"表面"增减
+   *     （回答的是"**下一次**请求会占多少"，而不是上一次请求用了多少）
+   * 所以这个投影才是权威，事件推算只是兜底。
+   */
+  function projectionPressure(summary) {
+    return safe(function () {
+      const v = summary && summary.projections && summary.projections.values
+      const p = v && v.contextPressure
+      if (!p) return null
+      return {
+        contextWindow: typeof p.contextWindow === 'number' && p.contextWindow > 0 ? p.contextWindow : 0,
+        pressureTokens: typeof p.pressureTokens === 'number' ? p.pressureTokens : -1,
+        projectedTokens: typeof p.projectedTokens === 'number' ? p.projectedTokens : -1,
+      }
+    }, null)
+  }
+
   function projectionModel(summary) {
     return safe(
       function () {

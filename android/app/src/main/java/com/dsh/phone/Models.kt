@@ -246,7 +246,14 @@ internal fun parseMessages(arr: JSONArray?): List<ChatMessage> {
                 reasoning = o.optStringOrNull("reasoning"),
                 turn = o.optInt("turn", 0),
                 step = o.optInt("step", 0),
-                contextUsed = usage?.optInt("input", 0) ?: 0,
+                // 与宿主同口径：上下文压力 = input + 缓存命中 + 缓存写入。
+                // 只算 input 会和电脑右下角的数字差一个数量级（缓存命中往往是主体）
+                contextUsed = usage?.let { u ->
+                    val a = if (u.isNull("input")) 0 else u.optInt("input", 0)
+                    val b = if (u.isNull("cacheRead")) 0 else u.optInt("cacheRead", 0)
+                    val c = if (u.isNull("cacheWrite")) 0 else u.optInt("cacheWrite", 0)
+                    a + b + c
+                } ?: 0,
                 isError = o.optBoolean("isError", false),
                 interrupted = o.optBoolean("interrupted", false),
                 usageIn = usage?.let { if (it.isNull("input")) null else it.optInt("input") },
@@ -753,7 +760,7 @@ data class SessionProgress(
     val turns: Int = 0,
     /** 模型这次可用的上下文窗口（0 = 还不知道）。 */
     val contextWindow: Int = 0,
-    /** 上一次请求实际用了多少输入 token。 */
+    /** 上下文占用（与电脑端同口径：input + 缓存命中 + 缓存写入）。 */
     val contextUsed: Int = 0,
 ) {
     val hasAnything: Boolean get() = turn > 0 || turns > 0 || contextUsed > 0
@@ -801,11 +808,69 @@ fun mergeProgress(vararg sources: SessionProgress?): SessionProgress {
         if (p.turn > turn) turn = p.turn
         if (p.step > step) step = p.step
         if (p.turns > turns) turns = p.turns
-        if (p.contextWindow > window) window = p.contextWindow
-        if (p.contextUsed > used) used = p.contextUsed
+        // 上下文这两项**取靠后那个非零值**，不取最大。
+        // 取最大会在上下文被压缩后卡住旧的大数字（回合数取最大是对的，
+        // 占用不是 —— 它随时会因为 compaction 变小）。
+        if (p.contextWindow > 0) window = p.contextWindow
+        if (p.contextUsed > 0) used = p.contextUsed
     }
     return SessionProgress(turn, step, turns, window, used)
 }
+
+/**
+ * token 数量的缩写 —— **逐字照抄电脑端右下角那个表**。
+ *
+ * 电脑端用的是 locale 文案 `number.thousand` = `{value}K`、`number.million` = `{value}M`，
+ * 缩放后 ≥100 取整、否则留一位小数（见 ui-conversation 里那份 formatTokens）。
+ *
+ * 为什么要连格式都抄：用户就是拿手机和电脑上这两个数字对着核对的。
+ * 一个写 `617.9K`、一个写 `617879`，即使数值完全一样也会让人以为又没对上。
+ */
+fun formatTokens(value: Int): String {
+    if (value < 1000) return value.toString()
+    fun scaled(c: Double): String {
+        val r = if (c >= 100) Math.round(c).toDouble() else Math.round(c * 10) / 10.0
+        return if (r == Math.floor(r)) r.toLong().toString() else r.toString()
+    }
+    return if (value < 1_000_000) {
+        scaled(value / 1000.0) + "K"
+    } else {
+        scaled(value / 1_000_000.0) + "M"
+    }
+}
+
+/** 上下文占用百分比，与电脑端同一个算法（取整、封顶 100）。 */
+fun contextPercent(used: Int, window: Int): Int? {
+    if (used <= 0 || window <= 0) return null
+    return Math.min(100, Math.round(used.toFloat() / window.toFloat() * 100f))
+}
+
+/**
+ * 把"权威进度"和"兜底进度"叠起来。
+ *
+ * 权威 = 桥接给的（就是电脑右下角那个数：宿主 `contextPressure` 投影，
+ * 把缓存命中也算进去了）；兜底 = 从历史消息里按同口径推的，
+ * **只在权威那一项还没有值的时候顶上去**。
+ *
+ * 不能简单取最大值：两者口径一致时最大无妨，可一旦上下文被压缩，
+ * 权威数会变小，取最大就永远显示旧的大数字。
+ */
+fun overlayProgress(authoritative: SessionProgress, fallback: SessionProgress): SessionProgress =
+    SessionProgress(
+        turn = maxOf(authoritative.turn, fallback.turn),
+        step = maxOf(authoritative.step, fallback.step),
+        turns = maxOf(authoritative.turns, fallback.turns),
+        contextWindow = if (authoritative.contextWindow > 0) {
+            authoritative.contextWindow
+        } else {
+            fallback.contextWindow
+        },
+        contextUsed = if (authoritative.contextUsed > 0) {
+            authoritative.contextUsed
+        } else {
+            fallback.contextUsed
+        },
+    )
 
 /**
  * 从历史消息里读进度：**最大的 turn** 就是累计轮数，最后一条的 step 是当前步，

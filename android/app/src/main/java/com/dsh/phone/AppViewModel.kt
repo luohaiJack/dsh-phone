@@ -275,12 +275,35 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 当前会话的仪表盘进度（轮/步、上下文窗口与占用）。
      *
-     * 三个来源合并（见 [mergeProgress]）：state 里桥接镜像的那份、实时流推的、
-     * 以及历史消息自带的 turn/usage。取最全的那份，而不是"后者覆盖前者" ——
-     * 桥接刚重载时它的镜像可能是空的，而历史里的轮号是真的。
+     * 分两层，**不能一锅炖**（见 [overlayProgress]）：
+     *   - 权威层 = 桥接给的（state 镜像 + 实时 progress 事件）。上下文那个数就是
+     *     电脑右下角显示的同一个（宿主的 `contextPressure` 投影，含缓存命中）；
+     *   - 兜底层 = 从历史消息里按同口径推的，只在权威层还没有值的时候顶上
+     *     （冷会话、桥接刚重载时）。
+     *
+     * 以前是把所有来源取最大值，结果是"手机上显示的和电脑上不一样" ——
+     * 我原来只数了 inputTokens，没把缓存命中/写入算进去。
      */
+    private var progressAuthoritative = SessionProgress()
+    private var progressFallback = SessionProgress()
     private val _progress = MutableStateFlow(SessionProgress())
     val progress: StateFlow<SessionProgress> = _progress.asStateFlow()
+
+    private fun publishProgress() {
+        _progress.value = overlayProgress(progressAuthoritative, progressFallback)
+    }
+
+    /** 桥接来的进度（权威）：上下文以它为准。 */
+    private fun setAuthoritativeProgress(vararg sources: SessionProgress?) {
+        progressAuthoritative = mergeProgress(progressAuthoritative, *sources)
+        publishProgress()
+    }
+
+    /** 历史里推出来的进度（兜底）：权威缺项时才显示它。 */
+    private fun setFallbackProgress(source: SessionProgress?) {
+        progressFallback = mergeProgress(progressFallback, source)
+        publishProgress()
+    }
 
     /** 主机侧可路由的模型目录。 */
     private val _models = MutableStateFlow(ModelCatalog.EMPTY)
@@ -416,7 +439,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun refreshProgress() {
         val sid = _openSessionId.value
         if (sid.isEmpty()) return
-        _progress.value = mergeProgress(_progress.value, stateProgress(sid))
+        setAuthoritativeProgress(stateProgress(sid))
     }
 
     /** 从已知表 / 状态 / 工作区里找某个会话的 activity。 */
@@ -527,6 +550,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         setLiveRunning(false)
         _doc.value = null
         _queue.value = emptyList()
+        progressAuthoritative = SessionProgress()
+        progressFallback = SessionProgress()
         _progress.value = SessionProgress()
         _hasMoreHistory.value = false
         _loadingOlder.value = false
@@ -654,7 +679,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _question.value = null
         setLiveRunning(false)
         _draft.value = settings.draft(sessionId)
-        _progress.value = stateProgress(sessionId)
+        progressAuthoritative = stateProgress(sessionId)
+        progressFallback = SessionProgress()
+        publishProgress()
         _queueEditDraft.value = settings.queueEditDraft(sessionId)
         _attachments.value = emptyList()
         _uploading.value = null
@@ -691,10 +718,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     _hasMoreHistory.value = page.hasMore
                     _chatError.value = null
                     // 历史里的轮/步/用量最可靠（读的就是会话日志），拿来校正仪表盘
-                    val fromHistory = progressFromMessages(msgs)
-                    if (fromHistory != null) {
-                        _progress.value = mergeProgress(_progress.value, fromHistory)
-                    }
+                    setFallbackProgress(progressFromMessages(msgs))
                     // 必须等消息到位再滚：列表还空着时滚，索引会被夹到 0，位置就丢了
                     pendingScrollRestore?.let { r ->
                         pendingScrollRestore = null
@@ -779,7 +803,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 setLiveRunning(data.optString("phase") == "start")
             }
             "progress" -> {
-                _progress.value = mergeProgress(_progress.value, parseProgress(data))
+                setAuthoritativeProgress(parseProgress(data))
             }
             "queue" -> {
                 _queue.value = parseQueue(data.optJSONArray("items"))
