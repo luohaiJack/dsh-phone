@@ -1,0 +1,2609 @@
+/**
+ * DSH ⇄ 手机 桥接核心（平台无关、零依赖纯 JS）
+ *
+ * 同一份代码有两个宿主：
+ *  1. 静态插件：bridge/lib/index.js 以 ESM 引入本文件（生产路径，随 dsh web 一起启动）
+ *  2. 动态插件：bridge/tools/gen-dynamic.mjs 把本函数体原样内联进 cordis_define 的 code.host
+ *     （开发路径，进程内即时生效，重启即失效）
+ *
+ * 因此：本文件内不得出现 import / require / process / Buffer / fetch / setTimeout
+ * 等宿主机全局，只能通过 ctx.get() 拿 Cordis Service，并调用宿主对象上的方法。
+ * 同理不使用 WebSocket（动态宿主内拿不到 crypto 做握手），一律走 SSE。
+ */
+
+export function createBridge(ctx, opts) {
+  /* ------------------------------------------------------------------ *
+   * 0. 配置与依赖
+   * ------------------------------------------------------------------ */
+  const cfg = opts || {}
+  const TOKEN = typeof cfg.token === 'string' ? cfg.token : ''
+  const BASE = typeof cfg.base === 'string' && cfg.base ? cfg.base : '/phone'
+  const NAME = 'dsh-phone-bridge'
+  const VERSION = 4
+
+  const webServer = ctx.get('webServer')
+  if (webServer === undefined) {
+    console.error('[' + NAME + '] webServer service missing; bridge not mounted')
+    return
+  }
+  // 硬依赖：没有会话控制器就没有桥接的意义
+  const sc = ctx.get('sessionController')
+  // 其余全部按可选处理，缺失时降级而不是崩溃
+  const sessionsSvc = ctx.get('sessions')
+  const titleSvc = ctx.get('sessionTitle')
+  const jobsSvc = ctx.get('jobs')
+  const goalsSvc = ctx.get('goals')
+  const agentsSvc = ctx.get('agents')
+  const modelSvc = ctx.get('agentDefaultModel')
+  const timerSvc = ctx.get('timer')
+  // 工作区注册表：harness 自己的"项目文件夹"概念，会话按 canonical-cwd 自动归属
+  const workspaceSvc = ctx.get('workspaceRegistry')
+  // 目录浏览/新建：复用 harness 自己的浏览后端，避免另造一套 fs 访问
+  const dirPicker = ctx.get('directoryPickerController')
+
+  /* ------------------------------------------------------------------ *
+   * 1. 基础设施：AbortSignal 替身 / 响应封装 / 定时器
+   * ------------------------------------------------------------------ */
+
+  /**
+   * 动态宿主里没有 AbortController。DSH 的 Remote 接口只把 signal 当鸭子类型用
+   * （读 .aborted、挂 abort 监听），所以这里给一个最小实现。
+   */
+  function makeSignal() {
+    const listeners = []
+    const signal = {
+      aborted: false,
+      reason: undefined,
+      onabort: null,
+      addEventListener(type, fn) {
+        if (type === 'abort' && typeof fn === 'function') listeners.push(fn)
+      },
+      removeEventListener(type, fn) {
+        if (type !== 'abort') return
+        const i = listeners.indexOf(fn)
+        if (i >= 0) listeners.splice(i, 1)
+      },
+      dispatchEvent() {
+        return true
+      },
+      throwIfAborted() {},
+    }
+    signal.abort = function abort(reason) {
+      if (signal.aborted) return
+      signal.aborted = true
+      signal.reason = reason
+      for (let i = 0; i < listeners.length; i += 1) {
+        try {
+          listeners[i].call(signal, { type: 'abort' })
+        } catch (err) {
+          /* 监听器异常不能影响其它监听器 */
+        }
+      }
+    }
+    return signal
+  }
+
+  function corsHeaders(extra) {
+    const head = {
+      'access-control-allow-origin': '*',
+      'access-control-allow-headers': 'content-type,authorization,x-phone-token',
+      'access-control-allow-methods': 'GET,POST,OPTIONS',
+      'cache-control': 'no-store',
+    }
+    if (extra) {
+      const keys = Object.keys(extra)
+      for (let i = 0; i < keys.length; i += 1) head[keys[i]] = extra[keys[i]]
+    }
+    return head
+  }
+
+  function sendJson(res, status, value) {
+    let body
+    try {
+      body = JSON.stringify(value)
+    } catch (err) {
+      body = JSON.stringify({ ok: false, error: 'serialize-failed: ' + String(err && err.message) })
+      status = 500
+    }
+    res.writeHead(status, corsHeaders({ 'content-type': 'application/json; charset=utf-8' }))
+    res.end(body)
+  }
+
+  function sendText(res, status, text) {
+    res.writeHead(status, corsHeaders({ 'content-type': 'text/plain; charset=utf-8' }))
+    res.end(text)
+  }
+
+  /** 用宿主注入的 timer Service 做可回收定时器；拿不到就退化为「不启动」。 */
+  function every(ms, fn) {
+    if (timerSvc && typeof timerSvc.interval === 'function') {
+      try {
+        return timerSvc.interval(fn, ms)
+      } catch (err) {
+        /* 落到下面的空实现 */
+      }
+    }
+    return function noop() {}
+  }
+
+  function safe(fn, fallback) {
+    try {
+      return fn()
+    } catch (err) {
+      return fallback
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 2. 请求解析
+   * ------------------------------------------------------------------ */
+
+  function readBody(req) {
+    return new Promise(function (resolve) {
+      let done = false
+      const chunks = []
+      let size = 0
+      function finish(value) {
+        if (done) return
+        done = true
+        resolve(value)
+      }
+      req.on('data', function (chunk) {
+        size += chunk.length
+        if (size > 2 * 1024 * 1024) {
+          finish(null)
+          return
+        }
+        chunks.push(chunk)
+      })
+      req.on('end', function () {
+        finish(BufferConcat(chunks))
+      })
+      req.on('error', function () {
+        finish(null)
+      })
+    })
+  }
+
+  function BufferConcat(chunks) {
+    if (chunks.length === 0) return ''
+    let total = 0
+    for (let i = 0; i < chunks.length; i += 1) total += chunks[i].length
+    const buf = new Uint8Array(total)
+    let off = 0
+    for (let i = 0; i < chunks.length; i += 1) {
+      buf.set(chunks[i], off)
+      off += chunks[i].length
+    }
+    const decoder = new TextDecoder('utf-8')
+    return decoder.decode(buf)
+  }
+
+  function parseBody(req) {
+    return readBody(req).then(function (text) {
+      if (!text) return {}
+      try {
+        const value = JSON.parse(text)
+        return value && typeof value === 'object' ? value : {}
+      } catch (err) {
+        return {}
+      }
+    })
+  }
+
+  /** 把 `req.url` 拆成 path 段与 query。 */
+  function parseUrl(rawUrl) {
+    const raw = typeof rawUrl === 'string' ? rawUrl : '/'
+    const q = raw.indexOf('?')
+    const path = q >= 0 ? raw.slice(0, q) : raw
+    const search = q >= 0 ? raw.slice(q + 1) : ''
+    const query = {}
+    if (search) {
+      const pairs = search.split('&')
+      for (let i = 0; i < pairs.length; i += 1) {
+        if (!pairs[i]) continue
+        const eq = pairs[i].indexOf('=')
+        const k = eq >= 0 ? pairs[i].slice(0, eq) : pairs[i]
+        const v = eq >= 0 ? pairs[i].slice(eq + 1) : ''
+        try {
+          query[decodeURIComponent(k)] = decodeURIComponent(v.replace(/\+/g, ' '))
+        } catch (err) {
+          query[k] = v
+        }
+      }
+    }
+    let clean = path
+    while (clean.length > 1 && clean.charAt(clean.length - 1) === '/') clean = clean.slice(0, -1)
+    return { path: clean, query: query }
+  }
+
+  /** 相对 BASE 的路径段，例如 /phone/session/abc/live -> ['session','abc','live'] */
+  function segments(path) {
+    let rest = path
+    if (rest.indexOf(BASE) === 0) rest = rest.slice(BASE.length)
+    const parts = rest.split('/')
+    const out = []
+    for (let i = 0; i < parts.length; i += 1) {
+      if (!parts[i]) continue
+      try {
+        out.push(decodeURIComponent(parts[i]))
+      } catch (err) {
+        out.push(parts[i])
+      }
+    }
+    return out
+  }
+
+  function authorized(req, query) {
+    if (!TOKEN) return true
+    const presented =
+      (query && query.token) ||
+      req.headers['x-phone-token'] ||
+      (function () {
+        const auth = req.headers.authorization
+        if (typeof auth === 'string' && auth.indexOf('Bearer ') === 0) return auth.slice(7)
+        return ''
+      })()
+    return presented === TOKEN
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 3. 会话状态快照
+   * ------------------------------------------------------------------ */
+
+  function liveSessionMap() {
+    const map = {}
+    const list = safe(function () {
+      return sessionsSvc && typeof sessionsSvc.list === 'function' ? sessionsSvc.list() : []
+    }, [])
+    for (let i = 0; i < list.length; i += 1) {
+      const s = list[i]
+      if (s && s.id !== undefined) map[String(s.id)] = s
+    }
+    return map
+  }
+
+  function projectJobs() {
+    const out = []
+    const list = safe(function () {
+      return jobsSvc && typeof jobsSvc.list === 'function' ? jobsSvc.list() : []
+    }, [])
+    for (let i = 0; i < list.length; i += 1) {
+      const j = list[i]
+      if (!j) continue
+      out.push({
+        id: String(j.id),
+        kind: String(j.kind || ''),
+        label: String(j.label || ''),
+        status: String(j.status || ''),
+        owner: j.ownerSession !== undefined && j.ownerSession !== null ? String(j.ownerSession) : null,
+        startedAt: typeof j.startedAt === 'number' ? j.startedAt : 0,
+        finishedAt: typeof j.finishedAt === 'number' ? j.finishedAt : null,
+        detail: typeof j.detail === 'string' ? j.detail : null,
+      })
+    }
+    return out
+  }
+
+  function projectGoal(sessionId) {
+    if (!goalsSvc || typeof goalsSvc.get !== 'function' || !agentsSvc || typeof agentsSvc.get !== 'function') return null
+    return safe(function () {
+      const agent = agentsSvc.get(sessionId)
+      if (!agent) return null
+      const g = goalsSvc.get(agent)
+      if (!g) return null
+      return {
+        objective: String(g.objective || ''),
+        phase: String(g.phase || ''),
+        roundsStarted: typeof g.roundsStarted === 'number' ? g.roundsStarted : 0,
+        maxGoalRounds: typeof g.maxGoalRounds === 'number' ? g.maxGoalRounds : null,
+        blockedReason: typeof g.blockedReason === 'string' ? g.blockedReason : null,
+        activation: g.activation !== undefined ? String(g.activation) : null,
+        updatedAt: typeof g.updatedAt === 'number' ? g.updatedAt : 0,
+      }
+    }, null)
+  }
+
+  function currentModel() {
+    return safe(function () {
+      if (!modelSvc || typeof modelSvc.currentSelection !== 'function') return null
+      const sel = modelSvc.currentSelection()
+      if (!sel) return null
+      return {
+        provider: String(sel.provider || ''),
+        model: String(sel.model || ''),
+        reasoningEffort: sel.reasoningEffort ? String(sel.reasoningEffort) : null,
+      }
+    }, null)
+  }
+
+  /**
+   * 取会话标题。
+   *
+   * 优先用 list() 自带的投影值 —— 标题在 dsh-session-title 里注册为 `title` 投影，
+   * 是持久化的，对冷会话同样有效。投影缺失时才退回活会话的 sessionTitle 折叠。
+   * 这一点很重要：本机所有会话常常共享同一个 cwd，拿不到标题时列表会全都长一样。
+   */
+  function titleOf(summary, session) {
+    const proj = summary && summary.projections && summary.projections.values
+    if (proj && typeof proj.title === 'string' && proj.title) return proj.title
+    const t = safe(function () {
+      if (!titleSvc || typeof titleSvc.get !== 'function' || !session) return null
+      return titleSvc.get(session)
+    }, null)
+    if (t && typeof t.title === 'string' && t.title) return t.title
+    return null
+  }
+
+  function buildState(limit) {
+    const maxSessions = typeof limit === 'number' && limit > 0 ? limit : 60
+    const state = {
+      ok: true,
+      name: NAME,
+      version: VERSION,
+      ts: Date.now(),
+      model: currentModel(),
+      sessions: [],
+      jobs: projectJobs(),
+      activeSessionId: activeSessionId,
+      error: null,
+    }
+    if (sc === undefined || typeof sc.list !== 'function') {
+      state.ok = false
+      state.error = 'sessionController unavailable'
+      return Promise.resolve(state)
+    }
+    const live = liveSessionMap()
+    const wsByPath = workspaceByPath()
+    return sc
+      .list({}, makeSignal())
+      .then(function (value) {
+        const items = (value && value.items) || []
+        for (let i = 0; i < items.length && state.sessions.length < maxSessions; i += 1) {
+          const it = items[i]
+          if (!it) continue
+          const id = String(it.sessionId)
+          const liveSession = live[id]
+          const owned = []
+          for (let k = 0; k < state.jobs.length; k += 1) {
+            if (state.jobs[k].owner === id) {
+              owned.push({
+                id: state.jobs[k].id,
+                label: state.jobs[k].label,
+                status: state.jobs[k].status,
+                kind: state.jobs[k].kind,
+              })
+            }
+          }
+          state.sessions.push({
+            id: id,
+            title: titleOf(it, liveSession),
+            running: it.running === true,
+            blank: it.blank === true,
+            updatedAt: typeof it.updatedAt === 'number' ? it.updatedAt : 0,
+            cwd: typeof it.cwd === 'string' ? it.cwd : null,
+            origin: typeof it.origin === 'string' ? it.origin : null,
+            parent: it.parentSessionId !== undefined && it.parentSessionId !== null ? String(it.parentSessionId) : null,
+            live: !!liveSession,
+            activity: activityOf(id),
+            model: projectionModel(it),
+            workspaceId: it.cwd && wsByPath[String(it.cwd)] ? wsByPath[String(it.cwd)] : null,
+            jobs: owned,
+            // goal 只在活会话上求值：冷会话没有 Agent，且逐个求值会拖慢状态轮询
+            goal: liveSession ? projectGoal(id) : null,
+          })
+        }
+        state.totalSessions = items.length
+        return state
+      })
+      .catch(function (err) {
+        state.ok = false
+        state.error = String((err && err.message) || err)
+        return state
+      })
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 4. 会话历史 / 消息归一化
+   * ------------------------------------------------------------------ */
+
+  function textFromBlocks(blocks) {
+    const parts = []
+    if (!blocks || typeof blocks.length !== 'number') return ''
+    for (let i = 0; i < blocks.length; i += 1) {
+      const b = blocks[i]
+      if (!b || typeof b !== 'object') continue
+      if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text)
+      else if (b.type === 'reasoning' && typeof b.text === 'string') parts.push(b.text)
+      else if (b.type === 'image') parts.push('[图片]')
+      else if (b.type === 'file') parts.push('[文件]')
+      // tool-call 块由 tool/call 事件单独呈现，这里跳过以免正文里出现重复的一行
+      else if (b.type === 'tool-result') parts.push(textFromBlocks(b.content))
+    }
+    return parts.join('\n')
+  }
+
+  /**
+   * 把助手消息的内容块拆成「正文」与「思考」两部分。
+   *
+   * 以前是把 reasoning 用 "[思考] " 前缀塞进正文里，混在一起既不好读，
+   * 也和电脑上的呈现不一致 —— 电脑上是折叠的独立区块。
+   */
+  function splitAssistantBlocks(blocks) {
+    const text = []
+    const reasoning = []
+    if (!blocks || typeof blocks.length !== 'number') return { text: '', reasoning: '' }
+    for (let i = 0; i < blocks.length; i += 1) {
+      const b = blocks[i]
+      if (!b || typeof b !== 'object') continue
+      if (b.type === 'text' && typeof b.text === 'string') text.push(b.text)
+      else if (b.type === 'reasoning' && typeof b.text === 'string') reasoning.push(b.text)
+      else if (b.type === 'image') text.push('[图片]')
+      else if (b.type === 'file') text.push('[文件]')
+      else if (b.type === 'tool-result') text.push(textFromBlocks(b.content))
+    }
+    return { text: text.join('\n'), reasoning: reasoning.join('\n') }
+  }
+
+  /**
+   * 给工具调用挑一行能看的摘要（和电脑上卡片的标题一个意思）。
+   * 工具参数各异，这里只挑最常见的几个字段，挑不到就留空由 App 退回首行参数。
+   */
+  function toolSummary(name, argsJson) {
+    const a = safe(function () {
+      return JSON.parse(String(argsJson || '{}'))
+    }, null)
+    if (!a || typeof a !== 'object') return { text: '', isPath: false, path: '' }
+    const keys = ['command', 'file_path', 'path', 'pattern', 'query', 'url', 'prompt', 'description', 'name']
+    for (let i = 0; i < keys.length; i += 1) {
+      const v = a[keys[i]]
+      if (typeof v === 'string' && v.trim()) {
+        const text = v.trim()
+        // file_path / path 直接就是文件；命令之类的不是，别乱标成可点
+        const isPath = keys[i] === 'file_path' || keys[i] === 'path'
+        return { text: text, isPath: isPath, path: isPath ? text : '' }
+      }
+    }
+    return { text: '', isPath: false, path: '' }
+  }
+
+  function clip(text, max) {
+    const s = typeof text === 'string' ? text : ''
+    const limit = typeof max === 'number' ? max : 4000
+    if (s.length <= limit) return s
+    return s.slice(0, limit) + '\n…（已截断 ' + (s.length - limit) + ' 字）'
+  }
+
+  function sourceKind(data) {
+    return safe(function () {
+      const src = data && data.source
+      if (!src) return 'user'
+      if (typeof src === 'string') return src
+      if (typeof src.kind === 'string') return src.kind
+      return 'user'
+    }, 'user')
+  }
+
+  /** 把 DSH 的 SessionHistoryRecord[] 归一化成手机端好渲染的消息数组。 */
+  function deriveMessages(records) {
+    const out = []
+    if (!records || typeof records.length !== 'number') return out
+    for (let i = 0; i < records.length; i += 1) {
+      const rec = records[i]
+      const ev = rec && rec.type === 'event' ? rec.event : rec
+      if (!ev || typeof ev.type !== 'string') continue
+      const data = ev.data || {}
+      const seq = typeof ev.seq === 'number' ? ev.seq : 0
+      const time = typeof ev.time === 'number' ? ev.time : 0
+
+      if (ev.type === 'user/message') {
+        const msg = data.message || data
+        const text = textFromBlocks(msg && msg.content)
+        if (!text) continue
+        out.push({ seq: seq, time: time, role: 'user', text: clip(text), source: sourceKind(data) })
+      } else if (ev.type === 'assistant/message') {
+        const msg = data.message || data
+        const parts = splitAssistantBlocks(msg && msg.content)
+        if (!parts.text && !parts.reasoning) continue
+        const usage = data.usage
+        out.push({
+          seq: seq,
+          time: time,
+          role: 'assistant',
+          text: clip(parts.text, 12000),
+          reasoning: parts.reasoning ? clip(parts.reasoning, 8000) : null,
+          interrupted: data.interrupted === true,
+          usage:
+            usage && typeof usage === 'object'
+              ? {
+                  input: typeof usage.inputTokens === 'number' ? usage.inputTokens : null,
+                  output: typeof usage.outputTokens === 'number' ? usage.outputTokens : null,
+                }
+              : null,
+        })
+      } else if (ev.type === 'tool/call') {
+        const sum = toolSummary(data.name, data.arguments)
+        out.push({
+          seq: seq,
+          time: time,
+          role: 'tool',
+          name: String(data.name || ''),
+          title: sum.text,
+          titlePath: sum.isPath ? sum.path : null,
+          text: clip(String(data.arguments || ''), 4000),
+          callId: data.callId !== undefined ? String(data.callId) : null,
+        })
+      } else if (ev.type === 'tool/result') {
+        const msg = data.message || data
+        const text = textFromBlocks(msg && msg.content)
+        out.push({
+          seq: seq,
+          time: time,
+          role: 'tool-result',
+          isError: !!(data.error || (msg && msg.isError)),
+          errorName: data.error ? String(data.error.name || '') : null,
+          text: clip(text, 1500),
+        })
+      }
+    }
+    return out
+  }
+
+  /** 拉一页历史：用 follow 的开场快照，拿完即关，避免依赖 throughSeq。 */
+  function loadHistory(sessionId, maxMessages) {
+    if (sc === undefined || typeof sc.follow !== 'function') {
+      return Promise.reject(new Error('sessionController.follow unavailable'))
+    }
+    const signal = makeSignal()
+    const request = {
+      address: { kind: 'session', sessionId: sessionId },
+      maxMessages: typeof maxMessages === 'number' && maxMessages > 0 ? maxMessages : 40,
+    }
+    // follow 是 async generator：调用即返回迭代器，不是 Promise
+    return Promise.resolve().then(function () {
+      const iter = sc.follow(request, signal)
+      const iterator = iter[Symbol.asyncIterator] ? iter[Symbol.asyncIterator]() : iter
+      return iterator.next().then(function (first) {
+        try {
+          if (typeof iterator.return === 'function') iterator.return()
+        } catch (err) {
+          /* 生成器可能已结束 */
+        }
+        signal.abort('history snapshot taken')
+        const frame = first && first.value
+        if (!frame) return { messages: [], cursor: 0, header: null }
+        return {
+          messages: deriveMessages(frame.records),
+          cursor: typeof frame.cursor === 'number' ? frame.cursor : 0,
+          header: frame.header
+            ? {
+                id: String(frame.header.id),
+                cwd: frame.header.cwd || null,
+                createdAt: frame.header.createdAt || 0,
+                agentPreset: frame.header.agentPreset || null,
+              }
+            : null,
+        }
+      })
+    })
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 5. 未读回复跟踪
+   *
+   * harness 自己没有"已读/未读"概念（全是客户端状态），所以这里只负责
+   * 提供**判断依据**：每个会话最后一次「助手回复」和最后一次「人提问」的
+   * seq 与时间。已读watermark 存在手机侧（那是每个观察者自己的状态）。
+   *
+   * 数据来自两处：
+   *   - 实时：session/event 火线（实测能到根监听器）
+   *   - 回填：挂载时对最近活跃的会话读一次日志尾部，
+   *           这样"挂之前就已经存在的未读回复"也能显示出来
+   * ------------------------------------------------------------------ */
+
+  const activity = {}
+  let backfillDone = false
+  let backfillCount = 0
+
+  function actOf(sid) {
+    if (!activity[sid]) {
+      activity[sid] = { lastSeq: 0, lastReplySeq: 0, lastReplyAt: 0, lastUserSeq: 0, lastUserAt: 0 }
+    }
+    return activity[sid]
+  }
+
+  function trackEvent(sid, event) {
+    if (!sid || !event || typeof event.type !== 'string') return
+    const a = actOf(sid)
+    const seq = typeof event.seq === 'number' ? event.seq : 0
+    if (seq > a.lastSeq) a.lastSeq = seq
+    const t = typeof event.time === 'number' ? event.time : Date.now()
+    if (event.type === 'assistant/message') {
+      if (seq >= a.lastReplySeq) {
+        a.lastReplySeq = seq
+        a.lastReplyAt = t
+      }
+    } else if (event.type === 'user/message') {
+      const kind = safe(function () {
+        const d = event.data || {}
+        const src = d.source
+        return src && src.kind ? String(src.kind) : 'user'
+      }, 'user')
+      // 只认真正的人发的；harness 注入的运行时提醒/技能目录不算"人提问"
+      if (kind === 'user' && seq >= a.lastUserSeq) {
+        a.lastUserSeq = seq
+        a.lastUserAt = t
+      }
+    }
+  }
+
+  function trackRecords(sid, records) {
+    if (!sid || !records || typeof records.length !== 'number') return
+    for (let i = 0; i < records.length; i += 1) {
+      const rec = records[i]
+      const ev = rec && rec.type === 'event' ? rec.event : rec
+      if (ev) trackEvent(sid, ev)
+    }
+  }
+
+  /** 读一个会话的日志尾部（不拉全量），补上挂载前的状态。 */
+  function readTail(sid) {
+    if (sc === undefined || typeof sc.follow !== 'function') return Promise.resolve()
+    const signal = makeSignal()
+    return Promise.resolve()
+      .then(function () {
+        const iter = sc.follow({ address: { kind: 'session', sessionId: sid }, maxMessages: 8 }, signal)
+        const it = iter[Symbol.asyncIterator] ? iter[Symbol.asyncIterator]() : iter
+        return it.next().then(function (r) {
+          try {
+            if (typeof it.return === 'function') it.return()
+          } catch (e) {
+            /* 已结束 */
+          }
+          signal.abort('tail read done')
+          const frame = r && r.value
+          if (frame && frame.records) trackRecords(sid, frame.records)
+        })
+      })
+      .catch(function () {
+        /* 单个会话读失败不影响其它 */
+      })
+  }
+
+  /**
+   * 回填：只挑最近 7 天活跃过、且还没被实时跟踪到的会话，
+   * 串行读尾巴，最多 60 个 —— 一次性的，不放在状态轮询路径上。
+   */
+  function backfillActivity() {
+    if (backfillDone) return
+    backfillDone = true
+    if (sc === undefined || typeof sc.list !== 'function') return
+    sc.list({}, makeSignal())
+      .then(function (value) {
+        const items = (value && value.items) || []
+        const cutoff = Date.now() - 7 * 24 * 3600 * 1000
+        const targets = []
+        for (let i = 0; i < items.length && targets.length < 60; i += 1) {
+          const it = items[i]
+          if (!it) continue
+          const sid = String(it.sessionId)
+          if (activity[sid]) continue
+          const up = typeof it.updatedAt === 'number' ? it.updatedAt : 0
+          if (up < cutoff) continue
+          targets.push(sid)
+        }
+        backfillCount = targets.length
+        let idx = 0
+        function step() {
+          if (idx >= targets.length) return
+          const sid = targets[idx]
+          idx += 1
+          readTail(sid).then(step, step)
+        }
+        step()
+      })
+      .catch(function () {})
+  }
+
+  /** 给状态/工作区接口用的三个字段。 */
+  function activityOf(sid) {
+    const a = activity[sid]
+    if (!a) return { lastReplySeq: 0, lastReplyAt: 0, agentSpokeLast: false }
+    return {
+      lastReplySeq: a.lastReplySeq,
+      lastReplyAt: a.lastReplyAt,
+      // "助手最后说话"= 大概率有你还没看的回复
+      agentSpokeLast: a.lastReplySeq > 0 && a.lastReplySeq > a.lastUserSeq,
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 6. 用户提问（ask_user_question）
+   *
+   * harness 用瀑布事件 `user-questions/request` 找回答者：
+   *   谁返回 { answers:[{id, selected, custom?}] } 谁就赢了；
+   *   不接就调 next() 让下一个回答者（浏览器 UI）来。
+   *
+   * 这里注册成**条件性**回答者，而不是无条件拦截：
+   * 只有当手机正开着那个会话的实时流时才接，否则立刻 next()。
+   * 这样你人在电脑前时，电脑上的选项框不会被手机拖慢。
+   * ------------------------------------------------------------------ */
+
+  const pendingQuestions = {}
+  const sessionStreamClients = {}
+  let questionSeq = 0
+  let questionEventCount = 0
+  let lastQuestionDebug = null
+  let sessionEventCount = 0
+  let lastSessionEventDebug = null
+
+  /**
+   * 「手机正在看这个会话」= 最近一次心跳足够新。
+   *
+   * 为什么不用 /live 连接是否开着来判断：手机静默掉线（App 被杀、蜂窝断、
+   * 没有正常发 FIN）时 TCP 连接可能挂很久才被回收，那期间桥接会以为手机还在看，
+   * 把提问推给一条死连接 —— 电脑要干等满超时。心跳新鲜度没有这个问题：
+   * 心跳一停，最多 TTL 之后就不再算"在看"。
+   *
+   * 心跳搭在 App 本来就有的那次 /phone/state 轮询上，不额外加请求。
+   */
+  const WATCH_TTL_MS = 15000
+  const watchPings = {}
+
+  /** 往某个会话的所有实时流推送一个事件。 */
+  function sessionStreamSend(sessionId, event, payload) {
+    const list = sessionStreamClients[sessionId]
+    if (!list || list.length === 0) return
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const res = list[i]
+      if (!res || res.writableEnded) {
+        list.splice(i, 1)
+        continue
+      }
+      sseSend(res, event, payload)
+    }
+  }
+
+  function touchWatch(sessionId) {
+    if (typeof sessionId === 'string' && sessionId) watchPings[sessionId] = Date.now()
+  }
+  function isWatched(sessionId) {
+    if (!sessionId) return false
+    const at = watchPings[sessionId]
+    return typeof at === 'number' && Date.now() - at < WATCH_TTL_MS
+  }
+  function watchedKeys() {
+    const out = []
+    const now = Date.now()
+    const ids = Object.keys(watchPings)
+    for (let i = 0; i < ids.length; i += 1) {
+      if (now - watchPings[ids[i]] < WATCH_TTL_MS) out.push(ids[i])
+    }
+    return out
+  }
+
+  /** 从瀑布事件里的 agent 取出会话 id（宿主侧是活 Agent，带 id）。 */
+  function agentSessionId(agent) {
+    return safe(function () {
+      if (!agent) return null
+      if (agent.id !== undefined) return String(agent.id)
+      if (agent.sessionId !== undefined) return String(agent.sessionId)
+      return null
+    }, null)
+  }
+
+  function normalizeQuestions(list) {
+    const out = []
+    const arr = Array.isArray(list) ? list : []
+    for (let i = 0; i < arr.length; i += 1) {
+      const q = arr[i]
+      if (!q || typeof q !== 'object') continue
+      const options = []
+      const opts = Array.isArray(q.options) ? q.options : []
+      for (let k = 0; k < opts.length; k += 1) {
+        const o = opts[k]
+        if (!o || typeof o.label !== 'string') continue
+        options.push({
+          label: o.label,
+          description: typeof o.description === 'string' ? o.description : null,
+        })
+      }
+      out.push({
+        id: String(q.id === undefined ? 'q' + i : q.id),
+        question: String(q.question || ''),
+        detail: typeof q.detail === 'string' ? q.detail : null,
+        header: typeof q.header === 'string' ? q.header : null,
+        options: options,
+        multiSelect: q.multiSelect === true,
+      })
+    }
+    return out
+  }
+
+  function normalizeAnswers(list) {
+    const out = []
+    const arr = Array.isArray(list) ? list : []
+    for (let i = 0; i < arr.length; i += 1) {
+      const a = arr[i]
+      if (!a || typeof a !== 'object') continue
+      const selected = []
+      const sel = Array.isArray(a.selected) ? a.selected : []
+      for (let k = 0; k < sel.length; k += 1) {
+        if (typeof sel[k] === 'string') selected.push(sel[k])
+      }
+      const item = { id: String(a.id === undefined ? '' : a.id), selected: selected }
+      if (typeof a.custom === 'string' && a.custom !== '') item.custom = a.custom
+      out.push(item)
+    }
+    return out
+  }
+
+  /** 把问题推给正在看这个会话的手机。 */
+  function pushQuestion(entry) {
+    sessionStreamSend(entry.sessionId, 'question', {
+      id: entry.id,
+      sessionId: entry.sessionId,
+      questions: entry.questions,
+    })
+  }
+
+  function pushQuestionDone(entry, reason) {
+    sessionStreamSend(entry.sessionId, 'question-done', { id: entry.id, reason: reason })
+  }
+
+  function settleQuestion(entry, answer, reason) {
+    if (!entry || entry.settled) return
+    entry.settled = true
+    pushQuestionDone(entry, reason)
+    if (typeof entry.resolve === 'function') entry.resolve(answer)
+  }
+
+  /** 每秒清理：超时、或手机不再看这个会话了，就把问题交还给下一个回答者。 */
+  function expireQuestions() {
+    const ids = Object.keys(pendingQuestions)
+    const now = Date.now()
+    for (let i = 0; i < ids.length; i += 1) {
+      const e = pendingQuestions[ids[i]]
+      if (!e || e.settled) continue
+      const age = now - e.createdAt
+      // 手机不看了（心跳停）→ 3 秒宽限后立刻交还电脑；兜底 120 秒
+      if (age > 120000 || (!isWatched(e.sessionId) && age > 3000)) {
+        settleQuestion(e, null, 'expired')
+      }
+    }
+  }
+
+  /**
+   * 先问手机，没人答就调 fallback 走原链路。
+   *
+   * 为什么不是注册 `user-questions/request` 监听器：
+   * 那个瀑布是按 **agent 作用域**派发的
+   * （`ctx.waterfall(scopeTarget(agent, agent), ...)`），
+   * 注册在根上下文上的监听器收不到 —— 实测 questionEventCount 一直是 0。
+   * 改成把 `userQuestions.ask` 包一层，语义等价且天然可回退。
+   */
+  function askPhoneFirst(request, fallback) {
+    const sid = agentSessionId(request && request.agent)
+    const questions = normalizeQuestions(request && request.questions)
+    questionEventCount += 1
+    lastQuestionDebug = {
+      at: Date.now(),
+      hasAgent: !!(request && request.agent),
+      agentIdType: typeof safe(function () {
+        return request.agent.id
+      }, undefined),
+      sid: sid,
+      watched: sid === null ? null : isWatched(sid),
+      watchedKeys: watchedKeys(),
+      questionCount: questions.length,
+      intercepted: !!(sid && questions.length > 0 && isWatched(sid)),
+    }
+    if (!sid || questions.length === 0 || !isWatched(sid)) return fallback()
+
+    questionSeq += 1
+    const id = 'q' + questionSeq
+    const entry = {
+      id: id,
+      sessionId: sid,
+      questions: questions,
+      createdAt: Date.now(),
+      settled: false,
+      resolve: null,
+    }
+    pendingQuestions[id] = entry
+    pushQuestion(entry)
+
+    // 调用方的 signal 中止时也交还，避免把瀑布卡死
+    safe(function () {
+      const sig = request && request.signal
+      if (sig && typeof sig.addEventListener === 'function') {
+        sig.addEventListener('abort', function () {
+          settleQuestion(entry, null, 'aborted')
+        })
+      }
+    })
+
+    return new Promise(function (resolve) {
+      entry.resolve = function (answer) {
+        delete pendingQuestions[id]
+        resolve(answer)
+      }
+    }).then(function (answer) {
+      // null = 没人从手机回答（超时/中止）→ 交回原链路（浏览器 UI）
+      return answer === null ? fallback() : answer
+    })
+  }
+
+  /** 把 userQuestions.ask 包一层；返回可还原的函数。 */
+  function installQuestionHook() {
+    const uq = ctx.get('userQuestions')
+    if (uq === undefined || typeof uq.ask !== 'function') return null
+    const original = uq.ask
+    const wrapper = function (request) {
+      return askPhoneFirst(request, function () {
+        return original.call(uq, request)
+      })
+    }
+    try {
+      uq.ask = wrapper
+    } catch (err) {
+      return null
+    }
+    return function restore() {
+      try {
+        if (uq.ask === wrapper) uq.ask = original
+      } catch (err) {
+        /* 已经还原 */
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 6. SSE：状态推送 + 单会话实时流
+   * ------------------------------------------------------------------ */
+
+  const stateClients = {}
+  let stateClientSeq = 0
+  let activeSessionId = null
+
+  function openSse(req, res) {
+    res.writeHead(
+      200,
+      corsHeaders({
+        'content-type': 'text/event-stream; charset=utf-8',
+        connection: 'keep-alive',
+        'x-accel-buffering': 'no',
+      }),
+    )
+    if (typeof res.flushHeaders === 'function') res.flushHeaders()
+    res.write(': dsh-phone-bridge stream open\n\n')
+  }
+
+  function sseSend(res, event, payload) {
+    try {
+      res.write('event: ' + event + '\ndata: ' + JSON.stringify(payload) + '\n\n')
+      return true
+    } catch (err) {
+      return false
+    }
+  }
+
+  let stateDirty = false
+  function broadcastState(force) {
+    const ids = Object.keys(stateClients)
+    if (ids.length === 0) return
+    buildState(60).then(function (state) {
+      for (let i = 0; i < ids.length; i += 1) {
+        const entry = stateClients[ids[i]]
+        if (!entry || entry.res.writableEnded) {
+          delete stateClients[ids[i]]
+          continue
+        }
+        sseSend(entry.res, force === true ? 'hello' : 'state', state)
+      }
+    })
+  }
+
+  /** 合并同一轮事件风暴，避免一次工具循环里刷爆手机。 */
+  function markStateDirty() {
+    stateDirty = true
+  }
+  every(1000, function () {
+    safe(expireQuestions, undefined)
+    if (!stateDirty) return
+    stateDirty = false
+    broadcastState(false)
+  })
+
+  function handleStateStream(req, res) {
+    const id = 's' + (stateClientSeq += 1)
+    openSse(req, res)
+    stateClients[id] = { res: res }
+    buildState(60).then(function (state) {
+      if (!res.writableEnded) sseSend(res, 'hello', state)
+    })
+    function drop() {
+      delete stateClients[id]
+      try {
+        res.end()
+      } catch (err) {
+        /* 已经关闭 */
+      }
+    }
+    req.on('close', drop)
+    req.on('error', drop)
+  }
+
+  /** 单会话实时流：转播 follow() 的帧。 */
+  function handleSessionStream(req, res, sessionId, maxMessages) {
+    if (sc === undefined || typeof sc.follow !== 'function') {
+      sendJson(res, 503, { ok: false, error: 'follow unavailable' })
+      return
+    }
+    openSse(req, res)
+    const signal = makeSignal()
+    const request = {
+      address: { kind: 'session', sessionId: sessionId },
+      maxMessages: typeof maxMessages === 'number' && maxMessages > 0 ? maxMessages : 40,
+      assistantStream: true,
+    }
+    let closed = false
+    // 只登记推送目标；「是否在看」由心跳决定（见上面的 WATCH_TTL_MS）
+    if (!sessionStreamClients[sessionId]) sessionStreamClients[sessionId] = []
+    sessionStreamClients[sessionId].push(res)
+
+    function drop() {
+      if (closed) return
+      closed = true
+      const list = sessionStreamClients[sessionId]
+      if (list) {
+        const idx = list.indexOf(res)
+        if (idx >= 0) list.splice(idx, 1)
+        if (list.length === 0) delete sessionStreamClients[sessionId]
+      }
+      signal.abort('client disconnected')
+      try {
+        res.end()
+      } catch (err) {
+        /* 已经关闭 */
+      }
+    }
+    req.on('close', drop)
+    req.on('error', drop)
+    activeSessionId = sessionId
+
+    Promise.resolve()
+      .then(function () {
+        const iter = sc.follow(request, signal)
+        const loop = iter[Symbol.asyncIterator]
+          ? iter[Symbol.asyncIterator]()
+          : iter[Symbol.iterator]()
+        function step() {
+          if (closed || signal.aborted) return Promise.resolve()
+          return loop.next().then(function (r) {
+            if (r.done || closed) {
+              if (!res.writableEnded) sseSend(res, 'end', { ok: true })
+              return
+            }
+            const frame = r.value
+            if (frame && frame.type === 'snapshot') {
+              sseSend(res, 'snapshot', {
+                cursor: frame.cursor,
+                hasMore: frame.hasMore === true,
+                header: frame.header
+                  ? {
+                      id: String(frame.header.id),
+                      cwd: frame.header.cwd || null,
+                      agentPreset: frame.header.agentPreset || null,
+                    }
+                  : null,
+                messages: deriveMessages(frame.records),
+              })
+            } else if (frame && frame.type === 'assistant-stream') {
+              const f = frame.frame || {}
+              if (f.type === 'chunk') {
+                sseSend(res, 'delta', { attemptId: String(f.attemptId || ''), index: f.index, chunk: f.chunk })
+              } else if (f.type === 'start') {
+                sseSend(res, 'attempt', { phase: 'start', attemptId: String(f.attemptId || ''), turn: f.turn, step: f.step })
+              } else if (f.type === 'end') {
+                sseSend(res, 'attempt', {
+                  phase: 'end',
+                  attemptId: String(f.attemptId || ''),
+                  outcome: f.outcome ? String(f.outcome.kind) : null,
+                  seq: f.outcome && typeof f.outcome.seq === 'number' ? f.outcome.seq : null,
+                })
+              }
+            } else if (frame && frame.type === 'event') {
+              const ev = frame.event || {}
+              if (ev.type === 'user/message' || ev.type === 'assistant/message' || ev.type === 'tool/call' || ev.type === 'tool/result') {
+                sseSend(res, 'messages', { messages: deriveMessages([frame]) })
+                markStateDirty()
+              } else if (ev.type === 'turn/start' || ev.type === 'turn/end') {
+                // 转播出去：App 靠它即时切换"停止按钮"的显隐，
+                // 不用等 5 秒一次的状态轮询（那会让按钮该出的时候不出）
+                sseSend(res, 'turn', {
+                  phase: ev.type === 'turn/start' ? 'start' : 'end',
+                  turn: safe(function () {
+                    return data.turn
+                  }, null),
+                  reason: safe(function () {
+                    return data.reason ? String(data.reason) : null
+                  }, null),
+                })
+                markStateDirty()
+              }
+            }
+            return step()
+          })
+        }
+        return step()
+      })
+      .catch(function (err) {
+        if (!closed && !res.writableEnded) {
+          sseSend(res, 'error', { message: String((err && err.message) || err) })
+          try {
+            res.end()
+          } catch (e) {
+            /* 已经关闭 */
+          }
+        }
+      })
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 6. 写操作：发消息 / 打断 / 新建会话
+   * ------------------------------------------------------------------ */
+
+  function requestId() {
+    // 只用于同一条用户消息的幂等关联，不需要密码学强度
+    const rand = Math.floor(Math.random() * 1e12).toString(36)
+    return 'phone-' + Date.now().toString(36) + '-' + rand
+  }
+
+  function doPrompt(sessionId, text) {
+    if (sc === undefined || typeof sc.prompt !== 'function') {
+      return Promise.reject(new Error('sessionController.prompt unavailable'))
+    }
+    const request = {
+      requestId: requestId(),
+      sessionId: sessionId,
+      mode: 'queue',
+      content: [{ type: 'text', text: text }],
+    }
+    return sc.prompt(request, makeSignal()).then(function (value) {
+      return { accepted: !!(value && value.accepted) }
+    })
+  }
+
+  function doCancel(sessionId) {
+    if (sc === undefined || typeof sc.cancel !== 'function') {
+      return Promise.reject(new Error('sessionController.cancel unavailable'))
+    }
+    // cancel 是同步返回 SessionCancelValue 的，这里统一包成 Promise
+    return Promise.resolve()
+      .then(function () {
+        sc.cancel({ sessionId: sessionId })
+        return { cancelled: true }
+      })
+  }
+
+  /**
+   * 新建会话。
+   *
+   * 关键差别（实测）：带 `workspaceId` 建出来的会话会自动挂进那个工作区，
+   * 只带 `cwd` 建的不会 —— 会话能跑，但在工作区列表里看不见。
+   * 所以这里先按路径反查工作区，查到就把 workspaceId 一并带上。
+   */
+  /* --------------------------- 会话/工作区管理 --------------------------- */
+
+  function doSessionRename(sessionId, title) {
+    if (sc === undefined || typeof sc.rename !== 'function') {
+      return Promise.reject(new Error('sessionController.rename unavailable'))
+    }
+    const t = typeof title === 'string' ? title.trim() : ''
+    if (!t) return Promise.reject(new Error('标题不能为空'))
+    return sc.rename({ sessionId: sessionId, title: t }).then(function (v) {
+      return { title: String((v && v.title) || t), seq: v && typeof v.seq === 'number' ? v.seq : null }
+    })
+  }
+
+  /** 分支：从某个位置分叉出一个新会话。不给 atSeq 就是从末尾分。 */
+  function doSessionFork(sessionId, atSeq) {
+    if (sc === undefined || typeof sc.fork !== 'function') {
+      return Promise.reject(new Error('sessionController.fork unavailable'))
+    }
+    const req = { sessionId: sessionId }
+    if (typeof atSeq === 'number' && atSeq >= 0) req.atSeq = atSeq
+    return sc.fork(req).then(function (v) {
+      return { sessionId: String((v && v.sessionId) || '') }
+    })
+  }
+
+  /**
+   * 归档会话。
+   *
+   * 注意会话**没有删除** —— 日志是只追加的，harness 提供的是"归档"：
+   * 从工作区分组里隐藏，文件与会话日志都保留。
+   */
+  function doSessionArchive(sessionId) {
+    const wc = ctx.get('workspaceController')
+    if (wc !== undefined && typeof wc.archiveSession === 'function') {
+      return wc.archiveSession({ sessionId: sessionId }).then(function (v) {
+        const ids = (v && v.archivedSessionIds) || []
+        return { archived: true, total: ids.length }
+      })
+    }
+    if (workspaceSvc !== undefined && typeof workspaceSvc.archiveSession === 'function') {
+      return workspaceSvc.archiveSession(sessionId).then(function () {
+        return { archived: true, total: null }
+      })
+    }
+    return Promise.reject(new Error('archiveSession unavailable'))
+  }
+
+  function doWorkspaceRename(workspaceId, title) {
+    const wc = ctx.get('workspaceController')
+    if (wc === undefined || typeof wc.rename !== 'function') {
+      return Promise.reject(new Error('workspaceController.rename unavailable'))
+    }
+    const t = typeof title === 'string' ? title.trim() : ''
+    if (!t) return Promise.reject(new Error('标题不能为空'))
+    return wc.rename({ workspaceId: workspaceId, title: t }).then(function (v) {
+      const w = (v && v.workspace) || {}
+      return { id: String(w.workspaceId || workspaceId), title: String(w.title || t) }
+    })
+  }
+
+  /**
+   * 删除工作区。
+   *
+   * 删的是**注册记录**，目录和里面的会话日志都保留 ——
+   * 这一点必须让用户知道，所以响应里把它讲清楚。
+   */
+  function doWorkspaceDelete(workspaceId) {
+    const wc = ctx.get('workspaceController')
+    if (wc === undefined || typeof wc.delete !== 'function') {
+      return Promise.reject(new Error('workspaceController.delete unavailable'))
+    }
+    return wc.delete({ workspaceId: workspaceId }).then(function () {
+      return { deleted: true }
+    })
+  }
+
+  /* ------------------------------ 文件 ------------------------------ */
+
+  /** 找某个会话的 cwd（相对路径要靠它解析）。 */
+  function sessionCwd(sessionId) {
+    if (!sessionId || sc === undefined || typeof sc.list !== 'function') return Promise.resolve('')
+    return sc.list({}, makeSignal()).then(
+      function (value) {
+        const items = (value && value.items) || []
+        for (let i = 0; i < items.length; i += 1) {
+          if (String(items[i].sessionId) === sessionId && typeof items[i].cwd === 'string') {
+            return items[i].cwd
+          }
+        }
+        return ''
+      },
+      function () {
+        return ''
+      },
+    )
+  }
+
+  /**
+   * 读一个文本文件给手机看。
+   *
+   * 相对路径按"该会话的 cwd"解析 —— 用户在正文里点的是
+   * docs/xxx.md 这种相对写法，不能要求他写全路径。
+   * 有大小上限，超了截断并标记，避免一个巨型文件把手机内存吃光。
+   */
+  function doReadFile(rawPath, sessionId, maxBytes) {
+    const fsSvc = ctx.get('fs')
+    if (fsSvc === undefined || typeof fsSvc.resolve !== 'function' || typeof fsSvc.readText !== 'function') {
+      return Promise.reject(new Error('fs service unavailable'))
+    }
+    const cap = typeof maxBytes === 'number' && maxBytes > 0 ? Math.min(maxBytes, 2 * 1024 * 1024) : 512 * 1024
+    const raw = typeof rawPath === 'string' ? rawPath.trim() : ''
+    if (!raw) return Promise.reject(new Error('path required'))
+
+    const use = function (cwd) {
+      let abs = safeAbsPath(raw)
+      if (abs === null) {
+        if (!cwd) return Promise.reject(new Error('相对路径需要会话上下文，或请给出绝对路径'))
+        const rel = raw.replace(/^\.\//, '')
+        abs = safeAbsPath(cwd.replace(/\/+$/, '') + '/' + rel)
+      }
+      if (abs === null) return Promise.reject(new Error('路径不合法'))
+      return fsSvc.resolve(abs, { signal: makeSignal() }).then(function (t) {
+        return fsSvc.stat(t, makeSignal()).then(function (info) {
+          if (!info) return Promise.reject(new Error('文件不存在：' + abs))
+          if (info.type !== 'file') return Promise.reject(new Error('不是一个普通文件：' + abs))
+          return fsSvc.readText(t, makeSignal()).then(function (text) {
+            const full = String(text)
+            const truncated = full.length > cap
+            return {
+              ok: true,
+              path: abs,
+              size: full.length,
+              truncated: truncated,
+              text: truncated ? full.slice(0, cap) : full,
+            }
+          })
+        })
+      })
+    }
+
+    if (safeAbsPath(raw) !== null) return use('')
+    return sessionCwd(sessionId).then(use)
+  }
+
+  /* ------------------------------ 模型 ------------------------------ */
+
+  /** 从 list() 的投影里取该会话当前生效的模型选择。 */
+  function projectionModel(summary) {
+    return safe(
+      function () {
+        const v = summary && summary.projections && summary.projections.values
+        const ms = v && v.modelSelection
+        if (!ms) return null
+        const sel = ms.next || ms.lastUsed
+        if (!sel) return null
+        return {
+          provider: String(sel.provider || ''),
+          model: String(sel.model || ''),
+          reasoningEffort: sel.reasoningEffort ? String(sel.reasoningEffort) : null,
+        }
+      },
+      null,
+    )
+  }
+
+  /** 主机侧可路由的模型目录（含每个模型的推理强度选项）。 */
+  function listModels(sessionId) {
+    if (sc === undefined || typeof sc.modelCatalog !== 'function') {
+      return Promise.reject(new Error('sessionController.modelCatalog unavailable'))
+    }
+    return sc.modelCatalog().then(function (cat) {
+      const c = cat || {}
+      const model = {
+        ok: true,
+        default: c.default
+          ? {
+              provider: String(c.default.provider || ''),
+              model: String(c.default.model || ''),
+              reasoningEffort: c.default.reasoningEffort ? String(c.default.reasoningEffort) : null,
+            }
+          : null,
+        routable: Array.isArray(c.routableProviders) ? c.routableProviders.map(String) : [],
+        groups: (c.groups || []).map(function (g) {
+          return {
+            id: String(g.id || ''),
+            name: String(g.name || ''),
+            models: (g.models || []).map(function (m) {
+              const out = { id: String(m.id || ''), name: String(m.name || '') }
+              if (typeof m.description === 'string') out.description = m.description
+              const r = m.reasoning
+              if (r && Array.isArray(r.efforts) && r.efforts.length > 0) {
+                out.efforts = r.efforts.map(function (e) {
+                  return { id: String(e.id || ''), name: String(e.name || '') }
+                })
+                if (r.defaultEffort) out.defaultEffort = String(r.defaultEffort)
+              }
+              return out
+            }),
+          }
+        }),
+        failures: (c.failures || []).map(function (f) {
+          return { id: String(f.id || ''), name: String(f.name || ''), message: String(f.message || '') }
+        }),
+        current: null,
+      }
+      if (!sessionId || sc === undefined || typeof sc.list !== 'function') return model
+      return sc.list({}, makeSignal()).then(
+        function (value) {
+          const items = (value && value.items) || []
+          for (let i = 0; i < items.length; i += 1) {
+            if (String(items[i].sessionId) === sessionId) {
+              model.current = projectionModel(items[i])
+              break
+            }
+          }
+          return model
+        },
+        function () {
+          return model
+        },
+      )
+    })
+  }
+
+  function doSelectModel(sessionId, provider, model, reasoningEffort) {
+    if (sc === undefined || typeof sc.selectModel !== 'function') {
+      return Promise.reject(new Error('sessionController.selectModel unavailable'))
+    }
+    if (!sessionId || !provider || !model) {
+      return Promise.reject(new Error('需要 sessionId / provider / model'))
+    }
+    const request = { sessionId: sessionId, provider: provider, model: model }
+    if (typeof reasoningEffort === 'string' && reasoningEffort) request.reasoningEffort = reasoningEffort
+    return sc.selectModel(request).then(function (value) {
+      const sel = (value && value.selected) || {}
+      return {
+        provider: String(sel.provider || ''),
+        model: String(sel.model || ''),
+        reasoningEffort: sel.reasoningEffort ? String(sel.reasoningEffort) : null,
+      }
+    })
+  }
+
+  function doCreate(cwd, workspaceId, agentPreset) {
+    if (sc === undefined || typeof sc.create !== 'function') {
+      return Promise.reject(new Error('sessionController.create unavailable'))
+    }
+    const request = {}
+    if (typeof cwd === 'string' && cwd) request.cwd = cwd
+    if (typeof workspaceId === 'string' && workspaceId) request.workspaceId = workspaceId
+    if (typeof agentPreset === 'string' && agentPreset) request.agentPreset = agentPreset
+
+    return Promise.resolve()
+      .then(function () {
+        if (request.workspaceId || !request.cwd) return undefined
+        if (workspaceSvc === undefined || typeof workspaceSvc.resolveByPath !== 'function') return undefined
+        return workspaceSvc.resolveByPath(request.cwd).then(
+          function (w) {
+            if (w && w.id) request.workspaceId = String(w.id)
+          },
+          function () {
+            /* 目录还没登记成工作区，保持只带 cwd */
+          },
+        )
+      })
+      .then(function () {
+        return sc.create(request)
+      })
+      .then(function (value) {
+        return { sessionId: String(value && value.sessionId), workspaceId: request.workspaceId || null }
+      })
+  }
+
+  /* ------------------------- 工作区 / 目录 ------------------------- */
+
+  /** cwd -> workspaceId 的索引，用于给每个会话标注所属工作区。 */
+  function workspaceByPath() {
+    const map = {}
+    const list = safe(function () {
+      return workspaceSvc && typeof workspaceSvc.list === 'function' ? workspaceSvc.list() : []
+    }, [])
+    for (let i = 0; i < list.length; i += 1) {
+      const w = list[i]
+      if (w && w.path !== undefined) map[String(w.path)] = String(w.id)
+    }
+    return map
+  }
+
+  /**
+   * 工作区列表。
+   *
+   * 会话归属不靠我们自己算 —— workspace.sessionIds 已经是 harness 按
+   * canonical-cwd 索引过滤好的，直接用它，避免两边规则不一致。
+   */
+  function listWorkspaces() {
+    if (workspaceSvc === undefined || typeof workspaceSvc.list !== 'function') {
+      return Promise.resolve({ ok: false, error: 'workspaceRegistry unavailable', workspaces: [] })
+    }
+    const ws = safe(function () {
+      return workspaceSvc.list()
+    }, [])
+    const summaries = {}
+    const listPromise =
+      sc !== undefined && typeof sc.list === 'function'
+        ? sc.list({}, makeSignal()).then(
+            function (value) {
+              const items = (value && value.items) || []
+              for (let i = 0; i < items.length; i += 1) {
+                if (items[i]) summaries[String(items[i].sessionId)] = items[i]
+              }
+            },
+            function () {},
+          )
+        : Promise.resolve()
+
+    return listPromise.then(function () {
+      const live = liveSessionMap()
+      const out = []
+      for (let i = 0; i < ws.length; i += 1) {
+        const w = ws[i]
+        if (!w) continue
+        const ids = (w.sessionIds || []).map(function (x) {
+          return String(x)
+        })
+        let runningCount = 0
+        const sessions = []
+        for (let k = 0; k < ids.length; k += 1) {
+          const sid = ids[k]
+          const summary = summaries[sid]
+          const running = !!(summary && summary.running)
+          if (running) runningCount += 1
+          sessions.push({
+            id: sid,
+            title: titleOf(summary, live[sid]),
+            running: running,
+            blank: !!(summary && summary.blank),
+            updatedAt: summary && typeof summary.updatedAt === 'number' ? summary.updatedAt : 0,
+            activity: activityOf(sid),
+            cwd: summary && typeof summary.cwd === 'string' ? summary.cwd : String(w.path),
+          })
+        }
+        sessions.sort(function (a, b) {
+          return (b.updatedAt || 0) - (a.updatedAt || 0)
+        })
+        out.push({
+          id: String(w.id),
+          path: String(w.path || ''),
+          title: String(w.title || ''),
+          createdAt: w.createdAt ? String(w.createdAt) : null,
+          updatedAt: w.updatedAt ? String(w.updatedAt) : null,
+          sessionCount: ids.length,
+          runningCount: runningCount,
+          sessions: sessions,
+        })
+      }
+      return { ok: true, workspaces: out }
+    })
+  }
+
+  /* ---------------------- 路径校验（手机端输入不可信） ---------------------- */
+
+  /** 只接受绝对路径，且不允许出现 `..` 段。 */
+  function safeAbsPath(value) {
+    if (typeof value !== 'string') return null
+    const v = value.trim()
+    if (!v || v.charAt(0) !== '/') return null
+    if (v.indexOf('\u0000') >= 0) return null
+    const parts = v.split('/')
+    for (let i = 0; i < parts.length; i += 1) {
+      if (parts[i] === '..') return null
+    }
+    const trimmed = v.replace(/\/+$/, '')
+    return trimmed === '' ? '/' : trimmed
+  }
+
+  /** 只接受单个路径段（文件夹名），挡掉 `/`、`.`、`..` 和空白。 */
+  function safeSegment(value) {
+    if (typeof value !== 'string') return null
+    const n = value.trim()
+    if (!n || n === '.' || n === '..') return null
+    if (n.length > 200) return null
+    if (n.indexOf('/') >= 0 || n.indexOf('\u0000') >= 0) return null
+    return n
+  }
+
+  /** POSIX 单引号转义，用于把路径安全地拼进 shell 命令。 */
+  function shellQuote(value) {
+    return "'" + String(value).replace(/'/g, "'\\''") + "'"
+  }
+
+  function pathJoin(parent, name) {
+    return (parent === '/' ? '' : parent) + '/' + name
+  }
+
+  function crumbsOf(absPath) {
+    const out = [{ name: '/', path: '/' }]
+    const parts = String(absPath).split('/')
+    let acc = ''
+    for (let i = 0; i < parts.length; i += 1) {
+      if (!parts[i]) continue
+      acc += '/' + parts[i]
+      out.push({ name: parts[i], path: acc })
+    }
+    return out
+  }
+
+  /** 家目录：只取一次并缓存（动态宿主里读不到宿主机环境变量）。 */
+  let homeCache = ''
+  function homeDir() {
+    if (homeCache) return Promise.resolve(homeCache)
+    const sh = ctx.get('shell')
+    if (sh === undefined || typeof sh.resolve !== 'function' || typeof sh.run !== 'function') {
+      homeCache = '/'
+      return Promise.resolve(homeCache)
+    }
+    return Promise.resolve()
+      .then(function () {
+        return sh.run(sh.resolve({ command: 'printf %s "$HOME"', workdir: '/', timeoutMs: 5000 }))
+      })
+      .then(
+        function (r) {
+          const v = ((r && r.stdout && r.stdout.text) || '').trim()
+          homeCache = v && v.charAt(0) === '/' ? v : '/'
+          return homeCache
+        },
+        function () {
+          homeCache = '/'
+          return homeCache
+        },
+      )
+  }
+
+  /* --------------------------- 目录浏览 / 新建 --------------------------- */
+
+  function doFsList(path) {
+    const fsSvc = ctx.get('fs')
+    if (fsSvc === undefined || typeof fsSvc.resolve !== 'function' || typeof fsSvc.listDir !== 'function') {
+      return Promise.reject(new Error('fs service unavailable'))
+    }
+    const wanted = safeAbsPath(path)
+    return homeDir().then(function (home) {
+      const start = wanted || home
+      return fsSvc.resolve(start, { signal: makeSignal() }).then(function (target) {
+        return fsSvc.listDir(target, makeSignal()).then(function (entries) {
+          const dirs = []
+          const list = entries || []
+          for (let i = 0; i < list.length; i += 1) {
+            const e = list[i]
+            if (!e || e.type !== 'directory') continue
+            const p = e.target && e.target.displayPath ? String(e.target.displayPath) : ''
+            if (!p) continue
+            dirs.push({ name: String(e.name || ''), path: p, hidden: String(e.name || '').charAt(0) === '.' })
+          }
+          dirs.sort(function (a, b) {
+            const ah = a.hidden ? 1 : 0
+            const bh = b.hidden ? 1 : 0
+            if (ah !== bh) return ah - bh
+            return a.name.localeCompare(b.name)
+          })
+          const shown = dirs.slice(0, 400)
+          return {
+            ok: true,
+            path: target.displayPath ? String(target.displayPath) : start,
+            home: home,
+            truncated: dirs.length > shown.length,
+            crumbs: crumbsOf(target.displayPath ? String(target.displayPath) : start),
+            entries: shown,
+          }
+        })
+      })
+    })
+  }
+
+  /**
+   * 在电脑上新建文件夹。
+   *
+   * 优先用 harness 自己的目录选择器后端（它自带校验）；这台机器的组合装的是
+   * native 选择器、没有 browse 能力，所以退回用 shell 执行 mkdir。
+   * 走 shell 就必须自己把关：路径与名字都先过严格校验，再单引号转义。
+   */
+  function doFsMkdir(parent, name) {
+    const p = safeAbsPath(parent)
+    const n = safeSegment(name)
+    if (p === null) return Promise.reject(new Error('parent 必须是绝对路径且不含 ..'))
+    if (n === null) return Promise.reject(new Error('文件夹名不合法（不能为空、不能含 /、不能是 . 或 ..）'))
+    const target = pathJoin(p, n)
+
+    if (dirPicker !== undefined && typeof dirPicker.createDirectory === 'function') {
+      return dirPicker.createDirectory(p, n).then(
+        function (created) {
+          return { ok: true, path: String(created || target), via: 'directoryPicker' }
+        },
+        function () {
+          return mkdirViaShell(target, p)
+        },
+      )
+    }
+    return mkdirViaShell(target, p)
+  }
+
+  function mkdirViaShell(target, workdir) {
+    const sh = ctx.get('shell')
+    if (sh === undefined || typeof sh.resolve !== 'function' || typeof sh.run !== 'function') {
+      return Promise.reject(new Error('既没有 directoryPicker.createDirectory，也没有 shell 可用'))
+    }
+    return Promise.resolve()
+      .then(function () {
+        return sh.run(
+          sh.resolve({
+            command: 'mkdir -p -- ' + shellQuote(target),
+            workdir: workdir,
+            timeoutMs: 10000,
+            // 必须显式给策略：组合里的 sandbox-policy 默认是 workspace-write
+            // 且根是 harness 的 cwd，工作区目录通常落在它之外 —— 那样 mkdir 会被
+            // 沙箱静默丢弃（exit 0 但文件没建出来）。这里建的是用户明确要求的目录，
+            // 与用户会话自身的 danger-full-access 预设一致。
+            sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: workdir },
+          }),
+        )
+      })
+      .then(function (r) {
+        const code = r && typeof r.exitCode === 'number' ? r.exitCode : null
+        if (code !== 0) {
+          const err = ((r && r.stderr && r.stderr.text) || '').trim()
+          throw new Error('mkdir 失败（exit ' + code + '）：' + err.slice(0, 200))
+        }
+        // 不信 exitCode：沙箱可能让命令"成功"但写不进去。用 fs 复核。
+        return verifyDirectory(target).then(function (exists) {
+          if (!exists) {
+            const sb = r && r.sandbox ? ' sandbox=' + String(r.sandbox.mode) + '/denied=' + String(r.sandbox.denied) : ''
+            throw new Error('mkdir 报告成功但目录不存在（可能被沙箱拦下）' + sb)
+          }
+          return { ok: true, path: target, via: 'shell' }
+        })
+      })
+  }
+
+  /** 复核目录确实存在且是目录。 */
+  function verifyDirectory(absPath) {
+    const fsSvc = ctx.get('fs')
+    if (fsSvc === undefined || typeof fsSvc.resolve !== 'function' || typeof fsSvc.stat !== 'function') {
+      return Promise.resolve(true)
+    }
+    return fsSvc.resolve(absPath, { signal: makeSignal() }).then(
+      function (t) {
+        return fsSvc.stat(t, makeSignal()).then(function (info) {
+          return !!(info && info.type === 'directory')
+        })
+      },
+      function () {
+        return false
+      },
+    )
+  }
+
+  function doWorkspaceCreate(path, title) {
+    if (workspaceSvc === undefined || typeof workspaceSvc.create !== 'function') {
+      return Promise.reject(new Error('workspaceRegistry.create unavailable'))
+    }
+    if (typeof path !== 'string' || !path) return Promise.reject(new Error('path required'))
+    // create() 会对路径做 realpath，目录不存在会直接 reject —— 所以调用方要先 mkdir
+    return workspaceSvc.create(path, typeof title === 'string' && title ? title : undefined).then(function (w) {
+      return { ok: true, id: String(w.id), path: String(w.path || ''), title: String(w.title || '') }
+    })
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 6bis. 手机终端（真 PTY）
+   *
+   * 目标：在手机上对这台电脑敲命令 —— 尤其在会话里复制一段命令后，
+   * 切到终端粘上就能跑。
+   *
+   * 为什么不用 SSH：
+   *   - Android 上没有自带 ssh 客户端，得往 APK 里塞一个 Java SSH 实现
+   *     （密钥、known_hosts、密码输入全要自己做），体积和出错面都大；
+   *   - 还要多开一条通道（adb reverse 22 或 tailscale serve 22）。
+   * 这里直接用宿主已有的 `subprocess.spawnTerminal` —— 它是一个**真 PTY**
+   * （不是把 bash 挂在管道上），所以提示符、行编辑、Ctrl-C、颜色、
+   * vim/htop 这类全屏程序都能用。传输走已有的 /phone/*（同一个端口、同一把令牌），
+   * 在家走 adb reverse、在外走 tailnet，都是低延迟路径。
+   *
+   * 三条纪律：
+   *   - 终端属于**这台电脑**，不属于任何会话；插件卸载时必须全部杀掉，
+   *     否则 reload 一次就漏一堆 bash 进程；
+   *   - 每条连接保留一段输出环形缓冲，手机切走再回来能接上（见 snapshot）；
+   *   - 没人看、也没人敲的终端超时回收（宿主没有 setTimeout，用 every() 扫）。
+   * ------------------------------------------------------------------ */
+
+  const subprocessSvc = ctx.get('subprocess')
+  const terms = {}
+  let termSeq = 0
+  const TERM_MAX = 4
+  const TERM_BUF_MAX = 96 * 1024
+  const TERM_IDLE_MS = 30 * 60 * 1000
+  const TERM_DEFAULT_COLS = 100
+  const TERM_DEFAULT_ROWS = 32
+
+  function clampInt(value, lo, hi, fallback) {
+    const n = typeof value === 'number' ? value : parseInt(value, 10)
+    if (!isFinite(n)) return fallback
+    return Math.max(lo, Math.min(hi, Math.floor(n)))
+  }
+
+  /**
+   * 收尾：杀掉 PTY、通知所有客户端、从表里删掉。
+   *
+   * 幂等 —— `done`、超时回收、手机点「关闭」、插件卸载可能同时到达。
+   */
+  function termClose(id, reason) {
+    const t = terms[id]
+    if (!t) return
+    delete terms[id]
+    try {
+      if (t.handle && typeof t.handle.terminate === 'function') t.handle.terminate()
+    } catch (err) {
+      /* 已经退了 */
+    }
+    t.closed = true
+    for (let i = 0; i < t.clients.length; i += 1) {
+      const res = t.clients[i]
+      try {
+        if (!res.writableEnded) {
+          sseSend(res, 'closed', { reason: reason || 'closed' })
+          res.end()
+        }
+      } catch (err) {
+        /* 忽略 */
+      }
+    }
+    t.clients.length = 0
+  }
+
+  /** 输出只留最后一段：手机重连时拿到的是"最近这些"，不是从头开始。 */
+  function termAppend(t, text) {
+    t.buf += text
+    if (t.buf.length > TERM_BUF_MAX) t.buf = t.buf.slice(t.buf.length - TERM_BUF_MAX)
+    t.lastOut = Date.now()
+  }
+
+  function termBroadcast(t, event, payload) {
+    for (let i = t.clients.length - 1; i >= 0; i -= 1) {
+      const res = t.clients[i]
+      if (!res || res.writableEnded) {
+        t.clients.splice(i, 1)
+        continue
+      }
+      sseSend(res, event, payload)
+    }
+  }
+
+  /**
+   * 把 PTY 的输出泵到手机上。
+   *
+   * 用**同一个** TextDecoder 逐块 decode({stream:true})：一个汉字被切成两半时
+   * 才不会变成乱码 —— 中文输出在这个项目里是常态，这个坑必须躲开。
+   */
+  function termPump(t) {
+    const decoder = new TextDecoder('utf-8')
+    const stream = t.handle.output
+    const iterator = stream[Symbol.asyncIterator] ? stream[Symbol.asyncIterator]() : null
+    if (!iterator) return
+    function step() {
+      iterator.next().then(
+        function (r) {
+          if (!terms[t.id]) return
+          if (r.done) {
+            termFinish(t)
+            return
+          }
+          const chunk = r.value
+          const text = typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true })
+          if (text) {
+            termAppend(t, text)
+            termBroadcast(t, 'out', { data: text })
+          }
+          step()
+        },
+        function () {
+          termFinish(t)
+        },
+      )
+    }
+    step()
+  }
+
+  function termFinish(t) {
+    if (t.exited) return
+    t.exited = true
+    termBroadcast(t, 'exit', { code: t.exitCode, signal: t.exitSignal })
+  }
+
+  /** 空闲回收：没人连着、也没人敲，超过 TERM_IDLE_MS 就关掉。 */
+  function sweepTerms() {
+    const now = Date.now()
+    const ids = Object.keys(terms)
+    for (let i = 0; i < ids.length; i += 1) {
+      const t = terms[ids[i]]
+      if (!t) continue
+      if (t.exited && t.clients.length === 0) {
+        termClose(ids[i], 'exited')
+        continue
+      }
+      if (t.clients.length === 0 && now - (t.lastActive || t.createdAt) > TERM_IDLE_MS) {
+        termClose(ids[i], 'idle')
+      }
+    }
+  }
+  every(20_000, function () {
+    safe(sweepTerms, undefined)
+    safe(termHeartbeat, undefined)
+  })
+
+  /**
+   * 蜂窝网下 SSE 静默太久会被中间设备掐掉（状态流本来就一直在推，不怕；
+   * 终端可以几分钟没输出），所以定期打个注释行当心跳。
+   */
+  function termHeartbeat() {
+    const ids = Object.keys(terms)
+    for (let i = 0; i < ids.length; i += 1) {
+      const t = terms[ids[i]]
+      for (let k = t.clients.length - 1; k >= 0; k -= 1) {
+        const res = t.clients[k]
+        if (!res || res.writableEnded) {
+          t.clients.splice(k, 1)
+          continue
+        }
+        try {
+          res.write(': ping\n\n')
+        } catch (err) {
+          t.clients.splice(k, 1)
+        }
+      }
+    }
+  }
+
+  /** 默认工作目录：手机上没指定就落到家目录。 */
+  function termDefaultCwd() {
+    return homeDir().then(
+      function (home) {
+        return home || '/'
+      },
+      function () {
+        return '/'
+      },
+    )
+  }
+
+  /**
+   * 用 `/usr/bin/env VAR=val cmd` 给 shell 补 TERM，而不是往 spec.env 里塞。
+   *
+   * 原因：`SubprocessTerminalSpawnSpec.env` 的语义是"完全指定环境"
+   * （没有默认值可继承），只塞一个 TERM 有把 PATH/HOME 一起抹掉的风险 ——
+   * 那就从"没颜色"变成"命令都找不着"了。env(1) 只动指定的变量，其余原样传递，
+   * 是唯一不用猜的写法。实测宿主的基线环境是 TERM=dumb + LANG=zh_CN.UTF-8。
+   */
+  let envBinCache = null
+  function resolveEnvBin() {
+    if (envBinCache !== null) return Promise.resolve(envBinCache)
+    const fsSvc = ctx.get('fs')
+    if (fsSvc === undefined || typeof fsSvc.resolve !== 'function' || typeof fsSvc.stat !== 'function') {
+      envBinCache = ''
+      return Promise.resolve('')
+    }
+    return Promise.resolve()
+      .then(function () {
+        return fsSvc.resolve('/usr/bin/env', { signal: makeSignal() })
+      })
+      .then(
+        function (target) {
+          return fsSvc.stat(target, makeSignal())
+        },
+        function () {
+          return undefined
+        },
+      )
+      .then(
+        function (info) {
+          envBinCache = info && info.type === 'file' ? '/usr/bin/env' : ''
+          return envBinCache
+        },
+        function () {
+          envBinCache = ''
+          return ''
+        },
+      )
+  }
+
+  /** 开一个终端。cols/rows 在分配时就定死了（PTY 尺寸没有 resize 接口）。 */
+  function termOpen(body) {
+    if (subprocessSvc === undefined || typeof subprocessSvc.spawnTerminal !== 'function') {
+      return Promise.reject(new Error('这台电脑的 harness 没挂 subprocess 服务，开不了终端'))
+    }
+    sweepTerms()
+    if (Object.keys(terms).length >= TERM_MAX) {
+      return Promise.reject(new Error('终端开太多了（最多 ' + TERM_MAX + ' 个），先关掉一个'))
+    }
+    const cols = clampInt(body.cols, 20, 400, TERM_DEFAULT_COLS)
+    const rows = clampInt(body.rows, 6, 200, TERM_DEFAULT_ROWS)
+    const shell = typeof body.shell === 'string' && body.shell.indexOf('/') === 0 ? body.shell : '/bin/bash'
+    const wanted = safeAbsPath(body.cwd)
+    const id = 't' + (termSeq += 1) + '-' + Date.now().toString(36)
+    return Promise.all([
+      wanted ? Promise.resolve(wanted) : termDefaultCwd(),
+      resolveEnvBin(),
+    ]).then(function (pair) {
+      const cwd = pair[0]
+      const envBin = pair[1]
+      // 真终端该有的 TERM；没有 env(1) 就退回裸 bash（功能不受影响，只是没颜色）
+      const argv = envBin
+        ? [envBin, 'TERM=xterm-256color', 'COLORTERM=truecolor', shell, '-l']
+        : [shell, '-l']
+      const spec = {
+        argv: argv,
+        cwd: cwd,
+        rows: rows,
+        cols: cols,
+        graceMs: 3000,
+      }
+      return subprocessSvc.spawnTerminal(spec).then(function (handle) {
+        const t = {
+          id: id,
+          handle: handle,
+          pid: typeof handle.pid === 'number' ? handle.pid : 0,
+          buf: '',
+          clients: [],
+          createdAt: Date.now(),
+          lastActive: Date.now(),
+          exited: false,
+          exitCode: null,
+          exitSignal: null,
+          cwd: cwd,
+          cols: cols,
+          rows: rows,
+        }
+        terms[id] = t
+        Promise.resolve(handle.done).then(
+          function (outcome) {
+            t.exitCode = outcome && typeof outcome.exitCode === 'number' ? outcome.exitCode : null
+            t.exitSignal = outcome && outcome.signal ? String(outcome.signal) : null
+            termFinish(t)
+          },
+          function () {
+            termFinish(t)
+          },
+        )
+        termPump(t)
+        return { ok: true, id: id, pid: t.pid, cwd: cwd, cols: cols, rows: rows }
+      })
+    })
+  }
+
+  /** 手机侧的输入。data 里可以带 \r（回车）、\u0003（Ctrl-C）等控制字符。 */
+  function termWrite(id, data) {
+    const t = terms[id]
+    if (!t) return Promise.reject(new Error('终端不存在或已关闭'))
+    if (t.exited) return Promise.reject(new Error('终端已经退出了'))
+    t.lastActive = Date.now()
+    return Promise.resolve(t.handle.write(data)).then(function () {
+      return { ok: true }
+    })
+  }
+
+  /** Ctrl-C 之类：交给 PTY 的前台进程组，不是 kill 掉这个终端。 */
+  function termSignal(id, name) {
+    const t = terms[id]
+    if (!t) return Promise.reject(new Error('终端不存在或已关闭'))
+    const allowed = ['SIGINT', 'SIGTERM', 'SIGKILL', 'SIGTSTP', 'SIGHUP']
+    if (allowed.indexOf(name) < 0) return Promise.reject(new Error('不允许的信号：' + name))
+    t.lastActive = Date.now()
+    return Promise.resolve(t.handle.signalForeground(name)).then(function (pgid) {
+      return { ok: true, pgid: typeof pgid === 'number' ? pgid : 0 }
+    })
+  }
+
+  /** 单终端实时流：先补一段缓冲（切走再回来能接上），再接增量。 */
+  function handleTermStream(req, res, id) {
+    const t = terms[id]
+    if (!t) {
+      sendJson(res, 404, { ok: false, error: '终端不存在或已关闭' })
+      return
+    }
+    openSse(req, res)
+    t.clients.push(res)
+    t.lastActive = Date.now()
+    sseSend(res, 'hello', {
+      id: id,
+      pid: t.pid,
+      cwd: t.cwd,
+      cols: t.cols,
+      rows: t.rows,
+      buffered: t.buf,
+      exited: t.exited,
+      exitCode: t.exitCode,
+    })
+    function drop() {
+      const idx = t.clients.indexOf(res)
+      if (idx >= 0) t.clients.splice(idx, 1)
+      try {
+        res.end()
+      } catch (err) {
+        /* 已经关了 */
+      }
+    }
+    req.on('close', drop)
+    req.on('error', drop)
+  }
+
+  function termList() {
+    const ids = Object.keys(terms)
+    const out = []
+    for (let i = 0; i < ids.length; i += 1) {
+      const t = terms[ids[i]]
+      out.push({
+        id: t.id,
+        pid: t.pid,
+        cwd: t.cwd,
+        cols: t.cols,
+        rows: t.rows,
+        clients: t.clients.length,
+        buffered: t.buf.length,
+        exited: t.exited,
+        exitCode: t.exitCode,
+        idleMs: Date.now() - (t.lastActive || t.createdAt),
+      })
+    }
+    return out
+  }
+
+  /** 插件卸载 / 更新：一个 PTY 都不许留。 */
+  function termKillAll() {
+    const ids = Object.keys(terms)
+    for (let i = 0; i < ids.length; i += 1) termClose(ids[i], 'plugin unload')
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 7. 路由
+   * ------------------------------------------------------------------ */
+
+  function handle(req, res) {
+    let parsed
+    try {
+      parsed = parseUrl(req.url)
+    } catch (err) {
+      sendText(res, 400, 'bad url')
+      return
+    }
+    const path = parsed.path
+    const query = parsed.query
+
+    if (path.indexOf(BASE) !== 0) {
+      sendText(res, 404, 'not a bridge route')
+      return
+    }
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, corsHeaders())
+      res.end()
+      return
+    }
+    if (!authorized(req, query)) {
+      sendJson(res, 401, { ok: false, error: 'unauthorized' })
+      return
+    }
+
+    const seg = segments(path)
+
+    // GET /phone/health
+    if (seg.length === 1 && seg[0] === 'health') {
+      sendJson(res, 200, { ok: true, name: NAME, version: VERSION, ts: Date.now() })
+      return
+    }
+
+    // GET /phone/state?watching=<sessionId>
+    // App 每次轮询顺便报一次"我还开着这个会话"，这就是心跳
+    if (seg.length === 1 && seg[0] === 'state') {
+      if (query.watching) touchWatch(query.watching)
+      buildState(query.max ? parseInt(query.max, 10) : 60).then(function (state) {
+        sendJson(res, 200, state)
+      })
+      return
+    }
+
+    // GET /phone/events  (SSE)
+    if (seg.length === 1 && seg[0] === 'events') {
+      handleStateStream(req, res)
+      return
+    }
+
+    // POST /phone/new   body: { cwd?, workspaceId?, agentPreset? }
+    if (seg.length === 1 && seg[0] === 'new') {
+      parseBody(req).then(function (body) {
+        doCreate(body.cwd, body.workspaceId, body.agentPreset).then(
+          function (value) {
+            markStateDirty()
+            sendJson(res, 200, { ok: true, sessionId: value.sessionId })
+          },
+          function (err) {
+            sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
+      })
+      return
+    }
+
+    // GET /phone/diag   内部状态自检（排查"手机上没收到提问"这类问题）
+    if (seg.length === 1 && seg[0] === 'diag') {
+      sendJson(res, 200, {
+        ok: true,
+        watchedSessions: watchedKeys(),
+        watchTtlMs: WATCH_TTL_MS,
+        sessionStreams: Object.keys(sessionStreamClients),
+        pendingQuestions: Object.keys(pendingQuestions),
+        questionEventCount: questionEventCount,
+        sessionEventCount: sessionEventCount,
+        backfill: { done: backfillDone, sessions: backfillCount, tracked: Object.keys(activity).length },
+        lastSessionEvent: lastSessionEventDebug,
+        lastQuestion: lastQuestionDebug,
+        stateClients: Object.keys(stateClients).length,
+        terminals: termList(),
+      })
+      return
+    }
+
+    // GET /phone/term/list   当前活着的终端（排查"命令卡住了"这类问题）
+    if (seg.length === 2 && seg[0] === 'term' && seg[1] === 'list') {
+      sendJson(res, 200, { ok: true, terminals: termList() })
+      return
+    }
+
+    // POST /phone/term/open  { cols?, rows?, cwd?, shell? }  → 开一个真 PTY
+    if (seg.length === 2 && seg[0] === 'term' && seg[1] === 'open') {
+      parseBody(req).then(function (body) {
+        return termOpen(body).then(
+          function (value) {
+            sendJson(res, 200, value)
+          },
+          function (err) {
+            sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
+      })
+      return
+    }
+
+    // GET /phone/term/<id>/stream   输出实时流（SSE，先给缓冲再接增量）
+    if (seg.length === 3 && seg[0] === 'term' && seg[2] === 'stream') {
+      handleTermStream(req, res, seg[1])
+      return
+    }
+
+    // POST /phone/term/<id>/input  { data }   键盘输入（可含 \r 与控制字符）
+    if (seg.length === 3 && seg[0] === 'term' && seg[2] === 'input') {
+      parseBody(req).then(function (body) {
+        const data = typeof body.data === 'string' ? body.data : ''
+        if (!data) {
+          sendJson(res, 400, { ok: false, error: 'data required' })
+          return
+        }
+        return termWrite(seg[1], data).then(
+          function (value) {
+            sendJson(res, 200, value)
+          },
+          function (err) {
+            sendJson(res, 404, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
+      })
+      return
+    }
+
+    // POST /phone/term/<id>/signal { signal: 'SIGINT' | ... }   Ctrl-C 等
+    if (seg.length === 3 && seg[0] === 'term' && seg[2] === 'signal') {
+      parseBody(req).then(function (body) {
+        return termSignal(seg[1], String(body.signal || 'SIGINT')).then(
+          function (value) {
+            sendJson(res, 200, value)
+          },
+          function (err) {
+            sendJson(res, 400, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
+      })
+      return
+    }
+
+    // POST /phone/term/<id>/close   关掉这个终端的 shell
+    if (seg.length === 3 && seg[0] === 'term' && seg[2] === 'close') {
+      termClose(seg[1], 'phone request')
+      sendJson(res, 200, { ok: true })
+      return
+    }
+
+    // GET /phone/file?path=<p>&sessionId=<id>   读一个文本文件（给文档阅读页用）
+    if (seg.length === 1 && seg[0] === 'file') {
+      const max = query.max ? parseInt(query.max, 10) : undefined
+      doReadFile(query.path, query.sessionId, max).then(
+        function (value) {
+          sendJson(res, 200, value)
+        },
+        function (err) {
+          sendJson(res, 404, { ok: false, error: String((err && err.message) || err) })
+        },
+      )
+      return
+    }
+
+    // GET  /phone/models?sessionId=<id>   模型目录 + 该会话当前选择
+    // POST /phone/model  { sessionId, provider, model, reasoningEffort? }
+    if (seg.length === 1 && seg[0] === 'models') {
+      if (req.method === 'POST') {
+        parseBody(req).then(function (body) {
+          doSelectModel(body.sessionId, body.provider, body.model, body.reasoningEffort).then(
+            function (selected) {
+              markStateDirty()
+              sendJson(res, 200, { ok: true, selected: selected })
+            },
+            function (err) {
+              sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+            },
+          )
+        })
+        return
+      }
+      listModels(query.sessionId).then(
+        function (value) {
+          sendJson(res, 200, value)
+        },
+        function (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+        },
+      )
+      return
+    }
+
+    // POST /phone/answer   body: { id, answers:[{id,selected,custom?}] }
+    if (seg.length === 1 && seg[0] === 'answer' && req.method === 'POST') {
+      parseBody(req).then(function (body) {
+        const entry = pendingQuestions[String(body.id || '')]
+        if (!entry || entry.settled) {
+          sendJson(res, 409, { ok: false, error: '这个问题已经结束或不存在' })
+          return
+        }
+        const answers = normalizeAnswers(body.answers)
+        if (answers.length === 0) {
+          sendJson(res, 400, { ok: false, error: 'answers 为空' })
+          return
+        }
+        settleQuestion(entry, { answers: answers }, 'answered')
+        sendJson(res, 200, { ok: true })
+      })
+      return
+    }
+
+    // GET /phone/workspaces        历史 + 当前的工作区（含各自会话）
+    // POST /phone/workspaces/create { path, title? }
+    if (seg.length >= 1 && seg[0] === 'workspaces') {
+      const action = seg.length >= 2 ? seg[1] : ''
+      const reply = function (promise) {
+        promise.then(
+          function (value) {
+            sendJson(res, 200, value)
+          },
+          function (err) {
+            sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
+      }
+      if (action === 'create' && req.method === 'POST') {
+        parseBody(req).then(function (body) {
+          reply(
+            doWorkspaceCreate(body.path, body.title).then(function (value) {
+              markStateDirty()
+              return value
+            }),
+          )
+        })
+        return
+      }
+      if (action === '' || action === 'list') {
+        reply(listWorkspaces())
+        return
+      }
+      if (seg.length >= 3 && seg[2] === 'rename' && req.method === 'POST') {
+        parseBody(req).then(function (body) {
+          doWorkspaceRename(seg[1], body.title).then(
+            function (value) {
+              markStateDirty()
+              sendJson(res, 200, { ok: true, id: value.id, title: value.title })
+            },
+            function (err) {
+              sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+            },
+          )
+        })
+        return
+      }
+      if (seg.length >= 3 && seg[2] === 'delete' && req.method === 'POST') {
+        doWorkspaceDelete(seg[1]).then(
+          function (value) {
+            markStateDirty()
+            sendJson(res, 200, { ok: true, deleted: value.deleted })
+          },
+          function (err) {
+            sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
+        return
+      }
+      sendJson(res, 404, { ok: false, error: 'unknown workspaces action: ' + action })
+      return
+    }
+
+    // GET  /phone/fs/list?path=<abs>      浏览电脑上的目录（用于选/建项目文件夹）
+    // POST /phone/fs/mkdir { parent, name }  在电脑上新建文件夹
+    if (seg.length === 2 && seg[0] === 'fs') {
+      if (seg[1] === 'list') {
+        doFsList(query.path).then(
+          function (value) {
+            sendJson(res, 200, value)
+          },
+          function (err) {
+            sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
+        return
+      }
+      if (seg[1] === 'mkdir' && req.method === 'POST') {
+        parseBody(req).then(function (body) {
+          doFsMkdir(body.parent, body.name).then(
+            function (value) {
+              sendJson(res, 200, value)
+            },
+            function (err) {
+              sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+            },
+          )
+        })
+        return
+      }
+      sendJson(res, 404, { ok: false, error: 'unknown fs action: ' + seg[1] })
+      return
+    }
+
+    // GET /phone/sessions/<id>[/history|/live]
+    if (seg.length >= 2 && seg[0] === 'sessions') {
+      const sessionId = seg[1]
+      const action = seg.length >= 3 ? seg[2] : 'history'
+      const max = query.max ? parseInt(query.max, 10) : 40
+
+      if (action === 'live') {
+        handleSessionStream(req, res, sessionId, max)
+        return
+      }
+      if (action === 'history') {
+        loadHistory(sessionId, max).then(
+          function (value) {
+            sendJson(res, 200, {
+              ok: true,
+              sessionId: sessionId,
+              cursor: value.cursor,
+              header: value.header,
+              messages: value.messages,
+            })
+          },
+          function (err) {
+            sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
+        return
+      }
+      if (action === 'prompt' && req.method === 'POST') {
+        parseBody(req).then(function (body) {
+          const text = typeof body.text === 'string' ? body.text : ''
+          if (!text.trim()) {
+            sendJson(res, 400, { ok: false, error: 'empty text' })
+            return
+          }
+          doPrompt(sessionId, text).then(
+            function (value) {
+              markStateDirty()
+              sendJson(res, 200, { ok: true, accepted: value.accepted })
+            },
+            function (err) {
+              sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+            },
+          )
+        })
+        return
+      }
+      if (action === 'cancel' && req.method === 'POST') {
+        doCancel(sessionId).then(
+          function (value) {
+            markStateDirty()
+            sendJson(res, 200, { ok: true, cancelled: value.cancelled })
+          },
+          function (err) {
+            sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
+        return
+      }
+      if (action === 'rename' && req.method === 'POST') {
+        parseBody(req).then(function (body) {
+          doSessionRename(sessionId, body.title).then(
+            function (value) {
+              markStateDirty()
+              sendJson(res, 200, { ok: true, title: value.title })
+            },
+            function (err) {
+              sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+            },
+          )
+        })
+        return
+      }
+      if (action === 'fork' && req.method === 'POST') {
+        parseBody(req).then(function (body) {
+          const at = typeof body.atSeq === 'number' ? body.atSeq : undefined
+          doSessionFork(sessionId, at).then(
+            function (value) {
+              markStateDirty()
+              sendJson(res, 200, { ok: true, sessionId: value.sessionId })
+            },
+            function (err) {
+              sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+            },
+          )
+        })
+        return
+      }
+      if (action === 'archive' && req.method === 'POST') {
+        doSessionArchive(sessionId).then(
+          function (value) {
+            markStateDirty()
+            sendJson(res, 200, { ok: true, archived: value.archived })
+          },
+          function (err) {
+            sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
+        return
+      }
+      if (action === 'select' && req.method === 'POST') {
+        activeSessionId = sessionId
+        sendJson(res, 200, { ok: true, activeSessionId: sessionId })
+        return
+      }
+      sendJson(res, 404, { ok: false, error: 'unknown session action: ' + action })
+      return
+    }
+
+    sendJson(res, 404, { ok: false, error: 'unknown bridge route', path: path })
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 8. 挂载
+   * ------------------------------------------------------------------ */
+
+  const disposers = []
+  disposers.push(webServer.register({ kind: 'prefix', path: BASE, handler: handle }))
+
+  // 状态失效信号：任何会话事件都标记脏，由 1s 合并器统一推送
+  if (typeof ctx.on === 'function') {
+    const mark = function (session, event) {
+      markStateDirty()
+      sessionEventCount += 1
+      safe(function () {
+        trackEvent(session && session.id !== undefined ? String(session.id) : null, event)
+      }, undefined)
+      lastSessionEventDebug = {
+        at: Date.now(),
+        sessionKind: typeof session,
+        hasId: !!(session && session.id !== undefined),
+        sid: safe(function () { return String(session.id) }, null),
+        eventType: safe(function () { return String(event && event.type) }, null),
+        seq: safe(function () { return typeof event.seq === 'number' ? event.seq : null }, null),
+      }
+    }
+    disposers.push(ctx.on('session/event', mark))
+    // 用户提问：把 ask 包一层，只有手机正开着该会话时才接（见第 5 节）
+    const restoreAsk = installQuestionHook()
+    if (typeof restoreAsk === 'function') disposers.push(restoreAsk)
+    disposers.push(ctx.on('api-session/added', mark))
+    disposers.push(ctx.on('api-session/updated', mark))
+  }
+
+  safe(function () {
+    Promise.resolve().then(backfillActivity)
+  }, undefined)
+
+  console.log('[' + NAME + '] mounted on ' + BASE + ' (v' + VERSION + ', token=' + (TOKEN ? 'on' : 'off') + ')')
+
+  return function dispose() {
+    // 终端是这台电脑上的真进程：插件卸载/更新时必须全部杀掉，
+    // 否则 reload 一次就在宿主里漏一堆 bash
+    safe(termKillAll, undefined)
+    const ids = Object.keys(stateClients)
+    for (let i = 0; i < ids.length; i += 1) {
+      try {
+        stateClients[ids[i]].res.end()
+      } catch (err) {
+        /* 忽略 */
+      }
+      delete stateClients[ids[i]]
+    }
+    for (let i = 0; i < disposers.length; i += 1) {
+      try {
+        disposers[i]()
+      } catch (err) {
+        /* 忽略 */
+      }
+    }
+  }
+}

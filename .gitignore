@@ -1,0 +1,42 @@
+# ---- 密钥 / 本机配置：绝对不能进仓库 ----
+# 桥接的访问令牌（首次挂载时生成，等价于这台电脑的 shell 钥匙）
+bridge/.token
+
+# ---- Android 构建产物与本机路径 ----
+android/local.properties
+android/.gradle/
+android/build/
+android/app/build/
+android/captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.keystore
+*.jks
+local.properties
+
+# ---- 工具链（scripts/setup-toolchain.sh 装在仓库外的用户目录）----
+jdk/
+android-sdk/
+gradle-dl/
+
+# ---- Python 缓存 ----
+__pycache__/
+*.pyc
+
+# ---- 编辑器 / 系统 ----
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ---- 本工作区自己的锁文件与临时产物 ----
+.workspace-writer
+/tmp/
+*.log
+node_modules/

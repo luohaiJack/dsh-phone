@@ -1,0 +1,19 @@
+# dsh-phone-bridge 作为 Profile Bundle 的组成层。
+#
+# 这一行把桥接插件挂进 dsh 的组合树。它属于 Host 平面（消费 webServer 与
+# sessionController，服务的是整个进程的 HTTP 面，消费方手机在 agent 平面之外），
+# 因此必须挂在宿主组成里，不能放进 agent preset。
+#
+# 注意：补丁层默认是按 id「覆盖已有行」，所以要**新增**一行必须显式写在
+# `insert:` 下；直接写 `- id: phone-bridge` 会得到
+# `patch: entry "phone-bridge" not found`。
+- insert:
+    - id: phone-bridge
+      name: 'dsh-phone-bridge'
+      config:
+        # 令牌留空 = 由插件自己生成并保存在 bridge/.token（0600，已在 .gitignore 里）。
+        #
+        # 为什么默认不让它空着跑：桥接在远程这条路（tailscale serve）上是
+        # 整个 harness 的唯一门禁，空令牌等于把电脑交出去。
+        # 想自己指定就填在这里，它会优先于 .token 文件。
+        token: ''

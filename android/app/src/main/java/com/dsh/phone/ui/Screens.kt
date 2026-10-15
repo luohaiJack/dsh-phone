@@ -1,0 +1,1887 @@
+package com.dsh.phone.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Send
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
+import com.dsh.phone.ChatMessage
+import com.dsh.phone.ConnPhase
+import com.dsh.phone.ConnStatus
+import com.dsh.phone.DirListing
+import com.dsh.phone.DocState
+import com.dsh.phone.PendingQuestion
+import com.dsh.phone.TermState
+import com.dsh.phone.QuestionAnswer
+import com.dsh.phone.HarnessState
+import com.dsh.phone.ModelCatalog
+import com.dsh.phone.WorkspaceInfo
+import com.dsh.phone.WorkspaceSession
+import com.dsh.phone.formatClock
+import com.dsh.phone.formatDuration
+import com.dsh.phone.relativeTime
+import com.dsh.phone.shortPath
+
+/* ============================== 通用小组件 ============================== */
+
+@Composable
+fun SectionCard(title: String, content: @Composable () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Text(
+                title,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Spacer(Modifier.height(8.dp))
+            content()
+        }
+    }
+}
+
+@Composable
+fun KeyValue(key: String, value: String, mono: Boolean = false) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+        Text(
+            key,
+            modifier = Modifier.width(96.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            value.ifBlank { "—" },
+            style = MaterialTheme.typography.bodyMedium.let {
+                if (mono) it.copy(fontFamily = FontFamily.Monospace) else it
+            },
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+}
+
+@Composable
+fun ConnBadge(conn: ConnStatus) {
+    val (color, label) = when (conn.phase) {
+        ConnPhase.LIVE -> Color(0xFF35C77A) to "已连接"
+        ConnPhase.CONNECTING -> Color(0xFFE0A93B) to "连接中"
+        ConnPhase.ERROR -> MaterialTheme.colorScheme.error to "未连接"
+        ConnPhase.IDLE -> MaterialTheme.colorScheme.onSurfaceVariant to "空闲"
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(9.dp).clip(RoundedCornerShape(50)).background(color))
+        Spacer(Modifier.width(6.dp))
+        Text(label, style = MaterialTheme.typography.bodySmall, color = color)
+    }
+}
+
+/* ================================ 状态页 ================================ */
+
+@Composable
+fun StatusScreen(
+    state: HarnessState,
+    conn: ConnStatus,
+    baseUrl: String,
+    term: TermState,
+    onRefresh: () -> Unit,
+    onOpenTerminal: () -> Unit,
+) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        SectionCard("连接") {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ConnBadge(conn)
+                if (conn.latencyMs > 0) {
+                    Text("往返 ${conn.latencyMs} ms", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            KeyValue("地址", baseUrl, mono = true)
+            KeyValue("状态", if (state.ok) "harness 正常" else (state.error ?: "未知"))
+            state.error?.let {
+                Spacer(Modifier.height(4.dp))
+                Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            }
+            conn.message?.takeIf { conn.phase == ConnPhase.ERROR }?.let {
+                Spacer(Modifier.height(4.dp))
+                Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            }
+            Spacer(Modifier.height(8.dp))
+            FilledTonalButton(onClick = onRefresh) {
+                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("刷新")
+            }
+        }
+
+        SectionCard("终端") {
+            KeyValue("状态", term.statusText)
+            if (term.pid > 0) KeyValue("进程", "pid " + term.pid)
+            if (term.cwd.isNotBlank()) KeyValue("工作目录", term.cwd, mono = true)
+            if (term.cols > 0) KeyValue("尺寸", term.cols.toString() + " 列 × " + term.rows + " 行")
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "在电脑上开一个真终端（真 PTY）。在会话里长按复制一段命令，\n" +
+                    "切到这里点「粘贴并跑」就能直接执行。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            FilledTonalButton(onClick = onOpenTerminal) {
+                Icon(Icons.Filled.Send, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(if (term.alive) "回到终端" else "打开终端")
+            }
+        }
+
+        SectionCard("模型") {
+            val m = state.model
+            if (m == null) {
+                Text("未读到模型信息", style = MaterialTheme.typography.bodyMedium)
+            } else {
+                KeyValue("Provider", m.provider)
+                KeyValue("Model", m.model)
+                KeyValue("推理强度", m.effort ?: "默认")
+            }
+        }
+
+        SectionCard("概览") {
+            KeyValue("会话总数", state.totalSessions.toString())
+            KeyValue("运行中", state.runningCount.toString())
+            KeyValue("活动任务", state.activeJobs.size.toString())
+            KeyValue("快照时间", formatClock(state.ts))
+        }
+
+        if (state.activeJobs.isNotEmpty()) {
+            SectionCard("运行中的任务") {
+                state.activeJobs.forEach { j ->
+                    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(
+                                j.label.ifBlank { j.id },
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                formatDuration(j.startedAt, j.finishedAt),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                        Text(
+                            "${j.kind} · ${j.status}" + (j.detail?.let { " · $it" } ?: ""),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    HorizontalDivider(Modifier.padding(vertical = 2.dp))
+                }
+            }
+        }
+
+        val withGoal = state.sessions.filter { it.goal != null && it.running }
+        if (withGoal.isNotEmpty()) {
+            SectionCard("进行中的目标") {
+                withGoal.forEach { s ->
+                    val g = s.goal ?: return@forEach
+                    Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                        Text(
+                            s.displayTitle,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(g.objective, style = MaterialTheme.typography.bodyMedium, maxLines = 3)
+                        Spacer(Modifier.height(6.dp))
+                        val max = g.maxGoalRounds
+                        if (max != null && max > 0) {
+                            LinearProgressIndicator(
+                                progress = { (g.roundsStarted.toFloat() / max).coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            Spacer(Modifier.height(4.dp))
+                        }
+                        Text(
+                            "阶段 ${g.phase} · 第 ${g.roundsStarted}" + (max?.let { "/$it" } ?: "") + " 轮",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        g.blockedReason?.let {
+                            Spacer(Modifier.height(2.dp))
+                            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+/* ======================= 工作区 / 会话列表 ======================= */
+
+/** 「最近会话」最多显示几条 —— 它只是快捷键，不是第二个工作区树。 */
+private const val RECENT_SHOWN = 6
+
+/**
+ * 三个板块（未读 / 正在工作 / 最近）共用的一张会话卡。
+ *
+ * 抽出来的理由：它们只差「左侧标记、右下角那句提示、配色」三点，
+ * 复制三份的话以后改一处必然漏两处。
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SessionSectionCard(
+    container: Color,
+    leading: @Composable () -> Unit,
+    title: String,
+    subtitle: String,
+    actionLabel: String,
+    actionColor: Color,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    menu: @Composable () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick),
+        colors = CardDefaults.cardColors(containerColor = container),
+    ) {
+        Box {
+            Row(
+                Modifier.fillMaxWidth().padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                leading()
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(title, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Text(actionLabel, style = MaterialTheme.typography.labelLarge, color = actionColor)
+            }
+            menu()
+        }
+    }
+}
+
+/** 会话页要用到的全部动作，收成一个 bundle —— 否则参数列表会长到没法读。 */
+data class DshActions(
+    val openSession: (String) -> Unit,
+    val renameSession: (String, String) -> Unit,
+    val forkSession: (String) -> Unit,
+    val archiveSession: (String) -> Unit,
+    val toggleWorkspace: (String) -> Unit,
+    val renameWorkspace: (String, String) -> Unit,
+    val deleteWorkspace: (String) -> Unit,
+    val newSessionInWorkspace: (String) -> Unit,
+    val newSession: () -> Unit,
+    /** 清空手机侧的「最近会话」记忆（电脑上的会话一个都不动）。 */
+    val clearRecent: () -> Unit,
+)
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun SessionsScreen(
+    state: HarnessState,
+    workspaces: List<WorkspaceInfo>,
+    unread: Set<String>,
+    working: Set<String>,
+    recentAt: Map<String, Long>,
+    expanded: Set<String>,
+    listState: LazyListState,
+    actions: DshActions,
+) {
+    // 长按弹出的菜单 / 对话框的目标
+    var menuSession by remember { mutableStateOf<String?>(null) }
+    var menuWorkspace by remember { mutableStateOf<String?>(null) }
+    var renameSessionTarget by remember { mutableStateOf<WorkspaceSession?>(null) }
+    var archiveTarget by remember { mutableStateOf<WorkspaceSession?>(null) }
+    var renameWorkspaceTarget by remember { mutableStateOf<WorkspaceInfo?>(null) }
+    var deleteWorkspaceTarget by remember { mutableStateOf<WorkspaceInfo?>(null) }
+
+    // 三个板块的分类规则（互斥，一个会话只出现在一块里）：
+    //   正在工作 = 电脑上还在跑（或手机正开着且实时流说在跑）
+    //   未读回复 = 没在跑 且 助手最后说话 且 手机没看过这条
+    //   最近会话 = 没在跑 且 已读 且 手机上最近点开过
+    //
+    // 为什么"还在跑"要从未读里摘出去：一轮里助手可能已经发过好几条消息
+    // （调工具前后的说明、中间结论），它们都带 seq 但都不是最终回复，
+    // 算成未读等于骗人 —— 点进去只看到半截。它该待在「正在工作」。
+    val byId = HashMap<String, Pair<WorkspaceInfo, WorkspaceSession>>()
+    workspaces.forEach { w -> w.sessions.forEach { s -> byId[s.id] = w to s } }
+
+    val totalSessions = workspaces.sumOf { it.sessionCount }
+
+    val runningNow = working
+        .mapNotNull { id -> byId[id] }
+        .sortedByDescending { it.second.updatedAt }
+
+    val unreadItems = workspaces
+        .flatMap { w -> w.sessions.filter { unread.contains(it.id) && !working.contains(it.id) }.map { w to it } }
+        .sortedByDescending { it.second.activity.lastReplyAt }
+
+    // recentAt 是有序表（新 → 旧），直接按它的顺序映射；映射不到的（刚被归档/删掉）自然消失
+    val recentItems = recentAt.keys
+        .mapNotNull { id -> byId[id]?.let { (w, s) -> Triple(w, s, recentAt[id] ?: 0L) } }
+        .filter { (_, s, _) -> !working.contains(s.id) && !unread.contains(s.id) }
+        .take(RECENT_SHOWN)
+
+    LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+        item {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "${workspaces.size} 个工作区 · $totalSessions 个会话",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                FilledTonalButton(onClick = actions.newSession) {
+                    Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("新建会话")
+                }
+            }
+        }
+
+        if (unreadItems.isNotEmpty()) {
+            item {
+                Text(
+                    "未读回复（${unreadItems.size}）",
+                    modifier = Modifier.padding(start = 16.dp, top = 4.dp, bottom = 4.dp),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = UnreadGreen,
+                )
+            }
+            items(unreadItems.size) { i ->
+                val (w, sess) = unreadItems[i]
+                SessionSectionCard(
+                    container = MaterialTheme.colorScheme.surfaceVariant,
+                    leading = {
+                        Box(Modifier.size(8.dp).clip(RoundedCornerShape(50)).background(UnreadGreen))
+                    },
+                    title = sess.displayTitle,
+                    subtitle = w.displayTitle + " · " + relativeTime(sess.activity.lastReplyAt),
+                    actionLabel = "去看 ›",
+                    actionColor = UnreadGreen,
+                    onClick = { actions.openSession(sess.id) },
+                    onLongClick = { menuSession = sess.id },
+                    menu = {
+                        SessionMenu(
+                            expanded = menuSession == sess.id,
+                            onDismiss = { menuSession = null },
+                            onOpen = { menuSession = null; actions.openSession(sess.id) },
+                            onRename = { menuSession = null; renameSessionTarget = sess },
+                            onFork = { menuSession = null; actions.forkSession(sess.id) },
+                            onArchive = { menuSession = null; archiveTarget = sess },
+                        )
+                    },
+                )
+            }
+        }
+
+        if (runningNow.isNotEmpty()) {
+            item {
+                Text(
+                    "正在工作",
+                    modifier = Modifier.padding(start = 16.dp, top = 4.dp, bottom = 4.dp),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+            items(runningNow.size) { i ->
+                val (w, sess) = runningNow[i]
+                SessionSectionCard(
+                    container = MaterialTheme.colorScheme.primaryContainer,
+                    leading = { CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp) },
+                    title = sess.displayTitle,
+                    subtitle = w.displayTitle + " · " + relativeTime(sess.updatedAt),
+                    actionLabel = "进入 ›",
+                    actionColor = MaterialTheme.colorScheme.primary,
+                    onClick = { actions.openSession(sess.id) },
+                    onLongClick = { menuSession = sess.id },
+                    menu = {
+                        SessionMenu(
+                            expanded = menuSession == sess.id,
+                            onDismiss = { menuSession = null },
+                            onOpen = { menuSession = null; actions.openSession(sess.id) },
+                            onRename = { menuSession = null; renameSessionTarget = sess },
+                            onFork = { menuSession = null; actions.forkSession(sess.id) },
+                            onArchive = { menuSession = null; archiveTarget = sess },
+                        )
+                    },
+                )
+            }
+        }
+
+        // 「最近会话」：手机屏小，工作区树一展开就滚不到底。
+        // 这块只放"已经看过、也已经停下来"的 —— 未读和正在工作的在上面两块里，
+        // 同一个会话不会同时出现在两块，免得用户不知道该点哪张卡。
+        if (recentItems.isNotEmpty()) {
+            item {
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 16.dp, end = 6.dp, top = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "最近会话",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(onClick = actions.clearRecent) { Text("清空") }
+                }
+            }
+            items(recentItems.size) { i ->
+                val (w, sess, openedAt) = recentItems[i]
+                SessionSectionCard(
+                    container = MaterialTheme.colorScheme.surfaceVariant,
+                    leading = {
+                        Icon(
+                            Icons.Filled.Refresh,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    },
+                    title = sess.displayTitle,
+                    subtitle = w.displayTitle + " · 上次打开：" + relativeTime(openedAt),
+                    actionLabel = "继续 ›",
+                    actionColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    onClick = { actions.openSession(sess.id) },
+                    onLongClick = { menuSession = sess.id },
+                    menu = {
+                        SessionMenu(
+                            expanded = menuSession == sess.id,
+                            onDismiss = { menuSession = null },
+                            onOpen = { menuSession = null; actions.openSession(sess.id) },
+                            onRename = { menuSession = null; renameSessionTarget = sess },
+                            onFork = { menuSession = null; actions.forkSession(sess.id) },
+                            onArchive = { menuSession = null; archiveTarget = sess },
+                        )
+                    },
+                )
+            }
+        }
+
+        item {
+            Text(
+                "工作区（历史 + 当前）",
+                modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 4.dp),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+
+        if (workspaces.isEmpty()) {
+            item {
+                Box(Modifier.fillMaxWidth().padding(40.dp), contentAlignment = Alignment.Center) {
+                    Text(
+                        "还没读到工作区\n检查连接，或点右上「新建会话」建一个",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+
+        items(workspaces.size) { i ->
+            val w = workspaces[i]
+            val isOpen = expanded.contains(w.id)
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            ) {
+                Box {
+                    Column(Modifier.fillMaxWidth()) {
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .combinedClickable(
+                                    onClick = { actions.toggleWorkspace(w.id) },
+                                    onLongClick = { menuWorkspace = w.id },
+                                )
+                                .padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                if (isOpen) "▾" else "▸",
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Column(Modifier.weight(1f)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        w.displayTitle,
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false),
+                                    )
+                                    if (w.runningCount > 0) {
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("运行中 ${w.runningCount}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                    }
+                                    val wUnread = w.sessions.count { unread.contains(it.id) }
+                                    if (wUnread > 0) {
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("未读 $wUnread", style = MaterialTheme.typography.labelSmall, color = UnreadGreen)
+                                    }
+                                }
+                                Text(w.path, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text("${w.sessionCount} 个会话", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        if (isOpen) {
+                            HorizontalDivider()
+                            if (w.sessions.isEmpty()) {
+                                Text(
+                                    "这个工作区还没有会话",
+                                    modifier = Modifier.padding(start = 34.dp, top = 8.dp, bottom = 4.dp),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            w.sessions.take(30).forEach { sess ->
+                                Box {
+                                    Row(
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .combinedClickable(
+                                                onClick = { actions.openSession(sess.id) },
+                                                onLongClick = { menuSession = sess.id },
+                                            )
+                                            .padding(start = 34.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        if (sess.running) {
+                                            CircularProgressIndicator(modifier = Modifier.size(11.dp), strokeWidth = 2.dp)
+                                            Spacer(Modifier.width(6.dp))
+                                        } else if (unread.contains(sess.id)) {
+                                            Box(Modifier.size(8.dp).clip(RoundedCornerShape(50)).background(UnreadGreen))
+                                            Spacer(Modifier.width(6.dp))
+                                        }
+                                        Text(sess.displayTitle, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                                        Text(relativeTime(sess.updatedAt), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    SessionMenu(
+                                        expanded = menuSession == sess.id,
+                                        onDismiss = { menuSession = null },
+                                        onOpen = { menuSession = null; actions.openSession(sess.id) },
+                                        onRename = { menuSession = null; renameSessionTarget = sess },
+                                        onFork = { menuSession = null; actions.forkSession(sess.id) },
+                                        onArchive = { menuSession = null; archiveTarget = sess },
+                                    )
+                                }
+                            }
+                            TextButton(
+                                onClick = { actions.newSessionInWorkspace(w.id) },
+                                modifier = Modifier.padding(start = 24.dp, bottom = 6.dp),
+                            ) { Text("在此工作区新建会话") }
+                        }
+                    }
+                    WorkspaceMenu(
+                        expanded = menuWorkspace == w.id,
+                        onDismiss = { menuWorkspace = null },
+                        onRename = { menuWorkspace = null; renameWorkspaceTarget = w },
+                        onDelete = { menuWorkspace = null; deleteWorkspaceTarget = w },
+                        onNewSession = { menuWorkspace = null; actions.newSessionInWorkspace(w.id) },
+                    )
+                }
+            }
+        }
+        item { Spacer(Modifier.height(24.dp)) }
+    }
+
+    /* ------------------------------ 对话框 ------------------------------ */
+
+    renameSessionTarget?.let { sess ->
+        RenameDialog(
+            title = "重命名会话",
+            initial = sess.displayTitle,
+            onDismiss = { renameSessionTarget = null },
+            onConfirm = { newTitle ->
+                actions.renameSession(sess.id, newTitle)
+                renameSessionTarget = null
+            },
+        )
+    }
+
+    renameWorkspaceTarget?.let { w ->
+        RenameDialog(
+            title = "重命名工作区",
+            initial = w.displayTitle,
+            onDismiss = { renameWorkspaceTarget = null },
+            onConfirm = { newTitle ->
+                actions.renameWorkspace(w.id, newTitle)
+                renameWorkspaceTarget = null
+            },
+        )
+    }
+
+    archiveTarget?.let { sess ->
+        AlertDialog(
+            onDismissRequest = { archiveTarget = null },
+            title = { Text("归档这个会话？") },
+            text = {
+                Text(
+                    "「${sess.displayTitle}」会从工作区列表里隐藏。\n\n" +
+                        "会话日志仍然完整保留在电脑上，不会被删除。",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    actions.archiveSession(sess.id)
+                    archiveTarget = null
+                }) { Text("归档") }
+            },
+            dismissButton = { TextButton(onClick = { archiveTarget = null }) { Text("取消") } },
+        )
+    }
+
+    deleteWorkspaceTarget?.let { w ->
+        AlertDialog(
+            onDismissRequest = { deleteWorkspaceTarget = null },
+            title = { Text("删除这个工作区？") },
+            text = {
+                Text(
+                    "「${w.displayTitle}」的**注册记录**会被删除，它不再出现在列表里。\n\n" +
+                        "⚠️ 只是取消登记：电脑上的目录（${w.path}）和里面所有会话日志都不会被删除。\n\n" +
+                        "以后想找回来，重新把那个目录登记成工作区即可。",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    actions.deleteWorkspace(w.id)
+                    deleteWorkspaceTarget = null
+                }) { Text("删除注册") }
+            },
+            dismissButton = { TextButton(onClick = { deleteWorkspaceTarget = null }) { Text("取消") } },
+        )
+    }
+}
+
+/** 会话长按菜单：和电脑上点「···」是同一批操作。 */
+@Composable
+private fun SessionMenu(
+    expanded: Boolean,
+    onDismiss: () -> Unit,
+    onOpen: () -> Unit,
+    onRename: () -> Unit,
+    onFork: () -> Unit,
+    onArchive: () -> Unit,
+) {
+    DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
+        DropdownMenuItem(text = { Text("打开") }, onClick = onOpen)
+        DropdownMenuItem(text = { Text("重命名") }, onClick = onRename)
+        DropdownMenuItem(text = { Text("分支会话") }, onClick = onFork)
+        HorizontalDivider()
+        DropdownMenuItem(
+            text = { Text("归档", color = MaterialTheme.colorScheme.error) },
+            onClick = onArchive,
+        )
+    }
+}
+
+/** 工作区长按菜单。 */
+@Composable
+private fun WorkspaceMenu(
+    expanded: Boolean,
+    onDismiss: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+    onNewSession: () -> Unit,
+) {
+    DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
+        DropdownMenuItem(text = { Text("在此新建会话") }, onClick = onNewSession)
+        DropdownMenuItem(text = { Text("重命名工作区") }, onClick = onRename)
+        HorizontalDivider()
+        DropdownMenuItem(
+            text = { Text("删除工作区", color = MaterialTheme.colorScheme.error) },
+            onClick = onDelete,
+        )
+    }
+}
+
+/** 通用重命名对话框。 */
+@Composable
+private fun RenameDialog(
+    title: String,
+    initial: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var value by remember { mutableStateOf(initial) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            OutlinedTextField(
+                value = value,
+                onValueChange = { value = it },
+                label = { Text("新名称") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = {
+            TextButton(
+                enabled = value.isNotBlank(),
+                onClick = { onConfirm(value.trim()) },
+            ) { Text("确定") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
+/* ============================ 新建会话 ============================ */
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun NewSessionScreen(
+    listing: DirListing,
+    busy: Boolean,
+    onBack: () -> Unit,
+    onBrowse: (String?) -> Unit,
+    onMakeFolder: (String) -> Unit,
+    onCreateHere: (String?) -> Unit,
+) {
+    var folderName by remember { mutableStateOf("") }
+    var wsTitle by remember { mutableStateOf("") }
+    var showFolderBox by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("新建会话") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "返回") }
+                },
+            )
+        },
+    ) { inner ->
+        Column(Modifier.fillMaxSize().padding(inner)) {
+            // 面包屑
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                listing.crumbs.takeLast(4).forEachIndexed { idx, c ->
+                    if (idx > 0) Text(" / ", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        c.name,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.clickable { onBrowse(c.path) },
+                    )
+                }
+                Spacer(Modifier.weight(1f))
+                if (listing.home.isNotBlank()) {
+                    Text(
+                        "家目录",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.clickable { onBrowse(listing.home) },
+                    )
+                }
+            }
+
+            Text(
+                listing.path.ifBlank { "（读取中）" },
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+
+            // 新建文件夹
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (showFolderBox) {
+                    OutlinedTextField(
+                        value = folderName,
+                        onValueChange = { folderName = it },
+                        label = { Text("新文件夹名") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    TextButton(
+                        enabled = folderName.isNotBlank(),
+                        onClick = {
+                            onMakeFolder(folderName)
+                            folderName = ""
+                            showFolderBox = false
+                        },
+                    ) { Text("创建") }
+                } else {
+                    FilledTonalButton(onClick = { showFolderBox = true }) {
+                        Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("在此新建文件夹")
+                    }
+                }
+            }
+
+            if (busy) {
+                LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
+
+            // 目录列表
+            LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
+                items(listing.entries.size) { i ->
+                    val e = listing.entries[i]
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { onBrowse(e.path) }
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(if (e.hidden) "· " else "📁 ", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            e.name,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            color = if (e.hidden) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                    HorizontalDivider(Modifier.padding(start = 16.dp))
+                }
+                if (listing.entries.isEmpty() && !busy && listing.path.isNotBlank()) {
+                    item {
+                        Box(Modifier.fillMaxWidth().padding(30.dp), contentAlignment = Alignment.Center) {
+                            Text("这个目录下没有子目录", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+            }
+
+            HorizontalDivider()
+            Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                OutlinedTextField(
+                    value = wsTitle,
+                    onValueChange = { wsTitle = it },
+                    label = { Text("工作区标题（留空则用文件夹名）") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                FilledTonalButton(
+                    onClick = { onCreateHere(wsTitle.ifBlank { null }) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("在这里新建会话") }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "会在电脑上把这个目录登记成 harness 工作区，并开一个会话。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/* ================================ 文档阅读 ================================ */
+
+/**
+ * 点开工具调用里的文件路径 / 正文里的文档路径，进到这里看内容。
+ *
+ * .md 走同一套 MarkdownText 渲染（表格、代码块、链接都在），
+ * 其它扩展名按等宽纯文本显示。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DocumentScreen(
+    doc: DocState?,
+    onBack: () -> Unit,
+    onOpenFile: (String) -> Unit,
+) {
+    val scheme = MaterialTheme.colorScheme
+    val d = doc ?: DocState(path = "")
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(d.fileName.ifBlank { "文档" }, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        if (d.path.isNotBlank()) {
+                            Text(
+                                d.path,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = scheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "返回") }
+                },
+            )
+        },
+    ) { inner ->
+        Column(Modifier.fillMaxSize().padding(inner)) {
+            when {
+                d.loading -> LinearProgressIndicator(Modifier.fillMaxWidth())
+
+                d.error != null -> Column(Modifier.padding(16.dp)) {
+                    Text("读不到这个文件", style = MaterialTheme.typography.titleSmall, color = scheme.error)
+                    Spacer(Modifier.height(6.dp))
+                    Text(d.error, style = MaterialTheme.typography.bodySmall, color = scheme.onSurfaceVariant)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "提示：正文里的相对路径是按当前会话的工作目录解析的。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = scheme.onSurfaceVariant,
+                    )
+                }
+
+                d.content != null -> Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                    if (d.truncated) {
+                        Text(
+                            "（文件较大，只显示前面一部分）",
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = scheme.error,
+                        )
+                    }
+                    Box(Modifier.padding(16.dp)) {
+                        if (d.isMarkdown) {
+                            MarkdownText(
+                                text = d.content,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = scheme.onSurface,
+                                onOpenFile = onOpenFile,
+                            )
+                        } else {
+                            SelectionContainer {
+                                Text(
+                                    d.content,
+                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                    color = scheme.onSurface,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* ================================= 聊天 ================================= */
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ChatScreen(
+    title: String,
+    messages: List<ChatMessage>,
+    streamText: String,
+    streamReasoning: String,
+    running: Boolean,
+    busy: Boolean,
+    showInjected: Boolean,
+    chatError: String?,
+    connPhase: ConnPhase,
+    question: PendingQuestion?,
+    draft: String,
+    onDraftChange: (String) -> Unit,
+    catalog: ModelCatalog,
+    switchingModel: Boolean,
+    listState: LazyListState,
+    followTail: Boolean,
+    onFollowTailChange: (Boolean) -> Unit,
+    onBack: () -> Unit,
+    onSend: (String) -> Unit,
+    onStop: () -> Unit,
+    onRetry: () -> Unit,
+    onAnswer: (List<QuestionAnswer>) -> Unit,
+    onStopThinking: () -> Unit,
+    onSwitchModel: (String, String, String?) -> Unit,
+    onRefreshModels: () -> Unit,
+    onOpenFile: (String) -> Unit,
+    onToggleInjected: (Boolean) -> Unit,
+) {
+    var showModels by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    val visible = remember(messages, showInjected) {
+        if (showInjected) messages else messages.filterNot { it.isInjected }
+    }
+
+    /**
+     * 是否跟随最新输出。
+     *
+     * 不能在"内容变化时"去看布局判断 —— 那时新内容还没进布局，
+     * totalItemsCount 已经涨了、visibleItemsInfo 还是旧的，
+     * 于是"最后一屏可见吗"必然为假，跟随就永远开不起来。
+     *
+     * 改成看**滚动位移的方向**：索引/偏移变小 = 用户自己往上翻了 → 停止跟随；
+     * 滚到最后一屏可见 = 恢复跟随。内容是被追加在下方的，位移不变，
+     * 所以追加本身不会误触发"停止跟随"。
+     */
+    LaunchedEffect(listState) {
+        var prevIdx = listState.firstVisibleItemIndex
+        var prevOff = listState.firstVisibleItemScrollOffset
+        var wasScrolling = false
+        snapshotFlow {
+            Triple(
+                listState.isScrollInProgress,
+                listState.firstVisibleItemIndex,
+                listState.firstVisibleItemScrollOffset,
+            )
+        }.collect { (inProgress, idx, off) ->
+            if (inProgress) {
+                wasScrolling = true
+                // 手指还在屏幕上、且往上挪了 → 立刻停止跟随（不能等松手，
+                // 否则这期间流式输出还是会把页面拽走）
+                val movedUp = idx < prevIdx || (idx == prevIdx && off < prevOff)
+                if (movedUp) onFollowTailChange(false)
+            } else if (wasScrolling) {
+                // 只在"一次真正的滚动刚结束"时才评估是否到底。
+                // ★ 不能在非滚动状态下评估：启动那一刻列表还短，
+                //   最后一个 item 必然可见，会把恢复出来的 followTail=false 覆盖成 true。
+                wasScrolling = false
+                val info = listState.layoutInfo
+                val last = info.visibleItemsInfo.lastOrNull()
+                onFollowTailChange(last == null || last.index >= info.totalItemsCount - 1)
+            }
+            prevIdx = idx
+            prevOff = off
+        }
+    }
+
+    LaunchedEffect(visible.size, streamText.length) {
+        if (!followTail) return@LaunchedEffect
+        val target = visible.size + if (streamText.isNotEmpty()) 1 else 0
+        if (target > 0) runCatching { listState.scrollToItem(target - 1) }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            if (running) "运行中" else "空闲",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (running) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Filled.ArrowBack, contentDescription = "返回")
+                    }
+                },
+                actions = {
+                    // 当前模型：点开切换
+                    val cur = catalog.current
+                    TextButton(onClick = { onRefreshModels(); showModels = true }) {
+                        Text(
+                            cur?.short ?: "模型",
+                            style = MaterialTheme.typography.labelLarge,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                },
+            )
+        },
+    ) { inner ->
+        Column(Modifier.fillMaxSize().padding(inner)) {
+            // 掉线横幅：USB 通道（adb reverse）会因拔插线/系统重协商而失效，
+            // 这时聊天页如果只是空白，用户无法区分"没有消息"和"没连上"。
+            val warn = chatError
+                ?: if (connPhase != ConnPhase.LIVE) "未连接到 harness（检查数据线，并重跑 install-to-phone.sh 恢复 adb reverse）" else null
+            if (warn != null) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.errorContainer)
+                        .padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        warn,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                    )
+                    TextButton(onClick = onRetry) { Text("重试") }
+                }
+            }
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+            ) {
+                items(visible.size) { i ->
+                    MessageRow(visible[i], onOpenFile)
+                }
+                if (streamText.isNotEmpty() || streamReasoning.isNotEmpty()) {
+                    item {
+                        StreamingRow(streamText, streamReasoning)
+                    }
+                }
+                if (visible.isEmpty() && streamText.isEmpty()) {
+                    item {
+                        Box(Modifier.fillMaxWidth().padding(40.dp), contentAlignment = Alignment.Center) {
+                            Text(
+                                "这个会话还没有消息，发一条试试",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+                item { Spacer(Modifier.height(8.dp)) }
+            }
+
+            // 上翻阅读时，给一个回到最新的入口（否则得手动滑回去）
+            if (!followTail) {
+                Box(Modifier.fillMaxWidth().padding(vertical = 4.dp), contentAlignment = Alignment.Center) {
+                    FilledTonalButton(
+                        onClick = {
+                            onFollowTailChange(true)
+                            val target = visible.size + if (streamText.isNotEmpty()) 1 else 0
+                            if (target > 0) scope.launch { listState.animateScrollToItem(target - 1) }
+                        },
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                    ) {
+                        Text("↓ 回到最新", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+            }
+
+            // 有提问时，卡片贴在输入框上方
+            if (question != null) {
+                QuestionCard(pending = question, onAnswer = onAnswer)
+            }
+
+            HorizontalDivider()
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .imePadding()
+                    .navigationBarsPadding()
+                    .padding(8.dp),
+                verticalAlignment = Alignment.Bottom,
+            ) {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = onDraftChange,
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("给 harness 发消息…") },
+                    maxLines = 6,
+                )
+                Spacer(Modifier.width(8.dp))
+                // 正在思考/生成时给一个显眼的停止按钮，
+                // 不用跑到顶栏去戳那个小 x
+                if (running) {
+                    FilledTonalButton(
+                        onClick = onStopThinking,
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+                    ) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text("停止", color = MaterialTheme.colorScheme.error)
+                    }
+                    Spacer(Modifier.width(6.dp))
+                }
+                IconButton(
+                    enabled = draft.isNotBlank() && !busy,
+                    onClick = {
+                        val t = draft
+                        onDraftChange("")
+                        onFollowTailChange(true)   // 自己发了消息，当然要跟到最新
+                        onSend(t)
+                    },
+                ) {
+                    Icon(Icons.Filled.Send, contentDescription = "发送", tint = MaterialTheme.colorScheme.primary)
+                }
+            }
+        }
+    }
+
+    if (showModels) {
+        ModalBottomSheet(onDismissRequest = { showModels = false }) {
+            ModelPicker(
+                catalog = catalog,
+                switching = switchingModel,
+                onPick = { provider, model, effort ->
+                    onSwitchModel(provider, model, effort)
+                    showModels = false
+                },
+            )
+        }
+    }
+}
+
+/**
+ * 模型选择面板：按 provider 分组，选中项打勾。
+ * 有推理强度的模型，选中那一行下面会展开强度选项。
+ */
+@Composable
+private fun ModelPicker(
+    catalog: ModelCatalog,
+    switching: Boolean,
+    onPick: (String, String, String?) -> Unit,
+) {
+    val scheme = MaterialTheme.colorScheme
+    val cur = catalog.current
+
+    Column(Modifier.fillMaxWidth().padding(bottom = 24.dp)) {
+        Text(
+            "切换模型" + (cur?.let { "　当前：${it.provider} / ${it.model}" + (it.effort?.let { e -> " · $e" } ?: "") } ?: ""),
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.titleSmall,
+            color = scheme.primary,
+        )
+        if (switching) LinearProgressIndicator(Modifier.fillMaxWidth())
+
+        if (catalog.groups.isEmpty()) {
+            Text(
+                "没读到模型列表（检查连接）",
+                modifier = Modifier.padding(16.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = scheme.onSurfaceVariant,
+            )
+        }
+
+        catalog.groups.forEach { g ->
+            Text(
+                g.name.ifBlank { g.id },
+                modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 4.dp),
+                style = MaterialTheme.typography.labelLarge,
+                color = scheme.onSurfaceVariant,
+            )
+            g.models.forEach { m ->
+                val isCurrent = cur != null && cur.provider == g.id && cur.model == m.id
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable { onPick(g.id, m.id, m.defaultEffort) }
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            m.name.ifBlank { m.id },
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = if (isCurrent) scheme.primary else scheme.onSurface,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (isCurrent) Text("✓", color = scheme.primary, style = MaterialTheme.typography.bodyLarge)
+                    }
+                    Text(
+                        m.id + (m.description?.let { " · $it" } ?: ""),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = scheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    // 只有"当前正用着、且支持推理强度"的模型才展开强度选项
+                    if (isCurrent && m.efforts.isNotEmpty()) {
+                        Spacer(Modifier.height(6.dp))
+                        Row {
+                            m.efforts.forEach { e ->
+                                val on = cur?.effort == e.id
+                                if (on) {
+                                    FilledTonalButton(
+                                        onClick = { onPick(g.id, m.id, e.id) },
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    ) { Text(e.name, style = MaterialTheme.typography.labelSmall) }
+                                } else {
+                                    OutlinedButton(
+                                        onClick = { onPick(g.id, m.id, e.id) },
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    ) { Text(e.name, style = MaterialTheme.typography.labelSmall) }
+                                }
+                                Spacer(Modifier.width(6.dp))
+                            }
+                        }
+                    }
+                }
+                HorizontalDivider(Modifier.padding(start = 16.dp))
+            }
+        }
+
+        if (catalog.failures.isNotEmpty()) {
+            Text(
+                "部分 provider 加载失败：" + catalog.failures.joinToString("；"),
+                modifier = Modifier.padding(16.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = scheme.error,
+            )
+        }
+    }
+}
+
+@Composable
+private fun MessageRow(m: ChatMessage, onOpenFile: (String) -> Unit) {
+    val scheme = MaterialTheme.colorScheme
+    val isUser = m.role == "user"
+    val isTool = m.role == "tool"
+    val isToolResult = m.role == "tool-result"
+
+    var expandReasoning by remember(m.seq) { mutableStateOf(false) }
+    var expandArgs by remember(m.seq) { mutableStateOf(false) }
+    var expandResult by remember(m.seq) { mutableStateOf(false) }
+
+    // Box(contentAlignment=) 要的是 Alignment，Alignment.Start/End 是
+    // Alignment.Horizontal，传进去编译不过，所以用 TopStart/TopEnd。
+    val bg = when {
+        isUser -> scheme.primaryContainer
+        isTool || isToolResult -> scheme.surface
+        else -> scheme.surfaceVariant
+    }
+    val textColor = when {
+        isUser -> scheme.onPrimaryContainer
+        isTool || isToolResult -> scheme.onSurfaceVariant
+        else -> scheme.onSurface
+    }
+    val align: Alignment = if (isUser) Alignment.TopEnd else Alignment.TopStart
+
+    Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), contentAlignment = align) {
+        Column(
+            Modifier
+                .fillMaxWidth(0.94f)
+                .clip(RoundedCornerShape(12.dp))
+                .background(bg)
+                .padding(10.dp),
+        ) {
+            val tag = when {
+                isUser -> if (m.isInjected) "注入 · ${m.source}" else "你"
+                m.role == "assistant" -> "Harness"
+                isTool -> "工具 · ${m.name ?: ""}"
+                else -> "工具结果" + (if (m.isError) " · 失败" else "")
+            }
+            Text(
+                tag + "  " + formatClock(m.time),
+                style = MaterialTheme.typography.labelSmall,
+                color = if (m.isError) scheme.error else scheme.onSurfaceVariant,
+            )
+
+            // 思考：和电脑上一样折叠成独立区块，默认收起，点标题展开
+            val reasoning = m.reasoning
+            if (!reasoning.isNullOrBlank()) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    (if (expandReasoning) "▾ " else "▸ ") + "思考（${reasoning.length} 字）",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = scheme.primary,
+                    modifier = Modifier.clickable { expandReasoning = !expandReasoning },
+                )
+                if (expandReasoning) {
+                    Spacer(Modifier.height(4.dp))
+                    SelectionContainer {
+                        Text(
+                            reasoning,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = scheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+
+            // 工具调用的摘要行：一眼能看出干了什么，细节收在"参数"里
+            if (isTool) {
+                val title = m.title
+                if (!title.isNullOrBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    val path = m.titlePath
+                    SelectionContainer {
+                        Text(
+                            title,
+                            style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace, fontSize = 12.sp),
+                            // 是文件路径就上色 + 下划线 + 可点：点开看渲染好的文档
+                            color = if (path != null) scheme.primary else textColor,
+                            textDecoration = if (path != null) TextDecoration.Underline else null,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = if (path != null) {
+                                Modifier.clickable { onOpenFile(path) }
+                            } else {
+                                Modifier
+                            },
+                        )
+                    }
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        (if (expandArgs) "▾ " else "▸ ") + "参数",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = scheme.primary,
+                        modifier = Modifier.clickable { expandArgs = !expandArgs },
+                    )
+                    if (expandArgs) {
+                        Spacer(Modifier.height(4.dp))
+                        SelectionContainer {
+                            Text(
+                                m.text.ifBlank { "(空)" },
+                                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace, fontSize = 11.sp),
+                                color = scheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                } else if (m.text.isNotBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    SelectionContainer {
+                        Text(
+                            m.text,
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace, fontSize = 12.sp),
+                            color = textColor,
+                        )
+                    }
+                }
+            } else if (m.text.isNotBlank()) {
+                Spacer(Modifier.height(4.dp))
+                if (isToolResult) {
+                    // 工具结果默认收起：一般很长，展开会把整屏读的东西全挤走。
+                    // 收起时给一行摘要 + 首行预览，要看细节再点开。
+                    val lines = m.text.count { it == '\n' } + 1
+                    Text(
+                        (if (expandResult) "▾ " else "▸ ") +
+                            "结果 · $lines 行 · ${m.text.length} 字",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (m.isError) scheme.error else scheme.primary,
+                        modifier = Modifier.clickable { expandResult = !expandResult },
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    if (expandResult) {
+                        SelectionContainer {
+                            Text(
+                                m.text,
+                                style = MaterialTheme.typography.bodyMedium.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 12.sp,
+                                ),
+                                color = if (m.isError) scheme.error else textColor,
+                            )
+                        }
+                    } else {
+                        val preview = m.text.lineSequence().firstOrNull { it.isNotBlank() } ?: ""
+                        if (preview.isNotBlank()) {
+                            Text(
+                                preview,
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp,
+                                ),
+                                color = scheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                } else {
+                    // 人和助手的正文都过 markdown：**粗体**、`代码`、链接、列表…
+                    // 外面套 SelectionContainer，长按即可选中 + 系统工具条的「复制」。
+                    //
+                    // 之前这里为了"怕长按选择和点链接抢手势"去掉了 SelectionContainer，
+                    // 结果就是正文整个没法复制 —— 那是想多了：
+                    // Compose 里点按归 LinkAnnotation、长按归选择，两者不冲突。
+                    SelectionContainer {
+                        MarkdownText(
+                            text = m.text,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (m.isError) scheme.error else textColor,
+                            onOpenFile = onOpenFile,
+                        )
+                    }
+                }
+            }
+
+            if (m.interrupted) {
+                Spacer(Modifier.height(4.dp))
+                Text("（被中断）", style = MaterialTheme.typography.labelSmall, color = scheme.error)
+            }
+        }
+    }
+}
+
+/**
+ * harness 提问卡片 —— 对应电脑上的选项框。
+ *
+ * 单选：点选项直接作答（和电脑上的手感一致）。
+ * 多选：勾完点「提交」。
+ * 两种都额外给一个自由文本输入，对应协议里的 custom 字段。
+ */
+@Composable
+private fun QuestionCard(
+    pending: PendingQuestion,
+    onAnswer: (List<QuestionAnswer>) -> Unit,
+) {
+    val scheme = MaterialTheme.colorScheme
+    val multi = pending.questions.count { it.multiSelect } > 0
+    var picked by remember(pending.id) { mutableStateOf(setOf<String>()) }
+    var custom by remember(pending.id) { mutableStateOf("") }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(scheme.primaryContainer)
+            .padding(12.dp),
+    ) {
+        Text(
+            "harness 在等你的回答",
+            style = MaterialTheme.typography.labelLarge,
+            color = scheme.onPrimaryContainer,
+        )
+        Spacer(Modifier.height(6.dp))
+
+        pending.questions.forEach { q ->
+            if (!q.header.isNullOrBlank()) {
+                Text(q.header, style = MaterialTheme.typography.labelSmall, color = scheme.onSurfaceVariant)
+            }
+            Text(q.question, style = MaterialTheme.typography.bodyLarge, color = scheme.onPrimaryContainer)
+            if (!q.detail.isNullOrBlank()) {
+                Spacer(Modifier.height(2.dp))
+                Text(q.detail, style = MaterialTheme.typography.bodySmall, color = scheme.onSurfaceVariant)
+            }
+            Spacer(Modifier.height(6.dp))
+
+            if (q.multiSelect) {
+                q.options.forEach { opt ->
+                    val on = picked.contains(opt.label)
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                picked = if (on) picked - opt.label else picked + opt.label
+                            }
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(checked = on, onCheckedChange = null)
+                        Text(
+                            opt.label,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = scheme.onPrimaryContainer,
+                        )
+                    }
+                }
+            } else {
+                q.options.forEach { opt ->
+                    OutlinedButton(
+                        onClick = {
+                            onAnswer(
+                                listOf(
+                                    QuestionAnswer(
+                                        id = q.id,
+                                        selected = listOf(opt.label),
+                                        custom = custom.ifBlank { null },
+                                    )
+                                )
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                    ) {
+                        Column(Modifier.fillMaxWidth()) {
+                            Text(opt.label, style = MaterialTheme.typography.bodyMedium)
+                            if (!opt.description.isNullOrBlank()) {
+                                Text(
+                                    opt.description,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = scheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = custom,
+            onValueChange = { custom = it },
+            label = { Text("或自己填一个答案") },
+            maxLines = 3,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            if (multi) {
+                FilledTonalButton(
+                    enabled = picked.isNotEmpty(),
+                    onClick = {
+                        onAnswer(
+                            listOf(
+                                QuestionAnswer(
+                                    id = pending.questions.first().id,
+                                    selected = picked.toList(),
+                                    custom = custom.ifBlank { null },
+                                )
+                            )
+                        )
+                    },
+                ) { Text("提交") }
+            } else {
+                FilledTonalButton(
+                    enabled = custom.isNotBlank(),
+                    onClick = {
+                        onAnswer(
+                            listOf(
+                                QuestionAnswer(
+                                    id = pending.questions.first().id,
+                                    selected = emptyList(),
+                                    custom = custom,
+                                )
+                            )
+                        )
+                    },
+                ) { Text("用这个回答") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StreamingRow(text: String, reasoning: String) {
+    val scheme = MaterialTheme.colorScheme
+    Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), contentAlignment = Alignment.TopStart) {
+        Column(
+            Modifier
+                .fillMaxWidth(0.92f)
+                .clip(RoundedCornerShape(12.dp))
+                .background(scheme.surfaceVariant)
+                .padding(10.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(11.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(6.dp))
+                Text("Harness 正在输出…", style = MaterialTheme.typography.labelSmall, color = scheme.primary)
+            }
+            if (reasoning.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    reasoning,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = scheme.onSurfaceVariant,
+                    maxLines = 8,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (text.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                // 流式输出也过 markdown。未闭合的标记在流中途会短暂显示成字面量，
+                // 但定稿后就会被解析掉 —— 比全程显示 ** 要好。
+                MarkdownText(
+                    text = text,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = scheme.onSurface,
+                )
+            }
+        }
+    }
+}
+
+/* ================================= 设置 ================================= */
+
+@Composable
+fun SettingsScreen(
+    endpointsRaw: String,
+    activeBaseUrl: String,
+    token: String,
+    showInjected: Boolean,
+    notifyEnabled: Boolean,
+    onSave: (String, String, Boolean) -> Unit,
+    onTest: (String, String) -> Unit,
+    onToggleInjected: (Boolean) -> Unit,
+) {
+    var eps by remember { mutableStateOf(endpointsRaw) }
+    var tok by remember { mutableStateOf(token) }
+    var notify by remember { mutableStateOf(notifyEnabled) }
+
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        SectionCard("桥接地址") {
+            Text(
+                "一行一个地址，按顺序挑第一个能连上的。典型两行：\n" +
+                    "  http://127.0.0.1:3080             在家插线（adb reverse）\n" +
+                    "  http://dsh-home.xxx.ts.net:3080   在外走 Tailscale\n" +
+                    "这样从家里出门不需要改任何设置。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            KeyValue("当前使用", activeBaseUrl, mono = true)
+            Spacer(Modifier.height(6.dp))
+            OutlinedTextField(
+                value = eps,
+                onValueChange = { eps = it },
+                label = { Text("端点（一行一个）") },
+                minLines = 2,
+                maxLines = 5,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = tok,
+                onValueChange = { tok = it },
+                label = { Text("令牌（桥接未设 token 时留空）") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(10.dp))
+            Row {
+                FilledTonalButton(onClick = { onTest(eps, tok) }) { Text("逐个测试") }
+                Spacer(Modifier.width(8.dp))
+                FilledTonalButton(onClick = { onSave(eps, tok, notify) }) { Text("保存并重连") }
+            }
+        }
+
+        SectionCard("显示") {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("显示注入消息", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "harness 注入的运行时提醒、技能目录等上下文",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = showInjected, onCheckedChange = onToggleInjected)
+            }
+        }
+
+        SectionCard("通知栏状态") {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("常驻显示 harness 状态", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "开启后不打开 App 也能在通知栏看到运行中的会话与任务",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = notify, onCheckedChange = { notify = it })
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "改完这里记得点上面的「保存并重连」。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        SectionCard("关于") {
+            KeyValue("应用", "DSH 手机端")
+            KeyValue("桥接", "/phone/* (HTTP + SSE)")
+            KeyValue("安装", "adb install，不 root、不解锁")
+        }
+
+        Spacer(Modifier.height(24.dp))
+    }
+}

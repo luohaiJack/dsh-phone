@@ -1,0 +1,16 @@
+{
+  "name": "dsh-phone-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "把本地 DSH harness 的状态与对话以简单 HTTP + SSE 暴露给手机 App（小米澎湃OS 客户端）",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
