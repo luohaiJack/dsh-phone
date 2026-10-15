@@ -21,6 +21,8 @@ data class JobInfo(
     val startedAt: Long,
     val finishedAt: Long?,
     val detail: String?,
+    /** 属于哪个会话（电脑端按会话分组显示后台任务，手机也照这个分）。 */
+    val owner: String? = null,
 )
 
 /** 会话当前的长任务目标。 */
@@ -58,6 +60,8 @@ data class SessionInfo(
     val updatedAt: Long,
     val cwd: String?,
     val origin: String?,
+    /** 父会话 id：非空 = 这是一条子代理会话。 */
+    val parent: String? = null,
     val live: Boolean,
     val jobs: List<JobInfo>,
     val goal: GoalInfo?,
@@ -141,6 +145,7 @@ internal fun parseJobs(arr: JSONArray?): List<JobInfo> {
                 startedAt = o.optLong("startedAt", 0L),
                 finishedAt = if (o.isNull("finishedAt")) null else o.optLong("finishedAt", 0L),
                 detail = o.optStringOrNull("detail"),
+                owner = o.optStringOrNull("owner"),
             )
         )
     }
@@ -175,6 +180,7 @@ internal fun parseState(root: JSONObject): HarnessState {
                     updatedAt = o.optLong("updatedAt", 0L),
                     cwd = o.optStringOrNull("cwd"),
                     origin = o.optStringOrNull("origin"),
+                    parent = o.optStringOrNull("parent"),
                     live = o.optBoolean("live", false),
                     jobs = parseJobs(o.optJSONArray("jobs")),
                     goal = parseGoal(if (o.isNull("goal")) null else o.optJSONObject("goal")),
@@ -601,4 +607,95 @@ internal fun parseQueue(arr: JSONArray?): List<QueuedMessage> {
         )
     }
     return out
+}
+
+/* ==================== 会话里的"后台在跑什么" ==================== */
+
+/** 一个子代理（harness 里就是"父会话下的子会话"）。 */
+data class SubagentInfo(
+    val id: String,
+    val title: String,
+    val running: Boolean,
+    /** 层级：直接子是 1，子的子 是 2 ……用来画缩进。 */
+    val depth: Int,
+    val updatedAt: Long,
+)
+
+/** 某个会话此刻的后台活动：后台任务 + 子代理。 */
+data class SessionActivity(
+    val jobs: List<JobInfo> = emptyList(),
+    val subagents: List<SubagentInfo> = emptyList(),
+) {
+    val runningJobs: List<JobInfo> get() = jobs.filter { it.status == "running" || it.status == "stopping" }
+    val runningSubagents: List<SubagentInfo> get() = subagents.filter { it.running }
+    val isEmpty: Boolean get() = jobs.isEmpty() && subagents.isEmpty()
+    val nothingRunning: Boolean get() = runningJobs.isEmpty() && runningSubagents.isEmpty()
+
+    /**
+     * 值不值得在聊天页占一张卡。
+     *
+     * 不是"有记录就显示"：一个会话昨天派过子代理，今天还挂着张卡就没意义了。
+     * 规则是**有在跑的**，或者**刚结束的**（默认 10 分钟内）——
+     * 后者是为了让"刚跑完，结果在这儿"也能被看见。
+     */
+    fun worthShowing(now: Long, freshMs: Long = 10 * 60 * 1000L): Boolean {
+        if (runningJobs.isNotEmpty() || runningSubagents.isNotEmpty()) return true
+        val cutoff = now - freshMs
+        return jobs.any { (it.finishedAt ?: it.startedAt) > cutoff } ||
+            subagents.any { it.updatedAt > cutoff }
+    }
+}
+
+/**
+ * 从整机快照里挑出"这个会话自己在跑什么"。
+ *
+ * 为什么不用额外请求：`/phone/state` 本来就每 5 秒拉一次，而且已经带了
+ * 每个后台任务的 owner、每个会话的 parent —— 子代理在 harness 里
+ * **就是一条子会话**，所以"谁是我的子代理"= `parent == 我`。
+ * 再往下递归，孙代理也一并收进来（电脑端的树状列表就是这个意思）。
+ *
+ * 纯函数，好测：这是"看着像对、错了很难发现"的那类逻辑（漏掉孙代理、
+ * 把别人的任务算进来）。
+ */
+fun sessionActivity(state: HarnessState, sessionId: String): SessionActivity {
+    if (sessionId.isEmpty()) return SessionActivity()
+
+    // 后台任务：owner 就是本会话的那些（按开始时间倒序，新的在前）
+    val jobs = state.jobs
+        .filter { it.owner == sessionId }
+        .sortedByDescending { it.startedAt }
+
+    // 子代理：从本会话出发按 parent 关系做宽度优先，收全部后代
+    val byParent = HashMap<String, MutableList<SessionInfo>>()
+    state.sessions.forEach { s ->
+        val p = s.parent
+        if (!p.isNullOrEmpty()) byParent.getOrPut(p) { ArrayList() }.add(s)
+    }
+    val out = ArrayList<SubagentInfo>()
+    val seen = HashSet<String>()
+    var frontier = listOf(sessionId)
+    var depth = 0
+    while (frontier.isNotEmpty() && depth < 8) {
+        depth += 1
+        val next = ArrayList<String>()
+        frontier.forEach { pid ->
+            byParent[pid].orEmpty().forEach { child ->
+                if (!seen.add(child.id)) return@forEach
+                out.add(
+                    SubagentInfo(
+                        id = child.id,
+                        title = child.displayTitle,
+                        running = child.running,
+                        depth = depth,
+                        updatedAt = child.updatedAt,
+                    ),
+                )
+                next.add(child.id)
+            }
+        }
+        frontier = next
+    }
+    // 在跑的排前面，其次按最近活动
+    out.sortWith(compareByDescending<SubagentInfo> { it.running }.thenByDescending { it.updatedAt })
+    return SessionActivity(jobs = jobs, subagents = out)
 }

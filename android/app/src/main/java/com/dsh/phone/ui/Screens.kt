@@ -78,6 +78,7 @@ import com.dsh.phone.ConnStatus
 import com.dsh.phone.DirListing
 import com.dsh.phone.DocState
 import com.dsh.phone.PendingQuestion
+import com.dsh.phone.SessionActivity
 import com.dsh.phone.QueuedMessage
 import com.dsh.phone.TermState
 import com.dsh.phone.QuestionAnswer
@@ -1102,6 +1103,8 @@ fun ChatScreen(
     onOpenFile: (String) -> Unit,
     onToggleInjected: (Boolean) -> Unit,
     queue: List<QueuedMessage>,
+    activity: SessionActivity,
+    onOpenSession: (String) -> Unit,
     onEditQueued: (String, String) -> Unit,
     onRetractQueued: (String) -> Unit,
     onSteerQueued: (String) -> Unit,
@@ -1275,6 +1278,9 @@ fun ChatScreen(
             if (question != null) {
                 QuestionCard(pending = question, onAnswer = onAnswer)
             }
+
+            // 这个会话在跑什么（后台任务 / 子代理）
+            ActivityCard(activity = activity, onOpenSession = onOpenSession)
 
             // 排队消息：harness 还在跑的时候发出去的那几条。
             // 放在输入框正上方 —— 用户的视线和手指本来就在这儿，
@@ -2014,4 +2020,137 @@ fun EditQueueDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
+}
+
+/* ========================= 会话里的"后台在跑什么" ========================= */
+
+/**
+ * 聊天页顶上那张"在跑什么"的卡。
+ *
+ * 为什么需要：电脑端能一眼看到这个会话挂了几个后台任务、派了几个子代理，
+ * 手机上原来什么都看不到 —— 于是会出现"它到底是在干活还是卡住了"的疑问。
+ * 只在**有东西**的时候出现，免得平时占地方。
+ */
+@Composable
+fun ActivityCard(
+    activity: SessionActivity,
+    onOpenSession: (String) -> Unit,
+) {
+    // 没在跑、也没有刚结束的，就不占地方
+    val now = System.currentTimeMillis()
+    if (!activity.worthShowing(now)) return
+    // 默认展开在跑的那些；全都停了就收起，别抢注意力
+    var expanded by remember { mutableStateOf(!activity.nothingRunning) }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+    ) {
+        Column(Modifier.fillMaxWidth().padding(10.dp)) {
+            Row(
+                Modifier.fillMaxWidth().clickable { expanded = !expanded },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val rj = activity.runningJobs.size
+                val rs = activity.runningSubagents.size
+                Text(
+                    buildString {
+                        append("⚙ ")
+                        if (rj > 0) append("$rj 个后台任务在跑") else append("无后台任务")
+                        append(" · ")
+                        append("👥 ")
+                        if (rs > 0) append("$rs 个子代理在跑") else append("无子代理")
+                    },
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    if (expanded) "收起 ▾" else "展开 ▸",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            if (expanded) {
+                if (activity.jobs.isNotEmpty()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text("后台任务", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                    activity.jobs.forEach { j ->
+                        Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.Top) {
+                            Text(
+                                if (j.status == "running") "▶" else if (j.status == "stopping") "⏹" else "✓",
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.width(20.dp),
+                            )
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    j.label.ifBlank { j.kind.ifBlank { j.id } },
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    buildString {
+                                        append(j.status)
+                                        if (j.kind.isNotBlank()) append(" · ").append(j.kind)
+                                        if (j.startedAt > 0) {
+                                            append(" · 已跑 ")
+                                            append(formatDuration(j.startedAt, j.finishedAt))
+                                        }
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                j.detail?.takeIf { it.isNotBlank() }?.let {
+                                    Text(
+                                        it,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (activity.subagents.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("子代理（点头部可以进去看）", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                    activity.subagents.forEach { sa ->
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable { onOpenSession(sa.id) }
+                                .padding(top = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                if (sa.running) "▶" else "·",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (sa.running) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.width(20.dp),
+                            )
+                            Text(
+                                // 层级用缩进表示：子代理下面还挂着孙代理时一眼能看出来
+                                (if (sa.depth > 1) "↳ ".repeat(sa.depth - 1) else "") + sa.title,
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                if (sa.running) "在跑" else relativeTime(sa.updatedAt),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (sa.running) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

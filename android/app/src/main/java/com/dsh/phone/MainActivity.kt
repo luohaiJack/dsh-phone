@@ -393,6 +393,9 @@ fun AppRoot(
                 vm.setShowInjected(it)
             },
             queue = queue,
+            // 纯计算，随 state/openId 变 —— 不用额外请求（state 每 5 秒已经拉了）
+            activity = remember(state, openId) { sessionActivity(state, openId) },
+            onOpenSession = { vm.openSession(it) },
             onEditQueued = { id, text -> vm.editQueued(id, text) },
             onRetractQueued = { vm.retractQueued(it) },
             onSteerQueued = { vm.steerQueued(it) },

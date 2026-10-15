@@ -1,6 +1,12 @@
 import com.dsh.phone.AnsiSpan
 import com.dsh.phone.CursorKind
+import com.dsh.phone.HarnessState
+import com.dsh.phone.JobInfo
+import com.dsh.phone.SessionActivity
+import com.dsh.phone.SessionInfo
+import com.dsh.phone.SubagentInfo
 import com.dsh.phone.TermState
+import com.dsh.phone.sessionActivity
 import com.dsh.phone.cursorKind
 import com.dsh.phone.lastNonBlankRange
 import com.dsh.phone.linesText
@@ -129,6 +135,61 @@ fun main() {
         check("最近 1 行是 three", tail != null && linesText(screen, tail.first, tail.second) == "three")
     }
 
-    println("\n==== 终端状态文案 + 光标格子验收：$pass 项通过，$fail 项失败 ====")
+    /* ---------- 会话里的"后台在跑什么"：谁是我的任务/子代理 ---------- */
+
+    run {
+        fun sess(id: String, parent: String?, running: Boolean) = SessionInfo(
+            id = id, title = id, running = running, blank = false, updatedAt = 0L,
+            cwd = null, origin = if (parent != null) "subagent" else null, parent = parent, live = running,
+            jobs = emptyList(), goal = null,
+        )
+        fun job(id: String, owner: String?, status: String) = JobInfo(
+            id = id, kind = "bash", label = "任务$id", status = status,
+            startedAt = 0L, finishedAt = null, detail = null, owner = owner,
+        )
+        val state = HarnessState(
+            ok = true, ts = 0L, model = null,
+            sessions = listOf(
+                sess("me", null, true),
+                sess("other", null, false),
+                sess("child1", "me", true),
+                sess("child2", "me", false),
+                sess("grand", "child1", true),      // 孙代理
+                sess("stranger", "other", true),    // 别人的子代理
+            ),
+            jobs = listOf(
+                job("j1", "me", "running"),
+                job("j2", "me", "completed"),
+                job("j3", "other", "running"),      // 别人的任务
+                job("j4", null, "running"),         // 没主的任务
+            ),
+            error = null, totalSessions = 6,
+        )
+        val a = sessionActivity(state, "me")
+        check("只算自己名下的任务", a.jobs.map { it.id } == listOf("j1", "j2"), a.jobs.map { it.id }.toString())
+        check("在跑的任务只算 running/stopping", a.runningJobs.map { it.id } == listOf("j1"))
+        check("子代理含后代（孙代理也在）", a.subagents.map { it.id }.toSet() == setOf("child1", "child2", "grand"),
+            a.subagents.map { it.id }.toString())
+        check("别人的子代理不算进来", a.subagents.none { it.id == "stranger" })
+        check("层级：孙代理 depth=2", a.subagents.first { it.id == "grand" }.depth == 2)
+        check("在跑的子代理排前面", a.subagents.first().id == "child1", a.subagents.map { "${it.id}:${it.running}" }.toString())
+        check("在跑的数得对", a.runningSubagents.map { it.id }.toSet() == setOf("child1", "grand"))
+        check("没有子代理时不报 null", a.subagents.isNotEmpty())
+        check("空会话 id 返回空", sessionActivity(state, "").isEmpty)
+        check("没有任何关系的会话是空的", sessionActivity(state, "nobody").isEmpty)
+
+        // 值不值得显示：有在跑就显示；都结束了就看是不是"刚结束"
+        val now = 1_000_000_000L
+        check("有在跑就显示", a.worthShowing(now))
+        val idle = SessionActivity(
+            jobs = listOf(JobInfo("j", "bash", "老任务", "completed", 0L, now - 3 * 3600_000L, null, "me")),
+            subagents = listOf(SubagentInfo("s", "老子代理", false, 1, now - 3 * 3600_000L)),
+        )
+        check("几小时前的记录不显示", !idle.worthShowing(now))
+        val fresh = idle.copy(subagents = listOf(SubagentInfo("s", "刚跑完", false, 1, now - 60_000L)))
+        check("刚结束的还显示一会儿", fresh.worthShowing(now))
+    }
+
+    println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动）：$pass 项通过，$fail 项失败 ====")
     if (fail > 0) throw RuntimeException("有失败项")
 }

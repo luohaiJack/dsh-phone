@@ -62,7 +62,7 @@ else
     fail=$((fail + 1))
   fi
 
-  # 终端状态文案 + 光标格子：要连 Models.kt 一起编（TermState 在那儿），
+  # UI 纯逻辑（状态文案 / 光标 / 复制 / 会话活动）：要连 Models.kt 一起编，
   # 它引用了 org.json，所以拿 android.jar 当编译期 classpath
   ANDROID_JAR="$(ls "$HOME"/android-sdk/platforms/*/android.jar 2>/dev/null | tail -1)"
   if [ -n "$ANDROID_JAR" ]; then
