@@ -56,6 +56,17 @@ scripts/verify.sh               # ⑤ 全链路自检，必须 15 项全过
 | ④ | `adb install` 输出 `Success`；手机上 App 已经起来 |
 | ⑤ | `================ 结果：15 项通过，0 项失败 ================` |
 
+> **改桥接不用再重启（2026-10-16 起，§61）**：桥接入口是薄壳 `bridge/lib/entry.js`，
+> 它按 mtime+size 拼 query 去动态 import `bridge/lib/mount.js`（挂载层），
+> mount 再同样方式 import `bridge-core.js`。于是改完 `mount.js` / `bridge-core.js`：
+>
+> 1. 把 `bridge-core.js` 里的 `VERSION` 加一（它是"这次改动生效了吗"的自检位）；
+> 2. 用 `plugin_manager` 把 `include:phone-bridge` **关一次再开一次**；
+> 3. `curl -s -H "x-phone-token: <token>" http://127.0.0.1:3080/phone/health`
+>    —— `version` 变了就是生效了（**`dsh web` 进程不用重启**，实测 pid 不变）。
+>
+> 只有"改入口 `entry.js` 本身"才需要重启（极少；那时换新文件名再重启）。
+>
 > **本机现状（2026-10-15 起）**：桥接已经作为 profile bundle 装进 `web`
 > （`~/.dsh/profiles/web/package.json` 的 `dependencies` 与
 > `dsh.profile.bundles` 都有 `dsh-phone-bridge`，`node_modules` 里是指向
