@@ -1307,7 +1307,29 @@ export function createBridge(ctx, opts) {
   let stateClientSeq = 0
   let activeSessionId = null
 
+  /**
+   * 所有活着的 SSE 连接。
+   *
+   * 为什么要一张总表：手机侧的 SSE 是**无限读超时**（为了长连接），
+   * 于是一旦连接半死（harness 重启、中间设备悄悄丢弃），客户端会**永远等下去**、
+   * 永远不触发重连 —— 2026-10-16 实测到"App 活着但 stateClients 一直是 0"。
+   * 现在桥接每 20 秒给每条 SSE 打一个注释行当心跳，
+   * App 侧就能用有界的读超时把它踹掉重连（见 BridgeClient 的 sseHttp）。
+   */
+  const sseAll = []
+
   function openSse(req, res) {
+    sseAll.push(res)
+    const forget = function () {
+      const idx = sseAll.indexOf(res)
+      if (idx >= 0) sseAll.splice(idx, 1)
+    }
+    try {
+      req.on('close', forget)
+      req.on('error', forget)
+    } catch (err) {
+      /* 拿不到事件就算了，sweep 时按 writableEnded 清 */
+    }
     res.writeHead(
       200,
       corsHeaders({
@@ -2389,6 +2411,24 @@ export function createBridge(ctx, opts) {
   every(20_000, function () {
     safe(sweepTerms, undefined)
     safe(termHeartbeat, undefined)
+  })
+
+  // 心跳间隔可注入：离线用例用 150ms 就能验"注释行确实发出去了"
+  const HEARTBEAT_MS = typeof cfg.heartbeatMs === 'number' && cfg.heartbeatMs > 0 ? cfg.heartbeatMs : 20_000
+  every(HEARTBEAT_MS, function () {
+    for (let i = sseAll.length - 1; i >= 0; i -= 1) {
+      const res = sseAll[i]
+      if (!res || res.writableEnded) {
+        sseAll.splice(i, 1)
+        continue
+      }
+      try {
+        // SSE 注释行：合规解析器一律忽略，但**能重置客户端的读超时**
+        res.write(': ping ' + Date.now() + '\n\n')
+      } catch (err) {
+        sseAll.splice(i, 1)
+      }
+    }
   })
 
   /**

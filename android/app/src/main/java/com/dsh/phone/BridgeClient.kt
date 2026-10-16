@@ -57,8 +57,17 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
         .readTimeout(120, TimeUnit.SECONDS)
         .build()
 
+    /**
+     * SSE 用的客户端。
+     *
+     * 读超时**不能是无限**：桥接每 20 秒发一个注释行当心跳，所以 65 秒
+     * （三次没收到）就说明这条连接已经半死 —— 半死的连接不会触发任何回调，
+     * 客户端会永远等下去、永远不重连（2026-10-16 实测到"App 活着但
+     * stateClients 一直是 0"就是这么来的，靠轮询兜着才没显得完全断线）。
+     * 超时后 OkHttp 抛 IOException → 走 onClosed → 重连循环接手。
+     */
     private val sseHttp: OkHttpClient = http.newBuilder()
-        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .readTimeout(65, TimeUnit.SECONDS)
         .build()
 
     private fun url(path: String): String = buildUrl(baseUrl, token, path)

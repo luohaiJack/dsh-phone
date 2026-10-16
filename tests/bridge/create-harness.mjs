@@ -114,7 +114,19 @@ const ctx = {
     if (name === 'webServer') return { register: (r) => { routes.push(r); return () => {} } }
     if (name === 'sessionController') return sessionController
     if (name === 'workspaceRegistry') return workspaceRegistry
-    if (name === 'timer') return { interval: () => () => {}, timeout: () => () => {} }
+    // 真定时器：心跳那条规则要靠它跑（空实现会让心跳永远不触发）
+    if (name === 'timer') {
+      return {
+        interval: (fn, ms) => {
+          const h = setInterval(fn, ms)
+          return () => clearInterval(h)
+        },
+        timeout: (fn, ms) => {
+          const h = setTimeout(fn, ms)
+          return () => clearTimeout(h)
+        },
+      }
+    }
     if (name === 'directoryPickerController') {
       return {
         // 手机上的"在此新建文件夹"走这里
@@ -138,7 +150,9 @@ const ctx = {
   effect() {},
 }
 
-createBridge(ctx, { token: TOKEN })
+// 心跳间隔压到 150ms，好在 1 秒内验完"注释行确实发出去了"
+const HEARTBEAT_MS = 150
+createBridge(ctx, { token: TOKEN, heartbeatMs: HEARTBEAT_MS })
 
 const server = http.createServer((req, res) => {
   const route = routes.find((r) => req.url.split('?')[0].startsWith(r.path))
@@ -242,6 +256,30 @@ check('不存在的 workspaceId → 报错而不是静默成功', bad.json.ok ==
 }
 
 check('全程零越界请求', violations.length === 0, JSON.stringify(violations))
+
+/* ------------------------------------------------------------------ *
+ * 7. SSE 心跳：没有它，半死的长连接会永远等下去（App 永远不会重连）
+ * ------------------------------------------------------------------ */
+{
+  const ac = new AbortController()
+  const frames = []
+  const stream = fetch(`${base}/events`, { headers: { 'x-phone-token': TOKEN }, signal: ac.signal })
+  stream.then(async (res) => {
+    const reader = res.body.getReader()
+    const dec = new TextDecoder()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      frames.push(dec.decode(value, { stream: true }))
+    }
+  }).catch(() => {})
+  await new Promise((r) => setTimeout(r, HEARTBEAT_MS * 4 + 400))
+  ac.abort()
+  const text = frames.join('')
+  check('★ SSE 会定期发心跳注释行（客户端才能用有界读超时）', /: ping \d+/.test(text),
+    text.slice(0, 90).replace(/\n/g, '\\n'))
+  check('心跳是注释行（合规解析器会忽略，不会当成事件）', !/event: ping/.test(text))
+}
 
 console.log(`\n==== 新建会话定位契约验收：${pass} 项通过，${fail} 项失败 ====`)
 server.close()
