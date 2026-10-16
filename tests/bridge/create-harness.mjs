@@ -48,7 +48,19 @@ const cloneWorkspace = (w) => ({
 })
 
 const sessionController = {
-  list: () => Promise.resolve({ items: [] }),
+  // 必须把已建的会话列出来：桥接要**按会话逐个**问后台任务
+  // （宿主 list(caller) 空参只返回无主任务 —— 见 projectJobs 的注释）
+  list: () =>
+    Promise.resolve({
+      items: sessions.map((x) => ({
+        sessionId: x.id,
+        updatedAt: Date.now(),
+        running: false,
+        blank: false,
+        cwd: x.cwd,
+        projections: { values: { modelSelection: { lastUsed: { provider: 'p', model: 'm' } } } },
+      })),
+    }),
   /**
    * 逐字照抄宿主的契约（见文件头引的那几行）。
    * 顺序很重要：先查"两个都给"，再解析 cwd，再 attach。
@@ -68,12 +80,39 @@ const sessionController = {
     }
     const cwd = workspace ? workspace.path : (request.cwd ?? '/home/u')
     seq += 1
-    const sessionId = `session-fake-${seq}`
+    const sessionId = seq === 1 ? SID_FOR_JOBS : `session-fake-${seq}`
     const rec = { id: sessionId, cwd, workspaceId: workspace ? workspace.id : null }
     sessions.push(rec)
     if (workspace) workspace.sessionIds.push(sessionId)
     return Promise.resolve({ sessionId })
   },
+}
+
+/**
+ * 假 jobs 服务 —— **逐字照抄宿主 `dsh-jobs-local` 的 `list(caller)` 语义**：
+ *
+ *     [...store.values()].filter((job) => job.owner === void 0 || job.owner.id === caller)
+ *
+ * 桥接原来空参调用（只拿到无主任务），而后台任务基本都是有主的 ——
+ * 于是 `state.jobs` 永远是空数组，手机上"看不到有后台任务的会话"。
+ * owner 还是个**对象**（`job.owner.id`），桥接原来读的 `j.ownerSession` 也不存在。
+ */
+const SID_FOR_JOBS = 'session-under-test'
+const jobStore = [
+  { id: 'job-owned', kind: 'bash', label: 'npm run dev', status: 'running', owner: { id: SID_FOR_JOBS }, startedAt: 100, finishedAt: null, detail: null },
+  { id: 'job-unowned', kind: 'bash', label: '无主任务', status: 'running', owner: undefined, startedAt: 200, finishedAt: null, detail: null },
+  { id: 'job-other', kind: 'bash', label: '别人会话的任务', status: 'running', owner: { id: 'session-other' }, startedAt: 300, finishedAt: null, detail: null },
+]
+const jobsSvc = {
+  // list(caller) 的过滤语义 + **view 的投影语义**（owner 是字符串，无主则不带该字段）
+  list: (caller) =>
+    jobStore
+      .filter((j) => j.owner === undefined || j.owner.id === caller)
+      .map((j) => {
+        const v = { id: j.id, kind: j.kind, label: j.label, status: j.status, startedAt: j.startedAt, finishedAt: j.finishedAt, detail: j.detail }
+        if (j.owner !== undefined) v.owner = j.owner.id
+        return v
+      }),
 }
 
 const workspaceRegistry = {
@@ -114,6 +153,7 @@ const ctx = {
     if (name === 'webServer') return { register: (r) => { routes.push(r); return () => {} } }
     if (name === 'sessionController') return sessionController
     if (name === 'workspaceRegistry') return workspaceRegistry
+    if (name === 'jobs') return jobsSvc
     // 真定时器：心跳那条规则要靠它跑（空实现会让心跳永远不触发）
     if (name === 'timer') {
       return {
@@ -256,6 +296,32 @@ check('不存在的 workspaceId → 报错而不是静默成功', bad.json.ok ==
 }
 
 check('全程零越界请求', violations.length === 0, JSON.stringify(violations))
+
+/* ------------------------------------------------------------------ *
+ * 6b. 后台任务必须报出来（手机上"看不到有后台任务的会话"就是这个）
+ * ------------------------------------------------------------------ */
+{
+  const d = await (await fetch(`${base}/state`, { headers: H })).json()
+  const jobs = d.jobs || []
+  const ids = jobs.map((j) => j.id)
+  check('★ 有主任务被报出来（不能因为空参调用而永远为空）', ids.includes('job-owned'), JSON.stringify(ids))
+  check('★ 无主任务也报（owner=null）', ids.includes('job-unowned') &&
+    (jobs.find((j) => j.id === 'job-unowned') || {}).owner === null, JSON.stringify(jobs.find((j) => j.id === 'job-unowned')))
+  check('owner 填的是会话 id（宿主那边 owner 是对象，不是 ownerSession）',
+    (jobs.find((j) => j.id === 'job-owned') || {}).owner === SID_FOR_JOBS,
+    JSON.stringify(jobs.find((j) => j.id === 'job-owned')))
+  check('没列出来的会话的任务不会混进来', !ids.includes('job-other'), JSON.stringify(ids))
+
+  // ★ list(caller) 会把无主任务返回给**每一个** caller —— 不能因此重复报
+  const unownedCount = ids.filter((x) => x === 'job-unowned').length
+  check('★ 无主任务只报一次（去重）', unownedCount === 1, '出现 ' + unownedCount + ' 次')
+  check('全部任务里没有重复 id', ids.length === new Set(ids).size, JSON.stringify(ids))
+
+  const sess = (d.sessions || []).find((x) => x.id === SID_FOR_JOBS)
+  check('★ 会话自己的 jobs 里有它', !!sess && (sess.jobs || []).some((j) => j.id === 'job-owned'),
+    JSON.stringify((sess && sess.jobs) || []))
+  check('会话的 jobs 不夹带别人的', !!sess && !(sess.jobs || []).some((j) => j.id === 'job-other'))
+}
 
 /* ------------------------------------------------------------------ *
  * 7. SSE 心跳：没有它，半死的长连接会永远等下去（App 永远不会重连）

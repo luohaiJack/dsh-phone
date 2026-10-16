@@ -299,24 +299,64 @@ export function createBridge(ctx, opts) {
     return map
   }
 
-  function projectJobs() {
+  /**
+   * 后台任务投影。
+   *
+   * ★ 必须**按 owner 逐个问**。宿主的契约（`dsh-jobs-local` 的 `list(caller)`）是：
+   *
+   *     [...this.store.values()]
+   *       .filter((job) => job.owner === void 0 || job.owner.id === caller)
+   *
+   * 也就是说 `list()` 不带 caller 只会返回**无主任务**，而后台任务基本都是有主的
+   * （owner 指向发起它的那个 agent/会话）。桥接原来就是空参调用 ——
+   * 于是 `state.jobs` **永远是空数组**，手机上"看不到有后台任务的会话"。
+   * 电脑端的 job 面板走的是另一个 API，所以它看得见（这就是"电脑上有、手机没有"）。
+   *
+   * 另一处错：owner 是**对象**（`job.owner.id`），原来读的 `j.ownerSession` 根本不存在，
+   * 所以就算拿到了任务，按会话分组也分不出来。
+   *
+   * @param sessionIds 要逐个问的会话 id（有主任务的归属）
+   */
+  function projectJobs(sessionIds) {
     const out = []
-    const list = safe(function () {
-      return jobsSvc && typeof jobsSvc.list === 'function' ? jobsSvc.list() : []
-    }, [])
-    for (let i = 0; i < list.length; i += 1) {
-      const j = list[i]
-      if (!j) continue
+    const seen = {}
+    const push = function (j) {
+      if (!j || j.id === undefined) return
+      const id = String(j.id)
+      if (seen[id]) return
+      seen[id] = true
+      // 归属以**投影里的 owner** 为准（宿主 `view()` 把 owner 投影成字符串，
+      // 无主任务干脆不带这个字段）。用"谁问的"当归属是错的：
+      // `list(caller)` 会把**无主任务也返回给每一个 caller**，
+      // 那样它会被重复塞进来、还会被错误地挂到某个会话上。
+      const raw = j.owner
       out.push({
-        id: String(j.id),
+        id: id,
         kind: String(j.kind || ''),
         label: String(j.label || ''),
         status: String(j.status || ''),
-        owner: j.ownerSession !== undefined && j.ownerSession !== null ? String(j.ownerSession) : null,
+        owner: raw === undefined || raw === null ? null : String(raw),
         startedAt: typeof j.startedAt === 'number' ? j.startedAt : 0,
         finishedAt: typeof j.finishedAt === 'number' ? j.finishedAt : null,
         detail: typeof j.detail === 'string' ? j.detail : null,
       })
+    }
+    if (jobsSvc === undefined || typeof jobsSvc.list !== 'function') return out
+    // 无主任务：list() 不带 caller 正好就是这一批
+    safe(function () {
+      const unowned = jobsSvc.list() || []
+      for (let i = 0; i < unowned.length; i += 1) push(unowned[i])
+    }, undefined)
+    // 有主任务：按会话逐个问（caller = 那个会话 id），再按 id 去重
+    const ids = Array.isArray(sessionIds) ? sessionIds : []
+    for (let i = 0; i < ids.length; i += 1) {
+      const sid = String(ids[i])
+      safe(function (sessionId) {
+        return function () {
+          const list = jobsSvc.list(sessionId) || []
+          for (let k = 0; k < list.length; k += 1) push(list[k])
+        }
+      }(sid), undefined)
     }
     return out
   }
@@ -384,7 +424,8 @@ export function createBridge(ctx, opts) {
       ts: Date.now(),
       model: currentModel(),
       sessions: [],
-      jobs: projectJobs(),
+      // jobs 在拿到会话列表之后再算（有主任务要按会话逐个问，见 projectJobs）
+      jobs: [],
       activeSessionId: activeSessionId,
       // 手机正开着这个会话时，把它上面挂着的待答问题一起带上 ——
       // 会话流只是快通道，这条轮询才是"一定会送到"的那条（见 pendingQuestionFor）
@@ -402,19 +443,31 @@ export function createBridge(ctx, opts) {
       .list({}, makeSignal())
       .then(function (value) {
         const items = (value && value.items) || []
+        // ★ 拿到会话 id 之后再问后台任务：宿主的 list(caller) 要按 owner 逐个问
+        //    （空参只会返回无主任务 —— 见 projectJobs 的注释）
+        const sessionJobs = projectJobs(
+          items
+            .map(function (x) {
+              return x && x.sessionId !== undefined && x.sessionId !== null ? String(x.sessionId) : ''
+            })
+            .filter(function (x) {
+              return x !== ''
+            }),
+        )
+        state.jobs = sessionJobs
         for (let i = 0; i < items.length && state.sessions.length < maxSessions; i += 1) {
           const it = items[i]
           if (!it) continue
           const id = String(it.sessionId)
           const liveSession = live[id]
           const owned = []
-          for (let k = 0; k < state.jobs.length; k += 1) {
-            if (state.jobs[k].owner === id) {
+          for (let k = 0; k < sessionJobs.length; k += 1) {
+            if (sessionJobs[k].owner === id) {
               owned.push({
-                id: state.jobs[k].id,
-                label: state.jobs[k].label,
-                status: state.jobs[k].status,
-                kind: state.jobs[k].kind,
+                id: sessionJobs[k].id,
+                label: sessionJobs[k].label,
+                status: sessionJobs[k].status,
+                kind: sessionJobs[k].kind,
               })
             }
           }
