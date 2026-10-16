@@ -971,6 +971,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * 清空待发附件。
+     *
+     * 为什么要这个：一次选七八张图（用户就是这么干的）时，逐个点小✕太折磨，
+     * 而且"哪张不要"往往一开始就清楚 —— 给一个明确的出口。
+     */
+    fun clearAttachments() {
+        _attachments.value = emptyList()
+    }
+
     fun removeAttachment(receiptId: String) {
         _attachments.value = _attachments.value.filterNot { it.receiptId == receiptId }
     }

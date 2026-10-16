@@ -409,6 +409,7 @@ fun AppRoot(
             uploadingName = uploadingName,
             onAttachFile = { name, bytes -> vm.attachFile(name, bytes) },
             onRemoveAttachment = { vm.removeAttachment(it) },
+            onClearAttachments = { vm.clearAttachments() },
             hasMoreHistory = hasMoreHistory,
             loadingOlder = loadingOlder,
             onLoadOlder = { vm.loadOlder() },

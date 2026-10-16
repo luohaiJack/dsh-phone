@@ -1154,6 +1154,7 @@ fun ChatScreen(
     uploadingName: String?,
     onAttachFile: (String, ByteArray) -> Unit,
     onRemoveAttachment: (String) -> Unit,
+    onClearAttachments: () -> Unit,
     onLoadOlder: () -> Unit,
     onJumpPreviousUser: () -> Unit,
     activity: SessionActivity,
@@ -1465,18 +1466,35 @@ fun ChatScreen(
                     }
                     attachments.forEach { a ->
                         Surface(
-                            shape = RoundedCornerShape(14.dp),
+                            shape = RoundedCornerShape(16.dp),
                             color = MaterialTheme.colorScheme.secondaryContainer,
                         ) {
                             Row(
-                                Modifier.padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                                Modifier.padding(start = 10.dp, end = 2.dp, top = 2.dp, bottom = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Text("📎 ${a.name} · ${a.sizeText}", style = MaterialTheme.typography.labelMedium)
-                                IconButton(onClick = { onRemoveAttachment(a.receiptId) }, modifier = Modifier.size(22.dp)) {
-                                    Icon(Icons.Filled.Close, contentDescription = "移除附件", modifier = Modifier.size(14.dp))
+                                // ★ 这个 ✕ 原来只有 22dp（图标 14dp）—— 远低于 48dp 的最小点击区，
+                                //   看起来"根本没有删除操作"（用户 2026-10-16 报的）。现在 32dp + 18dp 图标，
+                                //   并配上颜色，让人一眼看得见、点得中。
+                                IconButton(
+                                    onClick = { onRemoveAttachment(a.receiptId) },
+                                    modifier = Modifier.size(32.dp),
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Close,
+                                        contentDescription = "移除附件 ${a.name}",
+                                        tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                        modifier = Modifier.size(18.dp),
+                                    )
                                 }
                             }
+                        }
+                    }
+                    // 一次选好几张时，逐个点太累 —— 给一个明确的出口
+                    if (attachments.size > 1) {
+                        TextButton(onClick = onClearAttachments) {
+                            Text("清空附件", style = MaterialTheme.typography.labelMedium)
                         }
                     }
                 }
