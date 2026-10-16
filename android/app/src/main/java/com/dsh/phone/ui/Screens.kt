@@ -106,6 +106,7 @@ import com.dsh.phone.WorkspaceInfo
 import com.dsh.phone.WorkspaceSession
 import com.dsh.phone.contextPercent
 import com.dsh.phone.shortFileName
+import com.dsh.phone.jobsBadgeText
 import com.dsh.phone.formatTokens
 import com.dsh.phone.formatClock
 import com.dsh.phone.formatDuration
@@ -516,11 +517,26 @@ fun SessionsScreen(
                 }
                 items(runningNow.size) { i ->
                     val (w, sess) = runningNow[i]
+                    // 只在"后台任务在跑"、而 agent 那一轮已经结束的会话上显示 ⚙ ——
+                    // 否则用户看不出它到底是在跑 agent 还是在等后台任务。
+                    // jobs 只有 state 那份带（工作区树不带），所以按 id 去 state 里查。
+                    val info = state.sessions.firstOrNull { it.id == sess.id }
+                    val badge = jobsBadgeText(info?.jobs ?: emptyList())
+                    val agentRunning = info?.running ?: sess.running
                     SessionSectionCard(
                         container = MaterialTheme.colorScheme.primaryContainer,
-                        leading = { CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp) },
+                        leading = {
+                            if (agentRunning) {
+                                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                            } else {
+                                Text("⚙", style = MaterialTheme.typography.labelMedium)
+                            }
+                        },
                         title = sess.displayTitle,
-                        subtitle = w.displayTitle + " · " + relativeTime(sess.updatedAt),
+                        subtitle = buildString {
+                            append(w.displayTitle).append(" · ").append(relativeTime(sess.updatedAt))
+                            if (badge != null) append(" · ").append(badge)
+                        },
                         actionLabel = "进入 ›",
                         actionColor = MaterialTheme.colorScheme.primary,
                         onClick = { actions.openSession(sess.id) },

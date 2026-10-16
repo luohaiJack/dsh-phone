@@ -363,12 +363,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 里出不来，于是"未读"永远不出现 —— 那正是要修的问题。
      */
     private fun refreshWorking() {
-        val fresh = HashMap<String, Boolean>()
-        _state.value.sessions.forEach { fresh[it.id] = it.running }
+        // state 比工作区树新（5 秒一次），所以两边都留一份：优先用 state 的 running/jobs
+        val fresh = HashMap<String, SessionInfo>()
+        _state.value.sessions.forEach { fresh[it.id] = it }
         val out = HashSet<String>()
         _workspaces.value.forEach { w ->
             w.sessions.forEach { s ->
-                if (fresh[s.id] ?: s.running) out.add(s.id)
+                val info = fresh[s.id]
+                val running = info?.running ?: s.running
+                // jobs 只在 state 那份里（工作区树不带），拿不到就当没有
+                val jobs = info?.jobs ?: emptyList()
+                // ★ 有后台任务在跑也算「正在工作」（见 sessionWorking 的注释）：
+                //   后台任务常常比一轮活得久，只看 running 会让这类会话"消失"
+                //   —— 既不在未读（已读），也不在正在工作，用户以为它没在跑。
+                if (sessionWorking(running, jobs)) out.add(s.id)
             }
         }
         // 手机正开着的那个会话：实时流的 turn/start 比 5 秒轮询还快

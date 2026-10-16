@@ -6,6 +6,8 @@ import com.dsh.phone.hasNewRepliesInHistory
 import com.dsh.phone.looksLikeError
 import com.dsh.phone.PendingAttachment
 import com.dsh.phone.shortFileName
+import com.dsh.phone.sessionWorking
+import com.dsh.phone.jobsBadgeText
 import com.dsh.phone.formatAttachList
 import com.dsh.phone.parseAttachList
 import com.dsh.phone.appendErrorLog
@@ -530,6 +532,30 @@ fun main() {
         check("短名字原样返回", shortFileName("a.jpg") == "a.jpg")
         check("正好到上限不改", shortFileName("x".repeat(30)) == "x".repeat(30))
         check("中文名一样处理", shortFileName("截屏 " + "字".repeat(40) + ".png").contains("…"))
+    }
+
+    /* ---------- 正在工作：后台任务也算（用户报的"看不到有后台任务的会话"） ---------- */
+
+    run {
+        fun job(status: String, label: String = "npm run dev", kind: String = "bash") =
+            JobInfo(id = "j", kind = kind, label = label, status = status, startedAt = 0L, finishedAt = null, detail = null)
+
+        check("★ agent 在跑 → 算", sessionWorking(running = true, jobs = emptyList()))
+        check("★ agent 没跑但有 running 的任务 → 也算（任务比一轮活得久）",
+            sessionWorking(running = false, jobs = listOf(job("running"))))
+        check("任务在 stopping（正在停）也算", sessionWorking(running = false, jobs = listOf(job("stopping"))))
+        check("任务都结束了 → 不算", !sessionWorking(running = false, jobs = listOf(job("done"), job("failed"))))
+        check("没有任务、也没跑 → 不算", !sessionWorking(running = false, jobs = emptyList()))
+
+        check("一个任务时角标直接写名字", jobsBadgeText(listOf(job("running", label = "npm run dev"))) == "⚙ npm run dev",
+            jobsBadgeText(listOf(job("running", label = "npm run dev"))) ?: "null")
+        check("多个任务给个数", jobsBadgeText(listOf(job("running"), job("running"))) == "⚙ 2 个后台任务",
+            jobsBadgeText(listOf(job("running"), job("running"))) ?: "null")
+        check("没有在跑的任务 → 不占地方", jobsBadgeText(listOf(job("done"))) == null)
+        check("名字为空时不写出空名", jobsBadgeText(listOf(job("running", label = "  "))) == "⚙ 1 个后台任务",
+            jobsBadgeText(listOf(job("running", label = "  "))) ?: "null")
+        check("超长名字截断", jobsBadgeText(listOf(job("running", label = "x".repeat(60))))!!.length <= 30,
+            jobsBadgeText(listOf(job("running", label = "x".repeat(60))))!!.length.toString())
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

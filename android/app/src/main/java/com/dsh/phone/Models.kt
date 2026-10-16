@@ -202,9 +202,38 @@ data class HarnessState(
 ) {
     val runningCount: Int get() = sessions.count { it.running }
     val activeJobs: List<JobInfo> get() = jobs.filter { it.status == "running" || it.status == "stopping" }
+
+
     companion object {
         val EMPTY = HarnessState(false, 0L, null, emptyList(), emptyList(), null, 0)
     }
+}
+
+/**
+ * 这个会话算不算"正在工作"。
+ *
+ * ★ 不能只看 `running`：**后台任务的生命周期可以长过一轮**
+ * （bash 里 nohup 起的活、子代理、长跑的实验），这时 agent 那一轮早结束了，
+ * `running` 是 false，可活儿还在跑。用户 2026-10-16 报的
+ * "看不到有后台任务的会话的运行状态"就是这个 —— 三栏判据漏了 jobs。
+ */
+fun sessionWorking(running: Boolean, jobs: List<JobInfo>): Boolean =
+    running || jobs.any { it.status == "running" || it.status == "stopping" }
+
+/**
+ * 会话卡片上那行"后台任务"角标；没有在跑的任务就返回 null（不占地方）。
+ *
+ * 只有一个任务时直接把它的名字写出来（"⚙ npm run dev"），
+ * 多个时给个数（"⚙ 3 个后台任务"）—— 用户要的是"它在忙什么"，不是数量本身。
+ */
+fun jobsBadgeText(jobs: List<JobInfo>): String? {
+    val active = jobs.filter { it.status == "running" || it.status == "stopping" }
+    if (active.isEmpty()) return null
+    if (active.size == 1) {
+        val label = active[0].label.trim()
+        return if (label.isEmpty()) "⚙ 1 个后台任务" else "⚙ " + label.take(28)
+    }
+    return "⚙ ${active.size} 个后台任务"
 }
 
 /** 聊天页里的一条消息。 */
