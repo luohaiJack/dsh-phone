@@ -5,6 +5,7 @@ import com.dsh.phone.questionToShow
 import com.dsh.phone.hasNewRepliesInHistory
 import com.dsh.phone.looksLikeError
 import com.dsh.phone.PendingAttachment
+import com.dsh.phone.shortFileName
 import com.dsh.phone.formatAttachList
 import com.dsh.phone.parseAttachList
 import com.dsh.phone.appendErrorLog
@@ -515,6 +516,20 @@ fun main() {
             round.size == 1 && round[0].name == "a b c", round.firstOrNull()?.name ?: "空")
         check("空列表 → 空文本 → 空列表", formatAttachList(emptyList()) == "" && parseAttachList("").isEmpty())
         check("脏数据不炸", parseAttachList("乱七八糟\n只有\t两列").isEmpty())
+    }
+
+    /* ---------- 长文件名缩写（chip 里必须留得下 ✕） ---------- */
+
+    run {
+        val long = "Screenshot_2026-10-16-10-07-42-951_com.ss.android.ugc.aweme.jpg"
+        val short = shortFileName(long)
+        check("★ 长名字被缩短", short.length <= 30, short.length.toString())
+        check("★ 保留开头（时间戳最有信息量）", short.startsWith("Screenshot_2026-10"), short)
+        check("★ 保留扩展名（尾部截断会把 .jpg 吃掉）", short.endsWith(".jpg"), short)
+        check("有省略号", short.contains("…"))
+        check("短名字原样返回", shortFileName("a.jpg") == "a.jpg")
+        check("正好到上限不改", shortFileName("x".repeat(30)) == "x".repeat(30))
+        check("中文名一样处理", shortFileName("截屏 " + "字".repeat(40) + ".png").contains("…"))
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

@@ -12,7 +12,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.PaddingValues
@@ -103,6 +105,7 @@ import com.dsh.phone.ModelCatalog
 import com.dsh.phone.WorkspaceInfo
 import com.dsh.phone.WorkspaceSession
 import com.dsh.phone.contextPercent
+import com.dsh.phone.shortFileName
 import com.dsh.phone.formatTokens
 import com.dsh.phone.formatClock
 import com.dsh.phone.formatDuration
@@ -1153,6 +1156,8 @@ fun ChatScreen(
     attachments: List<PendingAttachment>,
     uploadingName: String?,
     onAttachFile: (String, ByteArray) -> Unit,
+    /** 一次加入多个（多选选文件）。 */
+    onAttachFiles: (List<Pair<String, ByteArray>>) -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onClearAttachments: () -> Unit,
     onLoadOlder: () -> Unit,
@@ -1175,20 +1180,35 @@ fun ChatScreen(
 
     // 选文件：用系统的 SAF（不申请存储权限，用户选什么我们才读什么）
     var pickError by remember { mutableStateOf<String?>(null) }
+    // ★ 原来是 OpenDocument() —— 那是**单选**契约，所以一次只能选一个（用户报的 bug）。
+    //   换成 OpenMultipleDocuments()：系统选择器会给出多选界面，回调拿到一串 Uri。
     val filePicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        if (uris.isNullOrEmpty()) return@rememberLauncherForActivityResult
         scope.launch {
-            val picked = withContext(Dispatchers.IO) { readPickedFile(context, uri) }
-            when {
-                picked == null -> pickError = "读不到这个文件（可能没有访问权限）"
-                picked.second == null -> pickError = "文件太大（上限 ${MAX_UPLOAD_MB} MB）"
-                else -> {
-                    pickError = null
-                    onAttachFile(picked.first, picked.second!!)
+            val result = withContext(Dispatchers.IO) {
+                val ok = ArrayList<Pair<String, ByteArray>>()
+                var unreadable = 0
+                var tooBig = 0
+                uris.forEach { u ->
+                    val picked = readPickedFile(context, u)
+                    when {
+                        picked == null -> unreadable += 1
+                        picked.second == null -> tooBig += 1
+                        else -> ok.add(picked.first to picked.second!!)
+                    }
                 }
+                Triple(ok, unreadable, tooBig)
             }
+            val (ok, unreadable, tooBig) = result
+            pickError = when {
+                ok.isEmpty() && unreadable > 0 -> "读不到这些文件（可能没有访问权限）"
+                ok.isEmpty() && tooBig > 0 -> "文件太大（单个上限 ${MAX_UPLOAD_MB} MB）"
+                unreadable + tooBig > 0 -> "有 ${unreadable + tooBig} 个没加成（读不到或体积超限）"
+                else -> null
+            }
+            if (ok.isNotEmpty()) onAttachFiles(ok)
         }
     }
 
@@ -1461,19 +1481,33 @@ fun ChatScreen(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp)
                             Spacer(Modifier.width(6.dp))
-                            Text("正在传 $n …（发送中）", style = MaterialTheme.typography.labelMedium)
+                            Text("正在传 ${shortFileName(n)} …（发送中）", style = MaterialTheme.typography.labelMedium)
                         }
                     }
                     attachments.forEach { a ->
                         Surface(
                             shape = RoundedCornerShape(16.dp),
                             color = MaterialTheme.colorScheme.secondaryContainer,
+                            // ★ 必须给 chip 一个宽度上限：文件名可能很长（小米截图 60+ 字符），
+                            //   没有约束时整条 chip 会被撑出屏幕，末尾的 ✕ 跑到屏幕外 ——
+                            //   用户两次反馈"看不到删除标识"就是这个。
+                            modifier = Modifier.widthIn(max = 280.dp),
                         ) {
                             Row(
                                 Modifier.padding(start = 10.dp, end = 2.dp, top = 2.dp, bottom = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Text("📎 ${a.name} · ${a.sizeText}", style = MaterialTheme.typography.labelMedium)
+                                Text(
+                                    "📎 ${shortFileName(a.name)} · ${a.sizeText}",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    // weight(1f, fill=false)：文字最多占满剩余宽度（✕ 永远留得下），
+                                    // 但短名字时 chip 不会被撑满整行
+                                    modifier = Modifier
+                                        .weight(1f, fill = false)
+                                        .combinedClickable(onClick = {}, onLongClick = { onRemoveAttachment(a.localId) }),
+                                )
                                 // ★ 这个 ✕ 原来只有 22dp（图标 14dp）—— 远低于 48dp 的最小点击区，
                                 //   看起来"根本没有删除操作"（用户 2026-10-16 报的）。现在 32dp + 18dp 图标，
                                 //   并配上颜色，让人一眼看得见、点得中。

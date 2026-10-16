@@ -56,6 +56,24 @@ fun isUnread(activity: ActivityInfo?, seenSeq: Long, now: Long, windowMs: Long):
     return a.lastReplyAt > 0 && now - a.lastReplyAt < windowMs
 }
 
+/**
+ * 把长文件名缩成"头…尾"。
+ *
+ * 为什么不用系统的省略号（尾部截断）：文件名最有信息量的是**扩展名**和**开头**，
+ * 尾部截断会把 `.jpg` 直接吃掉（小米截图的名字有 60 多个字符：
+ * `Screenshot_2026-10-16-10-07-42-951_com.ss.android.ugc.aweme.jpg`）。
+ *
+ * 这条直接关系到"能不能看到删除按钮"：chip 里的文字没有宽度约束时，
+ * 长名字会把整条 chip 撑出屏幕，末尾的 ✕ 就跑到屏幕外去了
+ * —— 用户两次反馈"没有删除标识"就是这个原因。
+ */
+fun shortFileName(name: String, max: Int = 30): String {
+    if (name.length <= max || max <= 6) return name
+    val tail = 8   // 留出扩展名 + 一点后缀
+    val head = max - tail - 1
+    return name.take(head) + "…" + name.takeLast(tail)
+}
+
 /* ------------------------------ 错误记录 ------------------------------ */
 
 /**

@@ -985,31 +985,54 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 不上传：用户可能马上又删掉，传上去就是电脑上的孤儿；
      * 而且"待发"本来就属于这条消息的草稿，该跟草稿一起待在手机上。
      */
-    fun attachFile(name: String, bytes: ByteArray) {
+    fun attachFile(name: String, bytes: ByteArray) = attachFiles(listOf(name to bytes))
+
+    /**
+     * 一次加入多个（系统选择器支持多选了）。
+     *
+     * 只报**一条**提示：一次选七八张图时，逐个弹 toast 会把屏幕刷满，
+     * 用户反而看不到"到底加了几个"。
+     */
+    fun attachFiles(items: List<Pair<String, ByteArray>>) {
         val sessionId = _openSessionId.value
         if (sessionId.isEmpty()) {
             say("先打开一个会话再加文件")
             return
         }
+        if (items.isEmpty()) return
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
                 val dir = draftDir(sessionId)
                 if (!dir.exists()) dir.mkdirs()
-                // 路径不带文件名：名字里可能有斜杠/奇怪字符，用时间戳当文件名，
-                // 显示名另存（上传时再把这个名字告诉电脑）
-                val file = File(dir, System.currentTimeMillis().toString() + ".bin")
-                file.writeBytes(bytes)
-                PendingAttachment(path = file.absolutePath, name = name, bytes = bytes.size)
+                val added = ArrayList<PendingAttachment>(items.size)
+                items.forEachIndexed { i, (name, bytes) ->
+                    // 路径不带文件名：名字里可能有斜杠/奇怪字符，用时间戳+序号当文件名，
+                    // 显示名另存（上传时再把这个名字告诉电脑）
+                    val file = File(dir, System.currentTimeMillis().toString() + "_" + i + ".bin")
+                    file.writeBytes(bytes)
+                    added.add(PendingAttachment(path = file.absolutePath, name = name, bytes = bytes.size))
+                }
+                added
             }
-                .onSuccess { a ->
-                    val next = _attachments.value + a
+                .onSuccess { added ->
+                    val next = _attachments.value + added
                     _attachments.value = next
                     persistAttachments(sessionId, next)
-                    say("已加入待发：${a.name}（${a.sizeText}）—— 点发送时才传给电脑")
+                    val total = added.sumOf { it.bytes }
+                    val sizeText = PendingAttachment(path = "", name = "", bytes = total).sizeText
+                    say(
+                        if (added.size == 1) {
+                            "已加入待发：${shortFileName(added[0].name, 24)}（${added[0].sizeText}）—— 点发送时才传给电脑"
+                        } else {
+                            "已加入 ${added.size} 个待发附件（共 $sizeText）—— 点发送时才传给电脑"
+                        },
+                    )
                 }
                 .onFailure { say("加入附件失败：${it.message}") }
         }
     }
+
+
 
     private fun persistAttachments(sessionId: String, list: List<PendingAttachment>) {
         settings.writeAttachments(sessionId, list)

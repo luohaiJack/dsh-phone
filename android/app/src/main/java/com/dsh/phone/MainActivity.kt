@@ -408,6 +408,7 @@ fun AppRoot(
             attachments = attachments,
             uploadingName = uploadingName,
             onAttachFile = { name, bytes -> vm.attachFile(name, bytes) },
+            onAttachFiles = { items -> vm.attachFiles(items) },
             onRemoveAttachment = { vm.removeAttachment(it) },
             onClearAttachments = { vm.clearAttachments() },
             hasMoreHistory = hasMoreHistory,
