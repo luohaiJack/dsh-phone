@@ -43,6 +43,20 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
         .build()
 
     /** SSE 需要无限读超时，否则空闲时会被自己掐断。 */
+    /**
+     * 上传专用客户端：读写超时放宽到 180/120 秒。
+     *
+     * 共用客户端是 25 秒（普通请求够用），但上传是**大 body + 可能走蜂窝**：
+     * 2026-10-16 那次 7 张截图（每张约 0.5 MB）上传时手机报了个错，
+     * 而电脑侧七个文件**尺寸分毫不差**、临时目录干净 ——
+     * 最像的就是"服务端已经把文件收下了，但响应没在 25 秒内回来"，
+     * 于是用户看到"传文件失败：timeout"这种**假警报**。
+     */
+    private val uploadHttp: OkHttpClient = http.newBuilder()
+        .writeTimeout(180, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
+        .build()
+
     private val sseHttp: OkHttpClient = http.newBuilder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
@@ -65,12 +79,16 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
     }
 
     /** 直接发原始字节（传文件用）；路径里的参数由调用方拼好。 */
-    private fun postBytes(path: String, bytes: ByteArray): JSONObject {
+    private fun postBytes(
+        path: String,
+        bytes: ByteArray,
+        client: OkHttpClient = http,
+    ): JSONObject {
         val req = Request.Builder()
             .url(url(path))
             .post(bytes.toRequestBody("application/octet-stream".toMediaType()))
             .build()
-        http.newCall(req).execute().use { resp ->
+        client.newCall(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) throw failure(resp.code, body)
             return if (body.isBlank()) JSONObject() else JSONObject(body)
@@ -147,7 +165,7 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
         withContext(Dispatchers.IO) {
             val q = "?sessionId=" + URLEncoder.encode(sessionId, "UTF-8") +
                 "&name=" + URLEncoder.encode(name, "UTF-8")
-            val r = postBytes("/phone/upload$q", bytes)
+            val r = postBytes("/phone/upload$q", bytes, client = uploadHttp)
             PendingAttachment(
                 receiptId = r.optString("receiptId", ""),
                 name = r.optString("name", name),

@@ -2011,6 +2011,8 @@ fun SettingsScreen(
     token: String,
     showInjected: Boolean,
     notifyEnabled: Boolean,
+    errorLog: List<String>,
+    onClearErrorLog: () -> Unit,
     onSave: (String, String, Boolean) -> Unit,
     onTest: (String, String) -> Unit,
     onToggleInjected: (Boolean) -> Unit,
@@ -2096,6 +2098,44 @@ fun SettingsScreen(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+
+        // 错误记录：出错提示以前只在屏幕上闪一下就没了，事后问"刚才报的什么错"
+        // 电脑侧什么也查不到。落盘在这里，不用数据线也能看。
+        SectionCard("错误记录（最近 ${errorLog.size} 条）") {
+            Text(
+                "这里只记「看起来是错」的提示（带「失败/错误/连不上」等字样），" +
+                    "最新的在最上面。电脑侧的桥接不记请求，所以这份是手机独有的现场。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (errorLog.isEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "还没有记录。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                Spacer(Modifier.height(6.dp))
+                errorLog.take(20).forEach { line ->
+                    Text(
+                        line,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(vertical = 1.dp),
+                    )
+                }
+                if (errorLog.size > 20) {
+                    Text(
+                        "（只显示最近 20 条，共 ${errorLog.size} 条）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                OutlinedButton(onClick = onClearErrorLog) { Text("清空记录") }
+            }
         }
 
         SectionCard("关于") {

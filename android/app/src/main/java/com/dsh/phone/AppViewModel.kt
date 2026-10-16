@@ -514,12 +514,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return id.ifEmpty { null }
     }
 
+    /** 错误记录（最新在最上面），落盘保存，不用数据线也能看。 */
+    private val _errorLog = MutableStateFlow<List<String>>(emptyList())
+    val errorLog: StateFlow<List<String>> = _errorLog.asStateFlow()
+
     private var stateCall: Call? = null
     private var sessionCall: Call? = null
     private var stateLoop: Job? = null
     private var pollLoop: Job? = null
 
     init {
+        _errorLog.value = settings.errorLog()
         startStateStream()
         startPollLoop()
         refreshWorkspaces()
@@ -645,6 +650,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun say(text: String) {
         _toast.value = text
+        // 出错就落盘留痕：以前只在屏幕上闪一下，用户回头问"报的什么错"，
+        // 电脑侧什么都查不到（桥接不记请求、harness 也不记）
+        if (looksLikeError(text)) recordError(text)
+    }
+
+    private fun recordError(text: String) {
+        val line = formatLogTime(System.currentTimeMillis()) + "  " + text.trim()
+        val next = appendErrorLog(_errorLog.value, line)
+        _errorLog.value = next
+        settings.writeErrorLog(next)
+    }
+
+    fun clearErrorLog() {
+        _errorLog.value = emptyList()
+        settings.clearErrorLog()
     }
 
     fun reconnect() {
@@ -686,6 +706,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     _conn.value = ConnStatus(ConnPhase.ERROR, message = "连接已关闭，重连中")
                 } else {
                     _conn.value = ConnStatus(ConnPhase.ERROR, message = err.message ?: err.javaClass.simpleName)
+                    recordError("状态流断开：" + (err.message ?: err.javaClass.simpleName))
                 }
                 attempt += 1
                 delay(backoffMs(attempt))

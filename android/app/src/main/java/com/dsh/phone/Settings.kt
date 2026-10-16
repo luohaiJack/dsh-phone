@@ -59,6 +59,29 @@ class Settings(context: Context) {
      * 只存在手机上 —— 已读是每个观察者自己的状态，不该写回电脑的会话存储。
      * 换手机/重装后重新计未读，这是符合预期的。
      */
+    /* ------------------------- 错误记录（落盘，可事后看） ------------------------- */
+
+    /**
+     * 最近的出错提示。
+     *
+     * 为什么要落盘：以前出错只在屏幕上闪一个 toast，用户回头问"刚才报的什么错"，
+     * 电脑侧什么也查不到（桥接不记请求、harness 也不记）—— 2026-10-16 就这么干瞪眼。
+     * 现在 App 把出错提示留在本机，**不用数据线也能读到**。
+     */
+    fun errorLog(): List<String> {
+        val raw = prefs.getString(KEY_ERROR_LOG, "") ?: return emptyList()
+        if (raw.isBlank()) return emptyList()
+        return raw.split('\n').filter { it.isNotBlank() }
+    }
+
+    fun writeErrorLog(lines: List<String>) {
+        prefs.edit().putString(KEY_ERROR_LOG, lines.joinToString("\n")).apply()
+    }
+
+    fun clearErrorLog() {
+        prefs.edit().remove(KEY_ERROR_LOG).apply()
+    }
+
     fun seenReplySeq(sessionId: String): Long = prefs.getLong(SEEN_PREFIX + sessionId, 0L)
 
     fun markReplySeen(sessionId: String, seq: Long) {
@@ -230,5 +253,6 @@ class Settings(context: Context) {
         private const val KEY_SHOW_INJECTED = "showInjected"
         private const val KEY_NOTIFY = "notify"
         private const val KEY_LAST_SESSION = "lastSessionId"
+        private const val KEY_ERROR_LOG = "errorLog"
     }
 }

@@ -227,6 +227,7 @@ fun AppRoot(
     val working by vm.working.collectAsState()
     val recentAt by vm.recentAt.collectAsState()
     val refreshing by vm.refreshing.collectAsState()
+    val errorLog by vm.errorLog.collectAsState()
     val term by vm.term.collectAsState()
     val termFollowTail by vm.termFollowTail.collectAsState()
     val queue by vm.queue.collectAsState()
@@ -496,6 +497,8 @@ fun AppRoot(
                     token = token,
                     showInjected = showInjected,
                     notifyEnabled = notifyEnabled,
+                    errorLog = errorLog,
+                    onClearErrorLog = { vm.clearErrorLog() },
                     onSave = { raw, tok, notify ->
                         vm.applySettings(raw, tok, notify)
                         if (notify) {

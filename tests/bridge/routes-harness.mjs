@@ -100,6 +100,20 @@ for (const [method, path, body] of documented) {
   check('不存在的路径仍然是 404', res.status === 404 && text.includes('unknown bridge route'), `status=${res.status}`)
 }
 
+/* 失败请求要留痕：手机上报错时，电脑侧得能回看（2026-10-16 加） */
+{
+  const d = await (await fetch(`${base}/diag`, { headers: { 'x-phone-token': TOKEN } })).json()
+  const http = d.http || {}
+  const codes = Object.keys(http.byStatus || {})
+  check('diag 里有失败请求统计', typeof http.total === 'number' && http.total > 0, JSON.stringify(http.byStatus))
+  check('★ 401 与 404 都被记下来了', codes.includes('401') && codes.includes('404'), codes.join(','))
+  const arr = http.last || []
+  const last = arr[arr.length - 1] || {}
+  check('★ 记了路由与状态码（能定位是哪条接口）',
+    typeof last.path === 'string' && last.path.length > 0 && typeof last.status === 'number',
+    JSON.stringify(last))
+}
+
 console.log(`\n==== 路由契约验收：${pass} 项通过，${fail} 项失败 ====`)
 server.close()
 process.exit(fail === 0 ? 0 : 1)

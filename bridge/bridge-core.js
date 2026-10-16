@@ -97,6 +97,32 @@ export function createBridge(ctx, opts) {
     return head
   }
 
+  /* ------------------------------------------------------------------ *
+   * 失败请求留痕（"手机上刚报了个错，电脑这边什么也查不到"）
+   *
+   * 起因：2026-10-16 用户传完图后 App 报错，回头问"有没有日志"，
+   * 结果 App 只弹了个 toast、桥接不记请求、harness 也不记 —— 三处全空。
+   * 现在把 4xx/5xx 记在这张表里（路由 + 状态码 + 错误文案），
+   * 用 `/phone/diag` 就能回看。
+   * ------------------------------------------------------------------ */
+  const httpErrors = []
+  const httpErrorCounts = {}
+  let httpErrorTotal = 0
+
+  function noteHttpError(res, status, message) {
+    httpErrorTotal += 1
+    const key = String(status)
+    httpErrorCounts[key] = (httpErrorCounts[key] || 0) + 1
+    httpErrors.push({
+      at: Date.now(),
+      method: res && res.__phoneMethod ? String(res.__phoneMethod) : '',
+      path: res && res.__phonePath ? String(res.__phonePath) : '',
+      status: status,
+      error: message === undefined || message === null ? '' : String(message).slice(0, 200),
+    })
+    if (httpErrors.length > 30) httpErrors.shift()
+  }
+
   function sendJson(res, status, value) {
     let body
     try {
@@ -105,11 +131,21 @@ export function createBridge(ctx, opts) {
       body = JSON.stringify({ ok: false, error: 'serialize-failed: ' + String(err && err.message) })
       status = 500
     }
+    if (status >= 400) {
+      safe(function () {
+        noteHttpError(res, status, value && typeof value === 'object' ? value.error : '')
+      }, undefined)
+    }
     res.writeHead(status, corsHeaders({ 'content-type': 'application/json; charset=utf-8' }))
     res.end(body)
   }
 
   function sendText(res, status, text) {
+    if (status >= 400) {
+      safe(function () {
+        noteHttpError(res, status, text)
+      }, undefined)
+    }
     res.writeHead(status, corsHeaders({ 'content-type': 'text/plain; charset=utf-8' }))
     res.end(text)
   }
@@ -2860,6 +2896,10 @@ export function createBridge(ctx, opts) {
     }
     const path = parsed.path
     const query = parsed.query
+    // 挂在 res 上给失败请求留痕用（sendJson/sendText 里读）——
+    // 比"模块级变量记住当前请求"稳：异步处理多个请求时不会串
+    res.__phoneMethod = req.method
+    res.__phonePath = path
 
     if (path.indexOf(BASE) !== 0) {
       sendText(res, 404, 'not a bridge route')
@@ -2931,6 +2971,12 @@ export function createBridge(ctx, opts) {
         stateClients: Object.keys(stateClients).length,
         terminals: termList(),
         queue: { controlRunning: controlRunning, frames: controlFrames, sessions: Object.keys(queues).length },
+        // 失败的请求（4xx/5xx）—— 手机上报错时先看这里
+        http: {
+          total: httpErrorTotal,
+          byStatus: httpErrorCounts,
+          last: httpErrors.slice(-10),
+        },
         // 归档集大小：手机上"归档了但没消失"时先看这一项有没有变大
         archived: Object.keys(archivedSet()).length,
         // 宿主事件循环忙不忙 —— 排查"页面自动重连失败"先看这里

@@ -56,6 +56,48 @@ fun isUnread(activity: ActivityInfo?, seenSeq: Long, now: Long, windowMs: Long):
     return a.lastReplyAt > 0 && now - a.lastReplyAt < windowMs
 }
 
+/* ------------------------------ 错误记录 ------------------------------ */
+
+/**
+ * 日志时间戳：`MM-dd HH:mm:ss`。
+ *
+ * 带上日期是因为"昨天那个错"和"刚刚那个错"必须能分开 ——
+ * 只有时分秒的话，隔天回看就分不清了。
+ */
+fun formatLogTime(now: Long): String {
+    val c = java.util.Calendar.getInstance()
+    c.timeInMillis = now
+    fun p(v: Int) = if (v < 10) "0$v" else "$v"
+    return "${p(c.get(java.util.Calendar.MONTH) + 1)}-${p(c.get(java.util.Calendar.DAY_OF_MONTH))} " +
+        "${p(c.get(java.util.Calendar.HOUR_OF_DAY))}:${p(c.get(java.util.Calendar.MINUTE))}:" +
+        p(c.get(java.util.Calendar.SECOND))
+}
+
+/**
+ * 这条提示算不算"出错了"？—— 决定要不要写进错误记录。
+ *
+ * 为什么用关键词而不是给每个调用点加一个 fail()：出错提示有三十来处
+ * （上传、刷新、归档、切模型、终端……），逐个改既啰嗦又容易漏；
+ * 而「话里带"失败/错误/连不上"」这件事本身就很可靠 ——
+ * 谁会写一句"上传失败"来表示成功呢。真要精确的时候再单开接口。
+ */
+fun looksLikeError(text: String): Boolean =
+    listOf("失败", "错误", "连不上", "超时", "异常", "没拿到", "没有拿到", "不能为空", "不可用")
+        .any { text.contains(it) }
+
+/**
+ * 往错误记录里追加一行：**最新的在最上面**，只留 [keep] 条。
+ *
+ * 最新的在最上面是为了"出事了立刻看一眼" —— 让用户往下翻找刚发生的错很反人类。
+ */
+fun appendErrorLog(current: List<String>, line: String, keep: Int = 50): List<String> {
+    if (line.isBlank()) return current
+    val next = ArrayList<String>(current.size + 1)
+    next.add(line.trim())
+    for (i in 0 until minOf(current.size, keep - 1)) next.add(current[i])
+    return next
+}
+
 /** 会话页上次离开时的阅读位置（也是"这次进来落在哪儿"的输入）。 */
 data class SavedScroll(val index: Int, val offset: Int, val followTail: Boolean)
 

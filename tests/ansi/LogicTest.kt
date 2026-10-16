@@ -3,6 +3,9 @@ import com.dsh.phone.ChatMessage
 import com.dsh.phone.mergeProgress
 import com.dsh.phone.questionToShow
 import com.dsh.phone.hasNewRepliesInHistory
+import com.dsh.phone.looksLikeError
+import com.dsh.phone.appendErrorLog
+import com.dsh.phone.formatLogTime
 import com.dsh.phone.planEntryScroll
 import com.dsh.phone.SavedScroll
 import com.dsh.phone.ActivityInfo
@@ -449,6 +452,36 @@ fun main() {
         check("★ 会话还在跑 → 一律看最新（哪怕历史还没定稿）",
             hasNewRepliesInHistory(hist, 999L, running = true))
         check("★ 冷启动也准：不依赖 activity 缓存", hasNewRepliesInHistory(hist, 0L, false))
+    }
+
+    /* ---------- 错误记录：只记"看起来是错"的，最新的在最上面 ---------- */
+
+    run {
+        check("上传失败 → 记", looksLikeError("传文件失败：timeout"))
+        check("上传没拿到凭据 → 记", looksLikeError("上传没有拿到凭据，可能没传成功"))
+        check("连接问题 → 记", looksLikeError("连不上 harness，重试中"))
+        check("归档失败 → 记", looksLikeError("归档失败：这个会话还在电脑上跑着，先停止它再归档"))
+        check("成功提示 → 不记", !looksLikeError("已归档：已从手机列表里移除（电脑上的会话日志仍然保留）"))
+        check("普通提示 → 不记", !looksLikeError("已创建文件夹：nmmiw卡尔曼滤波rl"))
+        check("附件成功提示 → 不记", !looksLikeError("已传到电脑：up-test.txt（33 B）"))
+        check("空串 → 不记", !looksLikeError(""))
+
+        var log = emptyList<String>()
+        log = appendErrorLog(log, "10-16 10:21:03  传文件失败：timeout")
+        log = appendErrorLog(log, "10-16 10:21:05  刷新失败：连接超时")
+        check("★ 最新的在最上面", log.first().contains("刷新失败") && log.last().contains("传文件失败"), log.toString())
+        check("空白行不进记录", appendErrorLog(log, "   ").size == log.size)
+
+        // 上限：只留最近 keep 条（久了不删会把 prefs 撑大）
+        var many = emptyList<String>()
+        for (i in 1..60) many = appendErrorLog(many, "第 $i 条", keep = 50)
+        check("★ 最多留 50 条", many.size == 50, many.size.toString())
+        check("★ 留下的是最新的那批（第 60 条在最上面）", many.first() == "第 60 条" && many.last() == "第 11 条",
+            "${many.first()} .. ${many.last()}")
+
+        // 时间戳：带日期，跨天也能分清
+        val ts = formatLogTime(1792117309624L)
+        check("时间戳形如 MM-dd HH:mm:ss", Regex("\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}").matches(ts), ts)
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")
