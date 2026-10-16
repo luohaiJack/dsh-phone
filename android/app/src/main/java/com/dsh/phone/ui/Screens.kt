@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.PaddingValues
@@ -1317,7 +1318,11 @@ fun ChatScreen(
             )
         },
     ) { inner ->
-        Column(Modifier.fillMaxSize().padding(inner)) {
+        // ★ imePadding 必须加在**根容器**上：这样键盘弹起时整块内容上移，
+        //   而 LazyColumn 的 weight(1f) 会跟着缩，输入框自然贴在键盘上方。
+        //   以前它只加在输入行上：附件条/排队卡在输入行**外面**，不会跟着缩，
+        //   内容一多就把输入框顶出屏幕（用户 2026-10-16 报的"文字被键盘遮挡"）。
+        Column(Modifier.fillMaxSize().padding(inner).imePadding()) {
             // 仪表盘：轮/步 + 目标（有才显示）+ 上下文进度
             SessionDashboard(progress = progress, goal = goal, onClearGoal = onClearGoal)
 
@@ -1412,6 +1417,16 @@ fun ChatScreen(
                 }
             }
 
+            // 输入框上方的这几块（提问卡 / 活动 / 排队 / 附件条）在"键盘弹起 + 内容多"
+            // 时会很高。给它们一个高度上限并允许**内部滚动** —— 否则整块会把输入框
+            // 顶出屏幕，打字时看不到自己写的字。输入行永远是这个 Column 的最后一个
+            // 孩子，所以它永远贴在键盘正上方。
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 240.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
             // 有提问时，卡片贴在输入框上方
             if (question != null) {
                 QuestionCard(pending = question, onAnswer = onAnswer)
@@ -1432,8 +1447,6 @@ fun ChatScreen(
                     onSteer = onSteerQueued,
                 )
             }
-
-            HorizontalDivider()
 
             // 已传上去、等着跟下一条消息一起发的文件。
             // 必须看得见：不然用户以为传丢了，会再传一遍
@@ -1476,11 +1489,13 @@ fun ChatScreen(
                     color = MaterialTheme.colorScheme.error,
                 )
             }
+            }   // ← 关闭"输入框上方可滚区"
+
+            HorizontalDivider()
 
             Row(
                 Modifier
                     .fillMaxWidth()
-                    .imePadding()
                     .navigationBarsPadding()
                     .padding(8.dp),
                 verticalAlignment = Alignment.Bottom,
