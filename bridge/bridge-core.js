@@ -34,6 +34,18 @@ export function createBridge(ctx, opts) {
   const jobsSvc = ctx.get('jobs')
   const goalsSvc = ctx.get('goals')
   const agentsSvc = ctx.get('agents')
+  /**
+   * 子代理编排服务。
+   *
+   * ★ 往**子代理会话**发消息不能走 `sessionController.prompt({sessionId})` ——
+   *   宿主明确拒绝（"session … is a subagent session; use subagent delivery"）。
+   *   宿主给宿主/浏览器留的门是这条：
+   *     subagents.prompt({parentSessionId, childSessionId, mode:'continuable',
+   *                       delivery:'queue', requestId, content}, signal)
+   *   （`mode` 必须是字面量 `'continuable'`；一次性子代理给不了消息。）
+   *   停止一个子代理也走它自己的门：`interruptByParent(child, parent, 'continuable')`。
+   */
+  const subagentsSvc = ctx.get('subagents')
   const modelSvc = ctx.get('agentDefaultModel')
   const timerSvc = ctx.get('timer')
   // 工作区注册表：harness 自己的"项目文件夹"概念，会话按 canonical-cwd 自动归属
@@ -476,6 +488,7 @@ export function createBridge(ctx, opts) {
             id,
             typeof it.origin === 'string' ? it.origin : null,
             it.parentSessionId !== undefined && it.parentSessionId !== null ? String(it.parentSessionId) : null,
+            subagentModeOf(it),
           )
           const summaryModel = projectionModel(it)
           if (summaryModel) sessionModelCache[id] = summaryModel
@@ -690,12 +703,23 @@ export function createBridge(ctx, opts) {
    */
   const sessionMeta = {}
 
-  function rememberSessionMeta(id, origin, parent) {
+  function rememberSessionMeta(id, origin, parent, subagentMode) {
     if (!id) return
     sessionMeta[String(id)] = {
       origin: typeof origin === 'string' ? origin : null,
       parent: typeof parent === 'string' && parent ? parent : null,
+      // 'continuable' 才能收消息；'one-shot' 只能看历史（宿主 schema 只认这两个字面量）
+      subagentMode: typeof subagentMode === 'string' && subagentMode ? subagentMode : null,
     }
+  }
+
+  /** 会话投影里的 subagent.mode（一次性 / 可续谈）。 */
+  function subagentModeOf(summary) {
+    return safe(function () {
+      const proj = summary && summary.projections && summary.projections.values
+      const sa = proj ? proj.subagent : null
+      return sa && typeof sa.mode === 'string' ? sa.mode : null
+    }, null)
   }
 
   function addressFor(sessionId, meta) {
@@ -728,6 +752,7 @@ export function createBridge(ctx, opts) {
               sessionId,
               typeof it.origin === 'string' ? it.origin : null,
               it.parentSessionId !== undefined && it.parentSessionId !== null ? String(it.parentSessionId) : null,
+              subagentModeOf(it),
             )
             break
           }
@@ -1724,18 +1749,73 @@ export function createBridge(ctx, opts) {
     }
     if (typeof text === 'string' && text) content.push({ type: 'text', text: text })
     if (content.length === 0) return Promise.reject(new Error('没有内容可发'))
-    const request = {
-      requestId: requestId(),
-      sessionId: sessionId,
-      mode: 'queue',
-      content: content,
-    }
-    return sc.prompt(request, makeSignal()).then(function (value) {
-      return { accepted: !!(value && value.accepted) }
+    // ★ 子代理会话必须走 subagents.prompt（宿主拒绝用 sessionId 给它发消息）
+    return resolveAddress(sessionId).then(function (address) {
+      const meta = sessionMeta[sessionId]
+      if (address.kind === 'subagent') {
+        if (!meta || meta.subagentMode !== 'continuable') {
+          // 一次性子代理：宿主 schema 只认 mode:'continuable'
+          return Promise.reject(new Error('这个子代理是一次性的（one-shot），只能看历史'))
+        }
+        if (subagentsSvc === undefined || typeof subagentsSvc.prompt !== 'function') {
+          return Promise.reject(new Error('这个 harness 版本没挂载 subagents 服务，发不了子代理消息'))
+        }
+        return Promise.resolve()
+          .then(function () {
+            return subagentsSvc.prompt(
+              {
+                parentSessionId: meta.parent,
+                childSessionId: sessionId,
+                mode: 'continuable',
+                delivery: 'queue',
+                requestId: requestId(),
+                content: content,
+              },
+              makeSignal(),
+            )
+          })
+          .then(
+            function (value) {
+              if (!value || !value.messageId) return { accepted: false }
+              return { accepted: true }
+            },
+            function (err) {
+              const msg = String((err && err.message) || err)
+              if (msg.indexOf('parent-unavailable') >= 0) {
+                throw new Error('父会话没开着：子代理要父会话活着才能回话，先把父会话在电脑上打开')
+              }
+              if (msg.indexOf('not-resumable') >= 0) throw new Error('这个子代理不能续谈，只能看历史')
+              throw err
+            },
+          )
+      }
+      const request = {
+        requestId: requestId(),
+        sessionId: sessionId,
+        mode: 'queue',
+        content: content,
+      }
+      return sc.prompt(request, makeSignal()).then(function (value) {
+        return { accepted: !!(value && value.accepted) }
+      })
     })
   }
 
   function doCancel(sessionId) {
+    // ★ 子代理的"停止"是它自己的门：interruptByParent(child, parent, 'continuable')
+    const meta = sessionMeta[sessionId]
+    if (meta && meta.origin === 'subagent' && meta.parent) {
+      if (subagentsSvc === undefined || typeof subagentsSvc.interruptByParent !== 'function') {
+        return Promise.reject(new Error('这个 harness 版本没挂载 subagents 服务，停不了子代理'))
+      }
+      return Promise.resolve()
+        .then(function () {
+          subagentsSvc.interruptByParent(sessionId, meta.parent, 'continuable')
+        })
+        .then(function () {
+          return { ok: true }
+        })
+    }
     if (sc === undefined || typeof sc.cancel !== 'function') {
       return Promise.reject(new Error('sessionController.cancel unavailable'))
     }

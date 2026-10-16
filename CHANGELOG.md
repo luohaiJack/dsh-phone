@@ -7,6 +7,27 @@
 
 ---
 
+## v0.3.24 —— 2026-10-16
+
+### 修：在子代理会话里发不出消息
+- 用户报打开子代理会话后发不出消息。上一节修历史时看到的错误里其实就写着
+  `use subagent delivery for this child session` —— 宿主不许用会话路由给子代理发消息，
+  但**留了另一扇门**：`ctx.subagents.prompt({parentSessionId, childSessionId,
+  mode:'continuable', delivery, requestId, content})`。
+- 三个细节都照做了：① control schema **只认 `mode:'continuable'`**，
+  一次性子代理（`one-shot`）本来就给不了消息 —— 给中文提示而不是抛 schema 错；
+  ② 父会话必须是活的（否则 `parent-unavailable`）→ 提示"父会话没开着"；
+  ③ 停止子代理走 `interruptByParent(child, parent, 'continuable')`。
+  而"一次性还是可续谈"**就在会话投影里**（`projections.values.subagent.mode`）
+  —— 又一次"数据有、没用它"。
+- 验证：假宿主照抄 control schema 与"父会话要活着"两条，并让假 sessionController
+  照抄宿主对子代理的拒绝；4 项新断言（能发/一次性给中文提示/普通会话照旧/能停）。
+  **反向验证**：旧桥接 3 项红，报的正是 `use subagent delivery`。合计 346 项全过。
+
+> 今天同一个问题问了三次："电脑上有的，手机为什么没有？"三次都是同一类错：
+> 宿主把信息/门放在 A 处，我一直在 B 处找。所以每接一个宿主能力，
+> **先看它有没有第二扇门**（grep 错误提示本身，它常常直接写着该走哪儿）。
+
 ## v0.3.23 —— 2026-10-16
 
 ### 修：点开子代理会话的历史就 500

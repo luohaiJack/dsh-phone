@@ -55,6 +55,35 @@ const cloneWorkspace = (w) => ({
  */
 const SUBAGENT = 'subagent-child-1'
 const SUBAGENT_PARENT = 'subagent-parent-1'
+const SUBAGENT_ONESHOT = 'subagent-oneshot-1'
+const delivered = []
+
+/**
+ * 假 subagents 服务 —— 照抄宿主 `dsh-subagent` 的两个要点：
+ * ① `prompt` 的 control schema 只认 `mode: 'continuable'`（一次性子代理给不了消息）；
+ * ② 投递要求**父会话是活的**（`agents.get(parentSessionId)`），否则 `parent-unavailable`。
+ */
+const subagentsSvc = {
+  prompt: (request) => {
+    if (request.mode !== 'continuable') {
+      throw new Error('invalid payload for subagent.prompt')
+    }
+    if (request.delivery !== 'queue' && request.delivery !== 'steer') {
+      throw new Error('invalid payload for subagent.prompt')
+    }
+    if (request.parentSessionId !== SUBAGENT_PARENT) {
+      throw new Error('subagent/parent-unavailable: parent session is not live')
+    }
+    delivered.push({ kind: 'prompt', child: request.childSessionId, text: (request.content[0] || {}).text || '' })
+    return Promise.resolve({ messageId: 'msg-' + delivered.length })
+  },
+  interruptByParent: (childSessionId, parentSessionId, mode) => {
+    if (mode !== 'continuable') throw new Error('invalid payload for subagent.interrupt')
+    if (parentSessionId !== SUBAGENT_PARENT) throw new Error('subagent does not belong to this parent')
+    delivered.push({ kind: 'interrupt', child: childSessionId })
+    return { accepted: true }
+  },
+}
 function validateAddress(address) {
   const target = String(address.kind === 'session' ? address.sessionId : address.childSessionId)
   const meta = target === SUBAGENT
@@ -95,10 +124,46 @@ const sessionController = {
           cwd: '/tmp',
           origin: 'subagent',
           parentSessionId: SUBAGENT_PARENT,
-          projections: { values: { modelSelection: { lastUsed: { provider: 'p', model: 'm' } } } },
+          projections: {
+            values: {
+              modelSelection: { lastUsed: { provider: 'p', model: 'm' } },
+              subagent: { mode: 'continuable', label: '可续谈的子代理', seq: 1 },
+            },
+          },
+        },
+        {
+          sessionId: SUBAGENT_ONESHOT,
+          updatedAt: Date.now(),
+          running: false,
+          blank: false,
+          cwd: '/tmp',
+          origin: 'subagent',
+          parentSessionId: SUBAGENT_PARENT,
+          projections: {
+            values: {
+              modelSelection: { lastUsed: { provider: 'p', model: 'm' } },
+              subagent: { mode: 'one-shot', seq: 2 },
+            },
+          },
         },
       ]),
     }),
+
+  // ★ 照抄宿主：用 sessionId 给子代理发消息会被明确拒绝（"use subagent delivery"）
+  prompt: (request) => {
+    const target = String(request.sessionId || '')
+    if (target === SUBAGENT || target === SUBAGENT_ONESHOT) {
+      return Promise.reject(new Error('session "' + target + '" is a subagent session; use subagent delivery'))
+    }
+    return Promise.resolve({ accepted: true })
+  },
+  cancel: (request) => {
+    const target = String(request.sessionId || '')
+    if (target === SUBAGENT || target === SUBAGENT_ONESHOT) {
+      return Promise.reject(new Error('session "' + target + '" is owned by subagent routing'))
+    }
+    return { accepted: true }
+  },
 
   // 历史/实时流：两个入口都要过地址校验（宿主的校验在 page/follow 之前）
   follow: (request) => {
@@ -222,6 +287,8 @@ const ctx = {
     if (name === 'sessionController') return sessionController
     if (name === 'workspaceRegistry') return workspaceRegistry
     if (name === 'jobs') return jobsSvc
+    if (name === 'subagents') return subagentsSvc
+    if (name === 'agents') return { get: (id) => (id === SUBAGENT_PARENT ? { id: id } : undefined) }
     // 真定时器：心跳那条规则要靠它跑（空实现会让心跳永远不触发）
     if (name === 'timer') {
       return {
@@ -405,6 +472,46 @@ check('全程零越界请求', violations.length === 0, JSON.stringify(violation
   // 对照：普通会话照样能读（别把所有人都改坏）
   const ok = await fetch(`${base}/sessions/${SID_FOR_JOBS}/history?max=20`, { headers: H })
   check('普通会话的历史照常能读', ok.status === 200, 'HTTP ' + ok.status)
+}
+
+/* ------------------------------------------------------------------ *
+ * 6d. 给子代理发消息（用户报的"在子代理里发不出消息"）
+ * ------------------------------------------------------------------ */
+{
+  const post = (path, body) =>
+    fetch(`${base}${path}`, {
+      method: 'POST',
+      headers: { ...H, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+
+  // 可续谈的子代理：必须走 subagents.prompt（会话路由会被宿主拒）
+  const r1 = await post(`/sessions/${SUBAGENT}/prompt`, { text: '继续干活' })
+  const b1 = await r1.json()
+  check('★ 能给可续谈的子代理发消息', r1.status === 200 && b1.accepted === true,
+    'HTTP ' + r1.status + ' ' + JSON.stringify(b1).slice(0, 100))
+  const p1 = delivered.find((x) => x.kind === 'prompt' && x.child === SUBAGENT)
+  check('★ 走的是 subagents.prompt，且带 mode/delivery', !!p1 && p1.text === '继续干活',
+    JSON.stringify(p1 || null))
+
+  // 一次性子代理：宿主 schema 只认 continuable，得给一句人话
+  const r2 = await post(`/sessions/${SUBAGENT_ONESHOT}/prompt`, { text: '喂' })
+  const b2 = await r2.json()
+  check('★ 一次性子代理给明确提示（不是把宿主原话抛出来）',
+    r2.status !== 200 && String(b2.error || '').indexOf('一次性') >= 0,
+    'HTTP ' + r2.status + ' ' + JSON.stringify(b2).slice(0, 100))
+
+  // 普通会话照旧（别把所有人都改坏）
+  const r3 = await post(`/sessions/${SID_FOR_JOBS}/prompt`, { text: '普通会话' })
+  const b3 = await r3.json()
+  check('普通会话的发消息照常', r3.status === 200 && b3.accepted === true,
+    'HTTP ' + r3.status + ' ' + JSON.stringify(b3).slice(0, 100))
+
+  // 停止子代理
+  const r4 = await post(`/sessions/${SUBAGENT}/cancel`, {})
+  check('★ 能停止子代理（interruptByParent）',
+    r4.status === 200 && delivered.some((x) => x.kind === 'interrupt' && x.child === SUBAGENT),
+    'HTTP ' + r4.status)
 }
 
 /* ------------------------------------------------------------------ *
