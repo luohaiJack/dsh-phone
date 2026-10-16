@@ -7,6 +7,28 @@
 
 ---
 
+## v0.3.25 —— 2026-10-16
+
+### 改：桥接改成"改完不用重启 dsh web"（带版本号的动态 import）
+- 起因：今天为桥接改动重启了四五次，每次都要用户手动来，而重启会打断他正在跑的会话。
+- 机制：Node 的模块缓存按**完整 URL**（含 query）索引，所以把文件 mtime+size
+  拼进 query 后，重新挂载就拿新实例，老实例由 disposer 正常卸载。
+  这条假设用真文件真 import 钉在 `tests/bridge/reload-harness.mjs` 里。
+- 结构分三层：`lib/entry.js`（薄壳，**永不再改**）→ `lib/mount.js`（挂载层）→
+  `bridge-core.js`（实现）。入口只负责"拼 query 动态 import mount.js"。
+- **两次实测的教训**（都写进 §61）：① 入口模块自己被缓存 → 改完入口，
+  开关一次插件拿到的**还是旧入口**（报的仍是 `version 6`）；
+  ② 连"换新文件名 + 改 package.json 的 main 指过去"都不行 ——
+  宿主对"包 → 入口"的解析结果同样被缓存。所以**安装机制要重启一次**，
+  之后 `mount.js`/`bridge-core.js` 的改动只需开关插件。
+- 生命周期：同步登记 effect、把 import 放进 effect 内、disposer 同步返回并带
+  cancelled 标志；`mount.js` 里不许再出现 `ctx.effect`（effect 主人只有一个）。
+- `bridge-core.js` 的 `VERSION` 升到 7 —— 它就是"这次改动生效了吗"的自检位。
+
+验证：新增第 9 组离线验收（12 项，含"同一 URL 命中缓存"与"换 query 拿新代码"
+这条关键假设、三层结构与入口无业务代码、effect 单一主人）；
+合计 **9 组 358 项**全过。
+
 ## v0.3.24 —— 2026-10-16
 
 ### 修：在子代理会话里发不出消息

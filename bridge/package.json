@@ -4,9 +4,9 @@
   "private": true,
   "description": "把本地 DSH harness 的状态与对话以简单 HTTP + SSE 暴露给手机 App（小米澎湃OS 客户端）",
   "type": "module",
-  "main": "lib/index.js",
+  "main": "lib/entry.js",
   "exports": {
-    ".": "./lib/index.js"
+    ".": "./lib/entry.js"
   },
   "dsh": {
     "bundle": {

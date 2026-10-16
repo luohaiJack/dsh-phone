@@ -19,7 +19,7 @@ export function createBridge(ctx, opts) {
   const TOKEN = typeof cfg.token === 'string' ? cfg.token : ''
   const BASE = typeof cfg.base === 'string' && cfg.base ? cfg.base : '/phone'
   const NAME = 'dsh-phone-bridge'
-  const VERSION = 6
+  const VERSION = 7
 
   const webServer = ctx.get('webServer')
   if (webServer === undefined) {
