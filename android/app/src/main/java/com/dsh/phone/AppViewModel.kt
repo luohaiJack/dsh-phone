@@ -1018,13 +1018,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     val next = _attachments.value + added
                     _attachments.value = next
                     persistAttachments(sessionId, next)
+                    // ★ 报之前先确认"它们还在、会话还开着"。
+                    //   读多个文件要几秒（SAF 逐个读 + 落盘），这段时间里用户完全可能
+                    //   已经退回上一级、甚至把它们删掉了 —— 那时再弹一句"已加入待发…
+                    //   传给电脑"，看起来就像"我删了却又上传了"（用户 2026-10-16 报的）。
+                    val stillHere = _openSessionId.value == sessionId &&
+                        added.all { a -> next.any { it.path == a.path } }
+                    if (!stillHere) return@onSuccess
                     val total = added.sumOf { it.bytes }
                     val sizeText = PendingAttachment(path = "", name = "", bytes = total).sizeText
                     say(
                         if (added.size == 1) {
-                            "已加入待发：${shortFileName(added[0].name, 24)}（${added[0].sizeText}）—— 点发送时才传给电脑"
+                            "已加入待发：${shortFileName(added[0].name, 24)}（${added[0].sizeText}）—— 还没传到电脑，点发送才传"
                         } else {
-                            "已加入 ${added.size} 个待发附件（共 $sizeText）—— 点发送时才传给电脑"
+                            "已加入 ${added.size} 个待发附件（共 $sizeText）—— 还没传到电脑，点发送才传"
                         },
                     )
                 }

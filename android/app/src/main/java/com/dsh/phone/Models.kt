@@ -1111,7 +1111,12 @@ fun parseQueueEditDraft(raw: String?): Pair<String, String>? {
     return id to raw.substring(i + 1)
 }
 
-/** 手机已传到电脑、等着跟下一条消息一起发出去的文件。 */
+/**
+ * 选中了、还没发出去的文件。
+ *
+ * ★ 它**还在手机上**（App 私有缓存里），点发送的那一刻才传给电脑 ——
+ * 所以选了又删不会在电脑上留下任何孤儿文件。
+ */
 data class PendingAttachment(
     /** 手机本地缓存里的路径（选中那一刻写进去的）。 */
     val path: String,
