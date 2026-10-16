@@ -11,8 +11,11 @@ android {
         applicationId = "com.dsh.phone"
         minSdk = 26
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0"
+        // versionCode 每次发版 +1：**用浏览器/文件管理器装 APK 时，
+        // 系统要求新包的 versionCode 不低于已装的**，否则会报
+        // 应用未安装/包无效。adb install -r 比较宽容，但用户自己点安装时不行。
+        versionCode = 2
+        versionName = "1.1"
         resourceConfigurations += listOf("zh", "en")
     }
 
