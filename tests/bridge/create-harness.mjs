@@ -47,6 +47,33 @@ const cloneWorkspace = (w) => ({
   sessionIds: w.sessionIds.slice(),
 })
 
+/**
+ * 子代理会话的地址契约（照抄 `dsh-api-session-controller` 的 `validateAddress`）：
+ * 用 `kind:'session'` 的地址去读一个 origin==='subagent' 的会话 → 直接报错
+ * "subagent Sessions require their durable parent address"。
+ * 正确地址是 `{kind:'subagent', parentSessionId, childSessionId, mode}`。
+ */
+const SUBAGENT = 'subagent-child-1'
+const SUBAGENT_PARENT = 'subagent-parent-1'
+function validateAddress(address) {
+  const target = String(address.kind === 'session' ? address.sessionId : address.childSessionId)
+  const meta = target === SUBAGENT
+    ? { origin: 'subagent', parent: SUBAGENT_PARENT }
+    : { origin: 'ui', parent: null }
+  if (address.kind === 'session') {
+    if (meta.origin === 'subagent') throw new Error('subagent Sessions require their durable parent address')
+    return
+  }
+  if (meta.origin !== 'subagent' || meta.parent !== address.parentSessionId) {
+    throw new Error('subagent does not belong to the supplied parent')
+  }
+}
+
+/** 一条最小可解析的用户消息（给历史快照用）。 */
+const snapshotRecords = [
+  { type: 'event', event: { type: 'user/message', seq: 1, time: 1, data: { turn: 1, step: 0, content: [{ type: 'text', text: '子代理会话的历史' }] } } },
+]
+
 const sessionController = {
   // 必须把已建的会话列出来：桥接要**按会话逐个**问后台任务
   // （宿主 list(caller) 空参只返回无主任务 —— 见 projectJobs 的注释）
@@ -59,8 +86,49 @@ const sessionController = {
         blank: false,
         cwd: x.cwd,
         projections: { values: { modelSelection: { lastUsed: { provider: 'p', model: 'm' } } } },
-      })),
+      })).concat([
+        {
+          sessionId: SUBAGENT,
+          updatedAt: Date.now(),
+          running: false,
+          blank: false,
+          cwd: '/tmp',
+          origin: 'subagent',
+          parentSessionId: SUBAGENT_PARENT,
+          projections: { values: { modelSelection: { lastUsed: { provider: 'p', model: 'm' } } } },
+        },
+      ]),
     }),
+
+  // 历史/实时流：两个入口都要过地址校验（宿主的校验在 page/follow 之前）
+  follow: (request) => {
+    validateAddress(request.address)
+    return {
+      [Symbol.asyncIterator]() {
+        let sent = false
+        return {
+          next: () => {
+            if (sent) return new Promise(() => {})
+            sent = true
+            return Promise.resolve({
+              done: false,
+              value: {
+                type: 'snapshot',
+                cursor: 1,
+                hasMore: false,
+                header: { id: String(request.address.kind === 'session' ? request.address.sessionId : request.address.childSessionId), cwd: '/tmp' },
+                records: snapshotRecords,
+              },
+            })
+          },
+        }
+      },
+    }
+  },
+  page: (request) => {
+    validateAddress(request.address)
+    return Promise.resolve({ records: [], hasMore: false })
+  },
   /**
    * 逐字照抄宿主的契约（见文件头引的那几行）。
    * 顺序很重要：先查"两个都给"，再解析 cwd，再 attach。
@@ -321,6 +389,22 @@ check('全程零越界请求', violations.length === 0, JSON.stringify(violation
   check('★ 会话自己的 jobs 里有它', !!sess && (sess.jobs || []).some((j) => j.id === 'job-owned'),
     JSON.stringify((sess && sess.jobs) || []))
   check('会话的 jobs 不夹带别人的', !!sess && !(sess.jobs || []).some((j) => j.id === 'job-other'))
+}
+
+/* ------------------------------------------------------------------ *
+ * 6c. 子代理会话的历史：地址必须换成 subagent 那种（用户报的 500）
+ * ------------------------------------------------------------------ */
+{
+  const r = await fetch(`${base}/sessions/${SUBAGENT}/history?max=20`, { headers: H })
+  const body = await r.json()
+  check('★ 子代理会话的历史能读（不是 500）', r.status === 200 && body.ok === true,
+    'HTTP ' + r.status + ' ' + JSON.stringify(body).slice(0, 120))
+  check('历史里确实有消息', Array.isArray(body.messages) && body.messages.length > 0,
+    JSON.stringify((body.messages || []).length))
+
+  // 对照：普通会话照样能读（别把所有人都改坏）
+  const ok = await fetch(`${base}/sessions/${SID_FOR_JOBS}/history?max=20`, { headers: H })
+  check('普通会话的历史照常能读', ok.status === 200, 'HTTP ' + ok.status)
 }
 
 /* ------------------------------------------------------------------ *

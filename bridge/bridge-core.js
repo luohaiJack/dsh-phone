@@ -471,6 +471,12 @@ export function createBridge(ctx, opts) {
               })
             }
           }
+          // 记下 origin/parent：读子代理会话的历史要换成 subagent 地址（见 addressFor）
+          rememberSessionMeta(
+            id,
+            typeof it.origin === 'string' ? it.origin : null,
+            it.parentSessionId !== undefined && it.parentSessionId !== null ? String(it.parentSessionId) : null,
+          )
           const summaryModel = projectionModel(it)
           if (summaryModel) sessionModelCache[id] = summaryModel
           const summaryPressure = projectionPressure(it)
@@ -674,9 +680,74 @@ export function createBridge(ctx, opts) {
    * 所以要"比 seq=X 更早的消息"，得传 throughSeq = X-1。
    * 这段语义是读宿主源码确认的，不是猜的。
    */
+  /**
+   * 会话的 origin / parent（用于判断"是不是子代理会话"）。
+   *
+   * 宿主对**子代理会话**有硬校验：拿 `{kind:'session'}` 的地址去读它，
+   * 会被拒（`subagent Sessions require their durable parent address`）——
+   * 用户在手机上点开一个子代理，历史就 500（2026-10-16 报的）。
+   * 正确的地址是 `{kind:'subagent', parentSessionId, childSessionId, mode}`。
+   */
+  const sessionMeta = {}
+
+  function rememberSessionMeta(id, origin, parent) {
+    if (!id) return
+    sessionMeta[String(id)] = {
+      origin: typeof origin === 'string' ? origin : null,
+      parent: typeof parent === 'string' && parent ? parent : null,
+    }
+  }
+
+  function addressFor(sessionId, meta) {
+    if (meta && meta.origin === 'subagent' && meta.parent) {
+      // mode: 'unknown' 是宿主允许的写法（它只在 address.mode !== 'unknown' 时才比对）
+      return {
+        kind: 'subagent',
+        parentSessionId: meta.parent,
+        childSessionId: sessionId,
+        mode: 'unknown',
+      }
+    }
+    return { kind: 'session', sessionId: sessionId }
+  }
+
+  /** 解析出这个会话该用哪种地址；缓存里没有就问一次 sc.list()。 */
+  function resolveAddress(sessionId) {
+    const cached = sessionMeta[sessionId]
+    if (cached) return Promise.resolve(addressFor(sessionId, cached))
+    if (sc === undefined || typeof sc.list !== 'function') {
+      return Promise.resolve(addressFor(sessionId, null))
+    }
+    return sc.list({}, makeSignal()).then(
+      function (value) {
+        const items = (value && value.items) || []
+        for (let i = 0; i < items.length; i += 1) {
+          const it = items[i]
+          if (it && String(it.sessionId) === String(sessionId)) {
+            rememberSessionMeta(
+              sessionId,
+              typeof it.origin === 'string' ? it.origin : null,
+              it.parentSessionId !== undefined && it.parentSessionId !== null ? String(it.parentSessionId) : null,
+            )
+            break
+          }
+        }
+        return addressFor(sessionId, sessionMeta[sessionId])
+      },
+      function () {
+        return addressFor(sessionId, null)
+      },
+    )
+  }
+
   function loadHistory(sessionId, maxMessages, beforeSeq) {
     const max = typeof maxMessages === 'number' && maxMessages > 0 ? maxMessages : 40
-    const address = { kind: 'session', sessionId: sessionId }
+    return resolveAddress(sessionId).then(function (address) {
+      return loadHistoryWith(address, sessionId, max, beforeSeq)
+    })
+  }
+
+  function loadHistoryWith(address, sessionId, max, beforeSeq) {
 
     if (typeof beforeSeq === 'number' && beforeSeq > 0) {
       if (sc === undefined || typeof sc.page !== 'function') {
@@ -979,7 +1050,7 @@ export function createBridge(ctx, opts) {
     const signal = makeSignal()
     return Promise.resolve()
       .then(function () {
-        const iter = sc.follow({ address: { kind: 'session', sessionId: sid }, maxMessages: 8 }, signal)
+        const iter = sc.follow({ address: addressFor(sid, sessionMeta[sid]), maxMessages: 8 }, signal)
         const it = iter[Symbol.asyncIterator] ? iter[Symbol.asyncIterator]() : iter
         return it.next().then(function (r) {
           try {
@@ -1497,11 +1568,6 @@ export function createBridge(ctx, opts) {
     // 光等增量帧会看见一段空白
     sseSend(res, 'queue', { items: queueViews(sessionId) })
     const signal = makeSignal()
-    const request = {
-      address: { kind: 'session', sessionId: sessionId },
-      maxMessages: typeof maxMessages === 'number' && maxMessages > 0 ? maxMessages : 40,
-      assistantStream: true,
-    }
     let closed = false
     // 只登记推送目标；「是否在看」由心跳决定（见上面的 WATCH_TTL_MS）
     if (!sessionStreamClients[sessionId]) sessionStreamClients[sessionId] = []
@@ -1532,8 +1598,15 @@ export function createBridge(ctx, opts) {
     req.on('error', drop)
     activeSessionId = sessionId
 
-    Promise.resolve()
-      .then(function () {
+    // ★ 地址要按"是不是子代理会话"来构造：拿 session 地址去读子代理会被宿主拒
+    //   （`subagent Sessions require their durable parent address`）。
+    resolveAddress(sessionId)
+      .then(function (address) {
+        const request = {
+          address: address,
+          maxMessages: typeof maxMessages === 'number' && maxMessages > 0 ? maxMessages : 40,
+          assistantStream: true,
+        }
         const iter = sc.follow(request, signal)
         const loop = iter[Symbol.asyncIterator]
           ? iter[Symbol.asyncIterator]()

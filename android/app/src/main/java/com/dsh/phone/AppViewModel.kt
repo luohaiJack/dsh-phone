@@ -978,7 +978,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     // 发出去了才清空（失败要留着，让用户能重发）
                     finishAttachments(sessionId)
                 }
-                .onFailure { say("发送失败：${it.message}") }
+                .onFailure { e ->
+                    val m = e.message ?: ""
+                    // 宿主的原话是 "subagent Sessions require their durable parent address" ——
+                    // 子代理会话只能看历史、不能往里发消息
+                    say(
+                        if (m.contains("durable parent address")) {
+                            "发送失败：这是子代理会话，只能看历史"
+                        } else {
+                            "发送失败：$m"
+                        },
+                    )
+                }
             _busy.value = false
         }
     }
