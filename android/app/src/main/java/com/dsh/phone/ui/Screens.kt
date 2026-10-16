@@ -1449,8 +1449,8 @@ fun ChatScreen(
                 )
             }
 
-            // 已传上去、等着跟下一条消息一起发的文件。
-            // 必须看得见：不然用户以为传丢了，会再传一遍
+            // 选中了、还没发出去的文件（**还在手机上**，点发送时才传给电脑）。
+            // 必须看得见：不然用户以为丢了，会再选一遍
             if (attachments.isNotEmpty() || uploadingName != null) {
                 FlowRow(
                     Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
@@ -1461,7 +1461,7 @@ fun ChatScreen(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp)
                             Spacer(Modifier.width(6.dp))
-                            Text("正在传 $n …", style = MaterialTheme.typography.labelMedium)
+                            Text("正在传 $n …（发送中）", style = MaterialTheme.typography.labelMedium)
                         }
                     }
                     attachments.forEach { a ->
@@ -1478,7 +1478,7 @@ fun ChatScreen(
                                 //   看起来"根本没有删除操作"（用户 2026-10-16 报的）。现在 32dp + 18dp 图标，
                                 //   并配上颜色，让人一眼看得见、点得中。
                                 IconButton(
-                                    onClick = { onRemoveAttachment(a.receiptId) },
+                                    onClick = { onRemoveAttachment(a.localId) },
                                     modifier = Modifier.size(32.dp),
                                 ) {
                                     Icon(

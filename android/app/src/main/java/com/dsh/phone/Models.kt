@@ -1095,14 +1095,52 @@ fun parseQueueEditDraft(raw: String?): Pair<String, String>? {
 
 /** 手机已传到电脑、等着跟下一条消息一起发出去的文件。 */
 data class PendingAttachment(
-    val receiptId: String,
+    /** 手机本地缓存里的路径（选中那一刻写进去的）。 */
+    val path: String,
     val name: String,
     val bytes: Int,
+    /** 传给电脑后拿到的凭据；null = 还没传（发送时才传）。 */
+    val receiptId: String? = null,
 ) {
+    /** 列表里的稳定标识（用文件名即可，路径是每份草稿独立的）。 */
+    val localId: String get() = path.substringAfterLast('/')
+
     val sizeText: String
         get() = when {
             bytes >= 1024 * 1024 -> "%.1f MB".format(bytes / 1024.0 / 1024.0)
             bytes >= 1024 -> "${bytes / 1024} KB"
             else -> "$bytes B"
         }
+}
+
+/**
+ * 待发附件列表 ↔ 存档文本。
+ *
+ * 格式：每行 `localId \t name \t bytes \t path \t receiptId`。
+ * 为什么用制表符而不是 JSON：这里的字段都是"不会有制表符"的东西
+ * （id/数字/路径），而**文件名可能什么都有** —— 所以写的时候把文件名里的
+ * 制表符与换行换成空格（它只用于显示与上传名的提示，换掉无害）。
+ *
+ * 为什么要落盘：附件属于"这条消息的草稿"。以前选中即上传，
+ * 列表却只在内存里 —— 退出 App 就丢，而电脑上文件已经躺着了（孤儿）。
+ * 现在改成"选中只落手机、发送才传"，那列表自然也得跟着草稿一起存下来。
+ */
+fun formatAttachList(list: List<PendingAttachment>): String =
+    list.joinToString("\n") { a ->
+        val clean = a.name.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+        listOf(a.localId, clean, a.bytes.toString(), a.path, a.receiptId ?: "").joinToString("\t")
+    }
+
+fun parseAttachList(text: String): List<PendingAttachment> {
+    if (text.isBlank()) return emptyList()
+    val out = ArrayList<PendingAttachment>()
+    text.split('\n').forEach { line ->
+        if (line.isBlank()) return@forEach
+        val f = line.split('\t')
+        if (f.size < 4) return@forEach
+        val bytes = f[2].toIntOrNull() ?: 0
+        val receipt = if (f.size > 4 && f[4].isNotBlank()) f[4] else null
+        out.add(PendingAttachment(path = f[3], name = f[1], bytes = bytes, receiptId = receipt))
+    }
+    return out
 }

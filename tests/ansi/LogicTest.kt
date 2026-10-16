@@ -4,6 +4,9 @@ import com.dsh.phone.mergeProgress
 import com.dsh.phone.questionToShow
 import com.dsh.phone.hasNewRepliesInHistory
 import com.dsh.phone.looksLikeError
+import com.dsh.phone.PendingAttachment
+import com.dsh.phone.formatAttachList
+import com.dsh.phone.parseAttachList
 import com.dsh.phone.appendErrorLog
 import com.dsh.phone.formatLogTime
 import com.dsh.phone.planEntryScroll
@@ -482,6 +485,36 @@ fun main() {
         // 时间戳：带日期，跨天也能分清
         val ts = formatLogTime(1792117309624L)
         check("时间戳形如 MM-dd HH:mm:ss", Regex("\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}").matches(ts), ts)
+    }
+
+    /* ---------- 待发附件：跟草稿一起落盘（选中只落手机，发送才传） ---------- */
+
+    run {
+        val a1 = PendingAttachment(path = "/data/cache/draft/1234.bin", name = "Screenshot_10-05.jpg", bytes = 516275)
+        val a2 = PendingAttachment(
+            path = "/data/cache/draft/1235.bin",
+            name = "报告 v2.pdf",
+            bytes = 2048,
+            receiptId = "sha256:abcdef",
+        )
+        val list = listOf(a1, a2)
+        val text = formatAttachList(list)
+        val back = parseAttachList(text)
+        check("往返不丢条目", back.size == 2, back.size.toString())
+        check("★ 名字里的中文与空格原样保留", back[1].name == "报告 v2.pdf", back[1].name)
+        check("★ 已拿到的凭据也存下来（重发时不用再传一遍）", back[1].receiptId == "sha256:abcdef", back[1].receiptId ?: "null")
+        check("没传过的凭据是 null", back[0].receiptId == null, back[0].receiptId.toString())
+        check("字节数保真", back[0].bytes == 516275 && back[1].bytes == 2048)
+        check("路径保真", back[0].path == a1.path)
+        check("localId 取文件名（UI 用它当稳定标识）", back[0].localId == "1234.bin", back[0].localId)
+
+        // 文件名里可能有制表符/换行 —— 不能把存档格式冲垮
+        val nasty = PendingAttachment(path = "/x/1.bin", name = "a\tb\nc", bytes = 1)
+        val round = parseAttachList(formatAttachList(listOf(nasty)))
+        check("★ 文件名里的制表符/换行被换成空格（不破坏存档格式）",
+            round.size == 1 && round[0].name == "a b c", round.firstOrNull()?.name ?: "空")
+        check("空列表 → 空文本 → 空列表", formatAttachList(emptyList()) == "" && parseAttachList("").isEmpty())
+        check("脏数据不炸", parseAttachList("乱七八糟\n只有\t两列").isEmpty())
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

@@ -1,6 +1,7 @@
 package com.dsh.phone
 
 import android.app.Application
+import java.io.File
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -770,7 +771,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         progressFallback = SessionProgress()
         publishProgress()
         _queueEditDraft.value = settings.queueEditDraft(sessionId)
-        _attachments.value = emptyList()
+        // 待发附件也属于"草稿"：切回来要还在（文件被系统清掉的就丢掉）
+        val savedAttachments = settings.attachments(sessionId).filter { File(it.path).exists() }
+        _attachments.value = savedAttachments
+        if (savedAttachments.size != settings.attachments(sessionId).size) {
+            settings.writeAttachments(sessionId, savedAttachments)
+        }
         _uploading.value = null
         _queue.value = emptyList()
         viewModelScope.launch(Dispatchers.IO) {
@@ -938,36 +944,88 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (body.isEmpty() && files.isEmpty()) return
         _busy.value = true
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { resolveClient().prompt(sessionId, body, files.map { it.receiptId }) }
+            // ★ 附件是**这一刻**才传给电脑的（选中时只落在手机上）。
+            //   好处：选了又删不会在电脑上留孤儿；待发列表能跟着草稿一起落盘。
+            //   逐个传并立刻把凭据写回列表：万一 prompt 失败要重发，已传过的不用再传一遍。
+            val ready = ArrayList<PendingAttachment>(files.size)
+            val failure = runCatching {
+                for (f in files) {
+                    if (f.receiptId != null) {
+                        ready.add(f)
+                        continue
+                    }
+                    _uploading.value = f.name
+                    val receipt = resolveClient().uploadFile(sessionId, f.name, File(f.path).readBytes())
+                    if (receipt.isEmpty()) throw IllegalStateException("${f.name}：没拿到凭据")
+                    val done = f.copy(receiptId = receipt)
+                    ready.add(done)
+                    persistAttachments(sessionId, ready + files.drop(ready.size))
+                }
+                _uploading.value = null
+                resolveClient().prompt(sessionId, body, ready.mapNotNull { it.receiptId })
+            }
+            _uploading.value = null
+            failure
                 .onSuccess {
-                    // 发出去了才清空附件（失败要留着，让用户能重发）
-                    _attachments.value = emptyList()
+                    // 发出去了才清空（失败要留着，让用户能重发）
+                    finishAttachments(sessionId)
                 }
                 .onFailure { say("发送失败：${it.message}") }
             _busy.value = false
         }
     }
 
-    /** 把一个已经读进内存的文件传给电脑。 */
+    /** 待发附件在本机的缓存目录（每个会话一个子目录）。 */
+    private fun draftDir(sessionId: String): File =
+        File(File(getApplication<Application>().cacheDir, "draft-attachments"), sessionId)
+
+    /**
+     * 把选中的文件**只放到手机本地**，加入待发列表。
+     *
+     * 不上传：用户可能马上又删掉，传上去就是电脑上的孤儿；
+     * 而且"待发"本来就属于这条消息的草稿，该跟草稿一起待在手机上。
+     */
     fun attachFile(name: String, bytes: ByteArray) {
         val sessionId = _openSessionId.value
         if (sessionId.isEmpty()) {
-            say("先打开一个会话再传文件")
+            say("先打开一个会话再加文件")
             return
         }
-        _uploading.value = name
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { resolveClient().uploadFile(sessionId, name, bytes) }
-                .onSuccess { file ->
-                    if (file.receiptId.isEmpty()) {
-                        say("上传没有拿到凭据，可能没传成功")
-                    } else {
-                        _attachments.value = _attachments.value + file
-                        say("已传到电脑：${file.name}（${file.sizeText}）—— 写字或不写都能发")
-                    }
+            runCatching {
+                val dir = draftDir(sessionId)
+                if (!dir.exists()) dir.mkdirs()
+                // 路径不带文件名：名字里可能有斜杠/奇怪字符，用时间戳当文件名，
+                // 显示名另存（上传时再把这个名字告诉电脑）
+                val file = File(dir, System.currentTimeMillis().toString() + ".bin")
+                file.writeBytes(bytes)
+                PendingAttachment(path = file.absolutePath, name = name, bytes = bytes.size)
+            }
+                .onSuccess { a ->
+                    val next = _attachments.value + a
+                    _attachments.value = next
+                    persistAttachments(sessionId, next)
+                    say("已加入待发：${a.name}（${a.sizeText}）—— 点发送时才传给电脑")
                 }
-                .onFailure { say("传文件失败：${it.message}") }
-            _uploading.value = null
+                .onFailure { say("加入附件失败：${it.message}") }
+        }
+    }
+
+    private fun persistAttachments(sessionId: String, list: List<PendingAttachment>) {
+        settings.writeAttachments(sessionId, list)
+    }
+
+    /** 发送成功：清空列表、删掉本地缓存文件、清掉存档。 */
+    private fun finishAttachments(sessionId: String) {
+        val files = _attachments.value
+        _attachments.value = emptyList()
+        settings.writeAttachments(sessionId, emptyList())
+        safeDeleteFiles(files)
+    }
+
+    private fun safeDeleteFiles(list: List<PendingAttachment>) {
+        list.forEach { a ->
+            runCatching { File(a.path).delete() }
         }
     }
 
@@ -978,11 +1036,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 而且"哪张不要"往往一开始就清楚 —— 给一个明确的出口。
      */
     fun clearAttachments() {
+        val sid = _openSessionId.value
+        val files = _attachments.value
         _attachments.value = emptyList()
+        if (sid.isNotEmpty()) settings.writeAttachments(sid, emptyList())
+        viewModelScope.launch(Dispatchers.IO) { safeDeleteFiles(files) }
     }
 
-    fun removeAttachment(receiptId: String) {
-        _attachments.value = _attachments.value.filterNot { it.receiptId == receiptId }
+    fun removeAttachment(localId: String) {
+        val sid = _openSessionId.value
+        val gone = _attachments.value.filter { it.localId == localId }
+        val next = _attachments.value.filterNot { it.localId == localId }
+        _attachments.value = next
+        if (sid.isNotEmpty()) settings.writeAttachments(sid, next)
+        // 本地缓存文件也删掉，别在 cache 里越堆越多
+        viewModelScope.launch(Dispatchers.IO) { safeDeleteFiles(gone) }
     }
 
     /** 输入变化：更新内存 + 防抖落盘（每敲一个字都写盘没必要）。 */

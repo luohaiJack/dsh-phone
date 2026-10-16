@@ -59,6 +59,29 @@ class Settings(context: Context) {
      * 只存在手机上 —— 已读是每个观察者自己的状态，不该写回电脑的会话存储。
      * 换手机/重装后重新计未读，这是符合预期的。
      */
+    /* ------------------------- 待发附件（跟草稿一起落盘） ------------------------- */
+
+    /**
+     * 某个会话的待发附件。
+     *
+     * 它们**只存在手机本地缓存里**，点"发送"时才真正传给电脑 ——
+     * 所以这份记录就是"我还没发出去的东西"，必须跟着会话一起存下来。
+     */
+    fun attachments(sessionId: String): List<PendingAttachment> {
+        if (sessionId.isBlank()) return emptyList()
+        return parseAttachList(prefs.getString(ATTACH_PREFIX + sessionId, "") ?: "")
+    }
+
+    fun writeAttachments(sessionId: String, list: List<PendingAttachment>) {
+        if (sessionId.isBlank()) return
+        val key = ATTACH_PREFIX + sessionId
+        if (list.isEmpty()) {
+            prefs.edit().remove(key).apply()
+        } else {
+            prefs.edit().putString(key, formatAttachList(list)).apply()
+        }
+    }
+
     /* ------------------------- 错误记录（落盘，可事后看） ------------------------- */
 
     /**
@@ -254,5 +277,6 @@ class Settings(context: Context) {
         private const val KEY_NOTIFY = "notify"
         private const val KEY_LAST_SESSION = "lastSessionId"
         private const val KEY_ERROR_LOG = "errorLog"
+        private const val ATTACH_PREFIX = "attach_"
     }
 }

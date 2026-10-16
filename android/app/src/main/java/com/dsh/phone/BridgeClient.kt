@@ -170,16 +170,18 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
      * 走宿主的"暂存 → 凭据"两步：拿到 receiptId 之后，把它放进 prompt 的 content，
      * 电脑那边会自己把附件绑到这条消息上。
      */
-    suspend fun uploadFile(sessionId: String, name: String, bytes: ByteArray): PendingAttachment =
+    /**
+     * 把一个文件传给电脑，返回**凭据**（receiptId）。
+     *
+     * 只回凭据：附件本体由 App 自己管（先落本地缓存、发送时才传），
+     * 这里不需要再拼一个附件对象出来。
+     */
+    suspend fun uploadFile(sessionId: String, name: String, bytes: ByteArray): String =
         withContext(Dispatchers.IO) {
             val q = "?sessionId=" + URLEncoder.encode(sessionId, "UTF-8") +
                 "&name=" + URLEncoder.encode(name, "UTF-8")
             val r = postBytes("/phone/upload$q", bytes, client = uploadHttp)
-            PendingAttachment(
-                receiptId = r.optString("receiptId", ""),
-                name = r.optString("name", name),
-                bytes = r.optInt("bytes", bytes.size),
-            )
+            r.optString("receiptId", "")
         }
 
     suspend fun cancel(sessionId: String): Boolean = withContext(Dispatchers.IO) {
