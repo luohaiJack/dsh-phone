@@ -308,6 +308,33 @@ data class ChatMessage(
     val isInjected: Boolean get() = role == "user" && !source.isNullOrBlank() && source != "user"
 }
 
+/**
+ * 给消息列表算**稳定的 key**（LazyColumn 的 `key =`）。
+ *
+ * 为什么必须有它（用户 2026-10-17 报的"看思维链时突然跳到上一条"）：
+ * 没有 key 时，Compose 按**位置**复用每一项 —— 而会话里随时会有新消息插到
+ * 中间（最典型的是 harness 注入的上下文：headless+timer 那一类），
+ * 一插入，后面每一项的位置都往下挪一格：
+ *  - 你正在看的那条被"顶走"，屏幕跳回上一条的开头；
+ *  - 每个气泡自己的 remember 状态（思维链展开、参数展开）也跟着错位。
+ * 有了稳定 key，Compose 会**按 key 锚定**，插入新项不会动你正在看的位置。
+ *
+ * 用 `seq`（宿主给每条记录的事件序号，天然唯一）打底；同一 seq 出现多次时
+ * （理论上不该有，但派生消息可能重复）补一个出现序号，保证 key 不重复 ——
+ * 重复 key 会让 Compose 直接抛异常。
+ */
+fun stableMessageKeys(messages: List<ChatMessage>): List<String> {
+    val seen = HashMap<String, Int>()
+    val out = ArrayList<String>(messages.size)
+    messages.forEach { m ->
+        val base = "${m.seq}:${m.role}"
+        val n = (seen[base] ?: 0) + 1
+        seen[base] = n
+        out.add(if (n == 1) base else "$base#$n")
+    }
+    return out
+}
+
 /* ----------------------------- JSON 解析 ----------------------------- */
 
 internal fun JSONObject.optStringOrNull(key: String): String? {

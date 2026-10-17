@@ -7,6 +7,7 @@ import com.dsh.phone.looksLikeError
 import com.dsh.phone.PendingAttachment
 import com.dsh.phone.TodoItem
 import com.dsh.phone.parseTodos
+import com.dsh.phone.stableMessageKeys
 import com.dsh.phone.todoSummary
 import com.dsh.phone.shortFileName
 import com.dsh.phone.sessionWorking
@@ -559,6 +560,30 @@ fun main() {
             jobsBadgeText(listOf(job("running", label = "  "))) ?: "null")
         check("超长名字截断", jobsBadgeText(listOf(job("running", label = "x".repeat(60))))!!.length <= 30,
             jobsBadgeText(listOf(job("running", label = "x".repeat(60))))!!.length.toString())
+    }
+
+    /* ---------- 消息列表的稳定 key（"看思维链时突然跳到上一条"） ---------- */
+
+    run {
+        fun m(seq: Int, role: String, text: String = "x") = ChatMessage(seq = seq, time = 0, role = role, text = text)
+
+        val before = listOf(m(1, "user"), m(2, "assistant"), m(3, "tool"), m(4, "assistant"))
+        val beforeKeys = stableMessageKeys(before)
+        check("每条都有 key", beforeKeys.size == 4 && beforeKeys.all { it.isNotBlank() }, beforeKeys.toString())
+        check("key 互不重复", beforeKeys.size == beforeKeys.toSet().size, beforeKeys.toString())
+
+        // ★ 关键场景：注入的上下文插到**中间**，后面的 key 必须一个都不变
+        val after = listOf(m(1, "user"), m(2, "assistant"), m(9, "user"), m(3, "tool"), m(4, "assistant"))
+        val afterKeys = stableMessageKeys(after)
+        val kept = beforeKeys.filter { it != beforeKeys[1] }.all { it in afterKeys }
+        check("★ 中间插入一条后，原有消息的 key 全部保持不变（不跳位）", kept, beforeKeys.toString() + " → " + afterKeys.toString())
+        check("★ 新插入的那条有自己的 key", afterKeys[2] !in beforeKeys, afterKeys[2])
+
+        // 重复 seq（理论不该有）：不能重复 key，也不能抛异常
+        val dup = stableMessageKeys(listOf(m(5, "assistant"), m(5, "assistant")))
+        check("重复 seq 也能给出不同 key（重复 key 会让 Compose 抛异常）",
+            dup.size == 2 && dup[0] != dup[1], dup.toString())
+        check("同一角色同一 seq 的第二个带 #2 后缀", dup[1].endsWith("#2"), dup[1])
     }
 
     /* ---------- 注入的上下文（电脑上能看到，手机上原来被过滤掉了） ---------- */

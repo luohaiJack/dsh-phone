@@ -106,6 +106,7 @@ import com.dsh.phone.WorkspaceInfo
 import com.dsh.phone.WorkspaceSession
 import com.dsh.phone.contextPercent
 import com.dsh.phone.TodoItem
+import com.dsh.phone.stableMessageKeys
 import com.dsh.phone.shortFileName
 import com.dsh.phone.todoSummary
 import com.dsh.phone.jobsBadgeText
@@ -1372,6 +1373,12 @@ fun ChatScreen(
 
             // 掉线横幅：USB 通道（adb reverse）会因拔插线/系统重协商而失效，
             // 这时聊天页如果只是空白，用户无法区分"没有消息"和"没连上"。
+            // ★ 消息列表的稳定 key（见 stableMessageKeys 的注释）：
+            //   会话里随时会有新消息插到中间（harness 注入的上下文最典型），
+            //   没有 key 时 Compose 按位置复用，后面每一项整体下移一格 ——
+            //   于是"正在看的那条被顶走、跳回上一条开头"，展开状态也跟着错位。
+            val msgKeys = remember(visible) { stableMessageKeys(visible) }
+
             val warn = chatError
                 ?: if (connPhase != ConnPhase.LIVE) "未连接到 harness（检查数据线，并重跑 install-to-phone.sh 恢复 adb reverse）" else null
             if (warn != null) {
@@ -1423,11 +1430,11 @@ fun ChatScreen(
                     }
                 }
 
-                items(visible.size) { i ->
+                items(count = visible.size, key = { i -> msgKeys[i] }) { i ->
                     MessageRow(visible[i], onOpenFile)
                 }
                 if (streamText.isNotEmpty() || streamReasoning.isNotEmpty()) {
-                    item {
+                    item(key = "__stream__") {
                         StreamingRow(streamText, streamReasoning)
                     }
                 }
