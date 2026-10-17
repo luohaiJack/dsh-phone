@@ -1849,6 +1849,29 @@ private fun MessageRow(m: ChatMessage, onOpenFile: (String) -> Unit) {
                         )
                     }
                 }
+            } else if (m.isInjected) {
+                // harness 注入的上下文（技能目录、运行时提醒…）常常很长：
+                // 默认压成 3 行、次要色，点一下展开全文 —— 不然整屏都被它刷满。
+                // 电脑上这类消息也是"特殊样式"，不是普通对话气泡。
+                var expandInjected by remember(m.seq) { mutableStateOf(false) }
+                Spacer(Modifier.height(2.dp))
+                SelectionContainer {
+                    Text(
+                        m.text,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = scheme.onSurfaceVariant,
+                        maxLines = if (expandInjected) Int.MAX_VALUE else 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                if (m.text.length > 120) {
+                    Text(
+                        if (expandInjected) "收起注入 ▾" else "展开注入 ▸（${m.text.length} 字）",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = scheme.primary,
+                        modifier = Modifier.clickable { expandInjected = !expandInjected },
+                    )
+                }
             } else if (m.text.isNotBlank()) {
                 Spacer(Modifier.height(4.dp))
                 if (isToolResult) {

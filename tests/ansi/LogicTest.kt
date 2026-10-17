@@ -561,6 +561,19 @@ fun main() {
             jobsBadgeText(listOf(job("running", label = "x".repeat(60))))!!.length.toString())
     }
 
+    /* ---------- 注入的上下文（电脑上能看到，手机上原来被过滤掉了） ---------- */
+
+    run {
+        fun user(source: String?) = ChatMessage(
+            seq = 1, time = 0, role = "user", text = "x", source = source,
+        )
+        check("人说的话（source=user）不算注入", !user("user").isInjected)
+        check("★ 没有 source 的用户消息不算注入（老数据）", !user(null).isInjected)
+        check("★ 技能目录（source=skills）算注入", user("skills").isInjected)
+        check("★ 运行时提醒（source=reminder 之类）算注入", user("runtime-reminder").isInjected)
+        check("助手消息永不注入", !ChatMessage(seq = 2, time = 0, role = "assistant", text = "x").isInjected)
+    }
+
     /* ---------- 计划清单（"任务 N 进行中 · M 待处理"） ---------- */
 
     run {

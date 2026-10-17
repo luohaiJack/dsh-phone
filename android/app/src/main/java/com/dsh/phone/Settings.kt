@@ -38,9 +38,15 @@ class Settings(context: Context) {
         get() = prefs.getString(KEY_TOKEN, "") ?: ""
         set(value) = prefs.edit().putString(KEY_TOKEN, value.trim()).apply()
 
-    /** 聊天里是否显示 harness 注入的上下文消息（插件提醒、技能目录等）。 */
+    /**
+     * 聊天里是否显示 harness 注入的上下文消息（插件提醒、技能目录等）。
+     *
+     * ★ 默认**显示**（2026-10-16 用户要求）：电脑上会话里能看到"上下文注入"，
+     * 手机上看不到 —— 数据一直都在（桥接早就在消息上带 source 了），
+     * 是这里默认 false 把它们过滤掉了。想清静的话聊天页菜单里能关。
+     */
     var showInjected: Boolean
-        get() = prefs.getBoolean(KEY_SHOW_INJECTED, false)
+        get() = prefs.getBoolean(KEY_SHOW_INJECTED, true)
         set(value) = prefs.edit().putBoolean(KEY_SHOW_INJECTED, value).apply()
 
     /** 是否开启常驻通知栏状态。 */
