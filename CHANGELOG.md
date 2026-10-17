@@ -7,6 +7,30 @@
 
 ---
 
+## v0.3.29 —— 2026-10-17
+
+### 修：待答问题 / 排队消息在手机上时有时无（桥接重载后消失）
+- 用户报：会话里明明有一条"待发"的东西，手机上看不到。
+- 核事实：那个会话 `userQuestions.active` 是空的 —— 那条是**排队中的消息**
+  （agent 在跑时发出去、等这轮结束才执行的），不是 `ask_user_question`。
+- 但两样东西都没显示，因为桥接把它们都存在**内存**里：待答问题靠 hook 住
+  `userQuestions.ask`、排队消息从 `control` 事件攒 —— **热重载一次就归零**。
+  而宿主本来就有持久化投影：`userQuestions`（`{active:[{callId,questions,state}]}`）
+  与 `inbox`（`{'next-turn':[…],'next-step':[…]}`）。
+- 还有个隐藏限制：`sessionController.list()` 的会话项**不带投影**，投影只能
+  `sessionQuery.observeSession(id, {projectionMode:'all'})` 拿（电脑端也是这么拿的）。
+- 改法：新增 `extrasFromObserve()` 一次观察同时取"待答问题 + 排队消息"；
+  `buildState` 里 hook 优先、投影兜底；队列路由与实时流的 queue 事件改为
+  **以 inbox 投影为准**（内存只兜底）；回答投影来的问题用
+  "问题 id → 会话 id" 映射找活 agent 调宿主 `answer()`，`open` 状态答不了时给
+  人话提示（等待句柄在重载时已丢）。
+- 新增带令牌的诊断口 `GET /phone/debug/observe?sessionId=`（投影键名 + `userQuestions` 原文），
+  这次排查就是靠它一步定位的。
+- 验证：假宿主照抄"list 不带投影"的限制，断言两类数据都能读出且不串台；
+  **反向验证**旧桥接 5 项红；合计 9 组 **386 项**全过。
+
+> 教训：**"在内存里攒"和"读投影"是两回事** —— 桥接在内存里攒状态，热重载一次就归零；
+> 宿主投影本来就持久，直接读它既不丢也不用自己维护。
 ## v0.3.28 —— 2026-10-17
 
 ### 修：看思维链时，会话突然跳到上一条消息的最上方

@@ -136,6 +136,7 @@ scripts/enable-bridge.sh --revert    # 回滚，harness 回到原样
 | POST | `/phone/term/<id>/close` | 关掉这个终端 |
 | GET | `/phone/term/list` | 当前活着的终端（排查用） |
 | GET | `/phone/sessions/<id>/queue` | 还没轮到执行的排队消息 |
+| `GET` | `/phone/debug/observe?sessionId=<id>` | **诊断**：`sessionQuery.observeSession` 返回的投影键名 + `userQuestions` 原文 |
 | POST | `/phone/sessions/<id>/queue/<itemId>` | 改/撤/插话 `{action:'remove'\|'edit'\|'steer', text?}` |
 
 自测（桥接起来之后）：

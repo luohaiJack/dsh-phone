@@ -19,7 +19,7 @@ export function createBridge(ctx, opts) {
   const TOKEN = typeof cfg.token === 'string' ? cfg.token : ''
   const BASE = typeof cfg.base === 'string' && cfg.base ? cfg.base : '/phone'
   const NAME = 'dsh-phone-bridge'
-  const VERSION = 9
+  const VERSION = 15
 
   const webServer = ctx.get('webServer')
   if (webServer === undefined) {
@@ -33,6 +33,9 @@ export function createBridge(ctx, opts) {
   const titleSvc = ctx.get('sessionTitle')
   const jobsSvc = ctx.get('jobs')
   const goalsSvc = ctx.get('goals')
+  /** 诊断：每个会话在 list() 里带了哪些投影（键名）。★ 必须在 buildState 之前声明（TDZ） */
+  const projectionKeys = {}
+
   const agentsSvc = ctx.get('agents')
   /**
    * 子代理编排服务。
@@ -441,7 +444,6 @@ export function createBridge(ctx, opts) {
       activeSessionId: activeSessionId,
       // 手机正开着这个会话时，把它上面挂着的待答问题一起带上 ——
       // 会话流只是快通道，这条轮询才是"一定会送到"的那条（见 pendingQuestionFor）
-      question: pendingQuestionFor(watching),
       error: null,
     }
     if (sc === undefined || typeof sc.list !== 'function') {
@@ -457,6 +459,21 @@ export function createBridge(ctx, opts) {
         const items = (value && value.items) || []
         // ★ 拿到会话 id 之后再问后台任务：宿主的 list(caller) 要按 owner 逐个问
         //    （空参只会返回无主任务 —— 见 projectJobs 的注释）
+        // 被看的那个会话的投影（待答问题要从里面读，见 projectionQuestion）
+        let watchedSummary = null
+        for (let wi = 0; wi < items.length; wi += 1) {
+          const w = items[wi]
+          if (w && watching && String(w.sessionId) === String(watching)) {
+            watchedSummary = w
+            break
+          }
+        }
+        // ① hook 的快通道（带等待句柄，open 状态也能答）
+        const hooked = pendingQuestionFor(watching, watchedSummary)
+        if (hooked) {
+          questionSessionById[hooked.id] = hooked.sessionId
+          state.question = hooked
+        }
         const sessionJobs = projectJobs(
           items
             .map(function (x) {
@@ -490,6 +507,11 @@ export function createBridge(ctx, opts) {
             it.parentSessionId !== undefined && it.parentSessionId !== null ? String(it.parentSessionId) : null,
             subagentModeOf(it),
           )
+          // 诊断：list() 到底给了哪些投影（待答问题要从 userQuestions 里读）
+          safe(function () {
+            const pv = it.projections && it.projections.values
+            if (pv) projectionKeys[id] = Object.keys(pv).join(',')
+          }, undefined)
           const summaryModel = projectionModel(it)
           if (summaryModel) sessionModelCache[id] = summaryModel
           const summaryPressure = projectionPressure(it)
@@ -517,7 +539,12 @@ export function createBridge(ctx, opts) {
           })
         }
         state.totalSessions = items.length
-        return state
+        // ② 投影兜底：桥接重载后内存是空的，但宿主的 userQuestions 投影还在
+        if (state.question) return state
+        return extrasFromObserve(watching).then(function (x) {
+          state.question = x ? x.question : null
+          return state
+        })
       })
       .catch(function (err) {
         state.ok = false
@@ -1311,7 +1338,140 @@ export function createBridge(ctx, opts) {
    * 现在：只要心跳说"我在看这个会话"，下一轮状态轮询就会把问题带上，
    * 会话流只是让用户更快看到它。
    */
-  function pendingQuestionFor(sessionId) {
+  /**
+   * 从**宿主投影**里读待答问题（`userQuestions` 投影，电脑端就是看它）。
+   *
+   * ★ 为什么必须补这条：桥接原来的待答问题只存在内存里（靠 hook `uq.ask` 抓），
+   *   而**桥接一重载（热重载/重启）内存就空了** —— 已经在等回答的问题于是
+   *   "从手机上消失"（用户 2026-10-17 报的：明明有个待答问题，手机上看不到）。
+   *   投影是**持久化**的：`{active: [{callId, questions, state}], settled: [...]}`。
+   *
+   * `state` 是 `open`（agent 正卡在 ask 里等）或 `continued`（它先往下走了）。
+   */
+  function projectionQuestion(sessionId, summary) {
+    return safe(
+      function () {
+        const proj = summary && summary.projections && summary.projections.values
+        const uq = proj ? proj.userQuestions : null
+        const active = uq && Array.isArray(uq.active) ? uq.active : []
+        for (let i = 0; i < active.length; i += 1) {
+          const a = active[i]
+          if (!a || !Array.isArray(a.questions) || a.questions.length === 0) continue
+          return {
+            // 手机端拿这个 id 回答；对投影来的问题，它就是宿主的 callId
+            id: String(a.callId),
+            sessionId: sessionId,
+            questions: a.questions,
+            continued: a.state === 'continued',
+          }
+        }
+        return null
+      },
+      null,
+    )
+  }
+
+  /** 问题 id → 会话 id（回答时要用；兜底路径没有别的办法定位会话）。 */
+  const questionSessionById = {}
+
+  /**
+   * 从 `sessionQuery.observeSession(id, {projectionMode:'all'})` 读**待答问题**。
+   *
+   * ★ 为什么要绕这一下：`sessionController.list()` 返回的会话项**不带投影**
+   *   （标题、上下文占用原来都是靠别的回退算出来的，所以一直没暴露）。
+   *   而"有没有待答问题"只有 `userQuestions` 投影里有 —— 电脑端也是从投影拿的。
+   *   投影是**持久化**的，所以桥接热重载/重启之后问题依然在（用户报的就是这个）。
+   */
+  function extrasFromObserve(sessionId) {
+    const sq = ctx.get('sessionQuery')
+    if (sq === undefined || typeof sq.observeSession !== 'function') return Promise.resolve({ question: null, queue: [] })
+    if (!sessionId) return Promise.resolve({ question: null, queue: [] })
+    return Promise.resolve()
+      .then(function () {
+        return sq.observeSession(sessionId, { projectionMode: 'all' })
+      })
+      .then(function (obs) {
+        try {
+          const proj = obs && obs.projections && obs.projections.values
+          // ★ 排队消息 = agent 的 inbox 投影（next-turn / next-step）。
+          //   原来只看内存缓存，桥接一重载就丢 —— 手机上于是看不到"已发出、还没轮到"的消息。
+          const inbox = proj ? proj.inbox : null
+          const queue = []
+          if (inbox) {
+            const push = function (arr, placement) {
+              if (!Array.isArray(arr)) return
+              for (let k = 0; k < arr.length; k += 1) {
+                const m = arr[k]
+                if (!m) continue
+                queue.push({
+                  id: String(m.id || ''),
+                  placement: placement,
+                  text: clip(textFromBlocks(m.content)),
+                })
+              }
+            }
+            push(inbox['next-turn'], 'next-turn')
+            push(inbox['next-step'], 'next-step')
+          }
+          const uq = proj ? proj.userQuestions : null
+          const active = uq && Array.isArray(uq.active) ? uq.active : []
+          for (let i = 0; i < active.length; i += 1) {
+            const a = active[i]
+            if (!a || !Array.isArray(a.questions) || a.questions.length === 0) continue
+            const out = {
+              // 手机端用这个 id 回答；对投影来的问题它就是宿主的 callId
+              id: String(a.callId),
+              sessionId: sessionId,
+              questions: a.questions,
+              continued: a.state === 'continued',
+            }
+            questionSessionById[out.id] = sessionId
+            return { question: out, queue: queue }
+          }
+          return { question: null, queue: queue }
+        } finally {
+          safe(function () {
+            if (obs && typeof obs[Symbol.dispose] === 'function') obs[Symbol.dispose]()
+          }, undefined)
+        }
+      })
+      .catch(function () {
+        return { question: null, queue: [] }
+      })
+  }
+
+  /**
+   * 用宿主的 `answer()` 回答一个**投影里**的问题（桥接重载后内存里没有的那种）。
+   *
+   * 只有 `continued` 状态的能这么回答：`open` 状态是 agent 正卡在 `ask()` 里等，
+   * 那个等待句柄在桥接重载时就没了 —— 这种情况只能回电脑上答，得说人话。
+   */
+  function answerViaProjection(callId, answers) {
+    const uq = ctx.get('userQuestions')
+    if (uq === undefined || typeof uq.answer !== 'function') return Promise.resolve('unsupported')
+    const sid = questionSessionById[callId]
+    if (!sid) return Promise.resolve('gone')
+    const agent = agentsSvc && typeof agentsSvc.get === 'function' ? agentsSvc.get(sid) : undefined
+    if (agent === undefined) return Promise.resolve('offline')
+    return Promise.resolve()
+      .then(function () {
+        const ok = safe(function () {
+          return uq.answer(agent, callId, { answers: answers })
+        }, false)
+        return ok === true ? 'answered' : 'open'
+      })
+      .catch(function () {
+        return 'open'
+      })
+  }
+
+  /**
+   * 这个会话的待答问题。
+   *
+   * 先看内存里的（hook 抓到的，带手机端回答要用的等待句柄），
+   * 再退回**投影**（持久化的那份）—— 后者保证"桥接重载后问题还在"。
+   */
+  function pendingQuestionFor(sessionId, summary) {
     if (!sessionId) return null
     const ids = Object.keys(pendingQuestions)
     for (let i = 0; i < ids.length; i += 1) {
@@ -1320,7 +1480,7 @@ export function createBridge(ctx, opts) {
         return { id: e.id, sessionId: e.sessionId, questions: e.questions }
       }
     }
-    return null
+    return projectionQuestion(sessionId, summary)
   }
 
   /** 把问题推给正在看这个会话的手机。 */
@@ -1620,7 +1780,16 @@ export function createBridge(ctx, opts) {
     openSse(req, res)
     // 先补一份当前排队情况：手机上多半是"跑着的时候点进来"的，
     // 光等增量帧会看见一段空白
-    sseSend(res, 'queue', { items: queueViews(sessionId) })
+    // 连上先补一份排队情况：以 inbox 投影为准（内存缓存可能在重载后是空的）
+    extrasFromObserve(sessionId).then(
+      function (x) {
+        const items = x && Array.isArray(x.queue) && x.queue.length > 0 ? x.queue : queueViews(sessionId)
+        sseSend(res, 'queue', { items: items })
+      },
+      function () {
+        sseSend(res, 'queue', { items: queueViews(sessionId) })
+      },
+    )
     const signal = makeSignal()
     let closed = false
     // 只登记推送目标；「是否在看」由心跳决定（见上面的 WATCH_TTL_MS）
@@ -3254,6 +3423,8 @@ export function createBridge(ctx, opts) {
         },
         // 归档集大小：手机上"归档了但没消失"时先看这一项有没有变大
         archived: Object.keys(archivedSet()).length,
+        // 诊断：list() 给每个会话带了哪些投影（排查投影里有、手机上没有）
+        projectionKeys: projectionKeys,
         // 宿主事件循环忙不忙 —— 排查"页面自动重连失败"先看这里
         eventLoop: {
           tickMs: TICK_MS,
@@ -3299,7 +3470,16 @@ export function createBridge(ctx, opts) {
     // GET /phone/sessions/<id>/queue   还没轮到执行的排队消息
     // ★ 段数按剥掉 BASE 之后算：/phone/sessions/<id>/queue → 3 段
     if (seg.length === 3 && seg[0] === 'sessions' && seg[2] === 'queue' && req.method === 'GET') {
-      sendJson(res, 200, { ok: true, items: queueViews(seg[1]) })
+      // ★ 以 **inbox 投影**为准（桥接重载后内存缓存是空的），内存那份只做兜底
+      extrasFromObserve(seg[1]).then(
+        function (x) {
+          const items = x && Array.isArray(x.queue) && x.queue.length > 0 ? x.queue : queueViews(seg[1])
+          sendJson(res, 200, { ok: true, items: items })
+        },
+        function () {
+          sendJson(res, 200, { ok: true, items: queueViews(seg[1]) })
+        },
+      )
       return
     }
 
@@ -3435,21 +3615,83 @@ export function createBridge(ctx, opts) {
       return
     }
 
+    // GET /phone/debug/observe?sessionId=   **诊断**：看 observeSession 到底给了什么
+    if (seg.length === 2 && seg[0] === 'debug' && seg[1] === 'observe') {
+      const sid = String(query.sessionId || '')
+      const sq = ctx.get('sessionQuery')
+      const out = {
+        ok: true,
+        sessionId: sid,
+        hasSessionQuery: sq !== undefined,
+        hasObserve: !!(sq && typeof sq.observeSession === 'function'),
+        projectionKeys: [],
+        userQuestions: null,
+        error: null,
+      }
+      if (!out.hasObserve || !sid) {
+        sendJson(res, 200, out)
+        return
+      }
+      Promise.resolve()
+        .then(function () {
+          return sq.observeSession(sid, { projectionMode: 'all' })
+        })
+        .then(
+          function (obs) {
+            safe(function () {
+              const proj = obs && obs.projections && obs.projections.values
+              if (proj) out.projectionKeys = Object.keys(proj)
+              out.userQuestions = proj ? proj.userQuestions : null
+            }, undefined)
+            safe(function () {
+              if (obs && typeof obs[Symbol.dispose] === 'function') obs[Symbol.dispose]()
+            }, undefined)
+            sendJson(res, 200, out)
+          },
+          function (err) {
+            out.error = String((err && err.message) || err)
+            sendJson(res, 200, out)
+          },
+        )
+      return
+    }
+
     // POST /phone/answer   body: { id, answers:[{id,selected,custom?}] }
     if (seg.length === 1 && seg[0] === 'answer' && req.method === 'POST') {
       parseBody(req).then(function (body) {
-        const entry = pendingQuestions[String(body.id || '')]
-        if (!entry || entry.settled) {
-          sendJson(res, 409, { ok: false, error: '这个问题已经结束或不存在' })
-          return
-        }
+        const callId = String(body.id || '')
         const answers = normalizeAnswers(body.answers)
         if (answers.length === 0) {
           sendJson(res, 400, { ok: false, error: 'answers 为空' })
           return
         }
-        settleQuestion(entry, { answers: answers }, 'answered')
-        sendJson(res, 200, { ok: true })
+        const entry = pendingQuestions[callId]
+        if (entry && !entry.settled) {
+          settleQuestion(entry, { answers: answers }, 'answered')
+          sendJson(res, 200, { ok: true })
+          return
+        }
+        // ★ 桥接重载后内存里没有这个句柄 —— 退回**投影**：按 callId 找到会话，
+        //   再走宿主的 answer()（只有 continued 状态能这么答，见 answerViaProjection）
+        answerViaProjection(callId, answers).then(
+          function (outcome) {
+            if (outcome === 'answered') {
+              sendJson(res, 200, { ok: true })
+            } else if (outcome === 'open') {
+              sendJson(res, 409, {
+                ok: false,
+                error: '这个问题还在电脑上等回答（桥接重载过，手机端接不上），请到电脑上回答',
+              })
+            } else if (outcome === 'offline') {
+              sendJson(res, 409, { ok: false, error: '那个会话现在不在电脑上跑着，回答不了' })
+            } else {
+              sendJson(res, 409, { ok: false, error: '这个问题已经结束或不存在' })
+            }
+          },
+          function (err) {
+            sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+          },
+        )
       })
       return
     }

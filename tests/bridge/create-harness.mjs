@@ -63,6 +63,47 @@ const delivered = []
  * ① `prompt` 的 control schema 只认 `mode: 'continuable'`（一次性子代理给不了消息）；
  * ② 投递要求**父会话是活的**（`agents.get(parentSessionId)`），否则 `parent-unavailable`。
  */
+/**
+ * 假 `sessionQuery` —— **照抄真宿主**：`list()` 返回的会话项**不带投影**，
+ * 投影只能从 `observeSession(id, {projectionMode:'all'})` 拿。
+ * （桥接原来以为 list() 里有投影，所以待答问题/排队消息永远是空的。）
+ */
+const sessionQuerySvc = {
+  observeSession: (sessionId) => {
+    const projections = {
+      values: {
+        userQuestions: { active: [], settled: [] },
+        inbox: { 'next-turn': [], 'next-step': [] },
+      },
+    }
+    if (sessionId === SUBAGENT) {
+      projections.values.userQuestions = {
+        active: [
+          {
+            callId: 'call-ask-1',
+            questions: [{ id: 'q1', question: '要不要继续？', options: [{ label: '要' }, { label: '不要' }] }],
+            state: 'continued',
+          },
+        ],
+        settled: [],
+      }
+    }
+    if (sessionId === SID_FOR_JOBS) {
+      projections.values.inbox = {
+        'next-turn': [
+          { id: 'msg-queued-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '排队中的那句话' }] },
+        ],
+        'next-step': [],
+      }
+    }
+    return Promise.resolve({
+      header: { id: sessionId, cwd: '/tmp' },
+      projections: projections,
+      [Symbol.dispose]() {},
+    })
+  },
+}
+
 const subagentsSvc = {
   prompt: (request) => {
     if (request.mode !== 'continuable') {
@@ -128,6 +169,16 @@ const sessionController = {
             values: {
               modelSelection: { lastUsed: { provider: 'p', model: 'm' } },
               subagent: { mode: 'continuable', label: '可续谈的子代理', seq: 1 },
+              userQuestions: {
+                active: [
+                  {
+                    callId: 'call-ask-1',
+                    questions: [{ id: 'q1', question: '要不要继续？', options: [{ label: '要' }, { label: '不要' }] }],
+                    state: 'continued',
+                  },
+                ],
+                settled: [],
+              },
               todos: [
                 { content: '摸清现状', status: 'completed' },
                 { content: '执行流水线同步', status: 'in_progress' },
@@ -293,6 +344,7 @@ const ctx = {
     if (name === 'workspaceRegistry') return workspaceRegistry
     if (name === 'jobs') return jobsSvc
     if (name === 'subagents') return subagentsSvc
+    if (name === 'sessionQuery') return sessionQuerySvc
     if (name === 'agents') return { get: (id) => (id === SUBAGENT_PARENT ? { id: id } : undefined) }
     // 真定时器：心跳那条规则要靠它跑（空实现会让心跳永远不触发）
     if (name === 'timer') {
@@ -496,6 +548,38 @@ check('全程零越界请求', violations.length === 0, JSON.stringify(violation
   const plain = (d.sessions || []).find((x) => x.id === SID_FOR_JOBS)
   check('没写过计划的会话给 null（不占地方）', !!plain && plain.todos === null,
     JSON.stringify(plain && plain.todos))
+}
+
+/* ------------------------------------------------------------------ *
+ * 6c3. 待答问题：桥接重载后内存空了，也必须从投影里看得到
+ * ------------------------------------------------------------------ */
+{
+  const d = await (await fetch(`${base}/state?watching=${SUBAGENT}`, { headers: H })).json()
+  const q = d.question
+  check('★ 投影里的待答问题被带出来（不靠内存 hook）', !!q && q.id === 'call-ask-1',
+    JSON.stringify(q).slice(0, 140))
+  check('问题内容与选项都在', !!q && q.questions.length === 1 &&
+    q.questions[0].question === '要不要继续？' && q.questions[0].options.length === 2,
+    JSON.stringify(q && q.questions).slice(0, 140))
+  check('属于被看的那个会话', !!q && q.sessionId === SUBAGENT, q && q.sessionId)
+
+  const other = await (await fetch(`${base}/state?watching=${SID_FOR_JOBS}`, { headers: H })).json()
+  check('看别的会话时不串台', other.question === null, JSON.stringify(other.question))
+}
+
+/* ------------------------------------------------------------------ *
+ * 6c4. 排队消息：以 inbox 投影为准（桥接重载后内存缓存是空的）
+ * ------------------------------------------------------------------ */
+{
+  const r = await fetch(`${base}/sessions/${SID_FOR_JOBS}/queue`, { headers: H })
+  const body = await r.json()
+  const items = body.items || []
+  check('★ 排队消息从 inbox 投影读出来（不靠内存缓存）', items.length === 1, JSON.stringify(items))
+  check('内容与位置都对', items[0] && items[0].placement === 'next-turn' &&
+    items[0].text === '排队中的那句话', JSON.stringify(items[0]))
+
+  const empty = await (await fetch(`${base}/sessions/${SUBAGENT}/queue`, { headers: H })).json()
+  check('没有排队的会话给空数组', Array.isArray(empty.items) && empty.items.length === 0, JSON.stringify(empty.items))
 }
 
 /* ------------------------------------------------------------------ *
