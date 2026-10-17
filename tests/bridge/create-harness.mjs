@@ -575,7 +575,7 @@ check('全程零越界请求', violations.length === 0, JSON.stringify(violation
   const body = await r.json()
   const items = body.items || []
   check('★ 排队消息从 inbox 投影读出来（不靠内存缓存）', items.length === 1, JSON.stringify(items))
-  check('内容与位置都对', items[0] && items[0].placement === 'next-turn' &&
+  check('内容与位置都对（next-turn 翻译成 App 认的 queued）', items[0] && items[0].placement === 'queued' &&
     items[0].text === '排队中的那句话', JSON.stringify(items[0]))
 
   const empty = await (await fetch(`${base}/sessions/${SUBAGENT}/queue`, { headers: H })).json()

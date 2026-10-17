@@ -19,7 +19,7 @@ export function createBridge(ctx, opts) {
   const TOKEN = typeof cfg.token === 'string' ? cfg.token : ''
   const BASE = typeof cfg.base === 'string' && cfg.base ? cfg.base : '/phone'
   const NAME = 'dsh-phone-bridge'
-  const VERSION = 15
+  const VERSION = 17
 
   const webServer = ctx.get('webServer')
   if (webServer === undefined) {
@@ -1405,7 +1405,9 @@ export function createBridge(ctx, opts) {
                 if (!m) continue
                 queue.push({
                   id: String(m.id || ''),
-                  placement: placement,
+                  // ★ 宿主的投影叫 next-turn / next-step，App 的排队卡只认
+                  //   queued / steer —— 在桥接里翻译一次，省得 App 跟着改。
+                  placement: placement === 'next-step' ? 'steer' : 'queued',
                   text: clip(textFromBlocks(m.content)),
                 })
               }
@@ -3108,7 +3110,17 @@ export function createBridge(ctx, opts) {
 
   function notifyQueue(sessionId) {
     if (!sessionId) return
-    sessionStreamSend(sessionId, 'queue', { items: queueViews(sessionId) })
+    // ★ 推送给手机之前先从**投影**取（内存缓存可能在重载后是空的）——
+    //   空着推一次会把手机上已经显示出来的排队消息**抹掉**（用户报的现象）。
+    extrasFromObserve(sessionId).then(
+      function (x) {
+        const items = x && Array.isArray(x.queue) && x.queue.length > 0 ? x.queue : queueViews(sessionId)
+        sessionStreamSend(sessionId, 'queue', { items: items })
+      },
+      function () {
+        sessionStreamSend(sessionId, 'queue', { items: queueViews(sessionId) })
+      },
+    )
   }
 
   function applyControlFrame(frame) {
