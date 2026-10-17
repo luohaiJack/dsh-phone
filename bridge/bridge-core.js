@@ -19,7 +19,7 @@ export function createBridge(ctx, opts) {
   const TOKEN = typeof cfg.token === 'string' ? cfg.token : ''
   const BASE = typeof cfg.base === 'string' && cfg.base ? cfg.base : '/phone'
   const NAME = 'dsh-phone-bridge'
-  const VERSION = 8
+  const VERSION = 9
 
   const webServer = ctx.get('webServer')
   if (webServer === undefined) {
@@ -510,6 +510,8 @@ export function createBridge(ctx, opts) {
             model: projectionModel(it),
             workspaceId: it.cwd && wsByPath[String(it.cwd)] ? wsByPath[String(it.cwd)] : null,
             jobs: owned,
+            // 计划清单（"任务 1 进行中 · 8 待处理"那张卡片的数据源）
+            todos: projectionTodos(it),
             // goal 只在活会话上求值：冷会话没有 Agent，且逐个求值会拖慢状态轮询
             goal: liveSession ? projectGoal(id) : null,
           })
@@ -711,6 +713,33 @@ export function createBridge(ctx, opts) {
       // 'continuable' 才能收消息；'one-shot' 只能看历史（宿主 schema 只认这两个字面量）
       subagentMode: typeof subagentMode === 'string' && subagentMode ? subagentMode : null,
     }
+  }
+
+  /**
+   * 会话投影里的**计划清单**（宿主 `dsh-tool-todo` 的 `todos` 投影）。
+   *
+   * 电脑上聊天页那张"任务 1 进行中 · 8 待处理"的卡片就是它：
+   * `[{content, status}]`，`status` ∈ pending / in_progress / completed，
+   * 每轮开始（turn/start）会被清成 null。手机上一直看不到 ——
+   * 又是"电脑上有、手机没有"，这次是没把投影带出来。
+   */
+  function projectionTodos(summary) {
+    return safe(
+      function () {
+        const proj = summary && summary.projections && summary.projections.values
+        if (!proj) return null
+        const list = proj.todos
+        if (!Array.isArray(list)) return null
+        const out = []
+        for (let i = 0; i < list.length; i += 1) {
+          const t = list[i]
+          if (!t || typeof t.content !== 'string') continue
+          out.push({ content: t.content, status: String(t.status || 'pending') })
+        }
+        return out.length > 0 ? out : null
+      },
+      null,
+    )
   }
 
   /** 会话投影里的 subagent.mode（一次性 / 可续谈）。 */

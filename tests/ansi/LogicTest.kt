@@ -5,6 +5,9 @@ import com.dsh.phone.questionToShow
 import com.dsh.phone.hasNewRepliesInHistory
 import com.dsh.phone.looksLikeError
 import com.dsh.phone.PendingAttachment
+import com.dsh.phone.TodoItem
+import com.dsh.phone.parseTodos
+import com.dsh.phone.todoSummary
 import com.dsh.phone.shortFileName
 import com.dsh.phone.sessionWorking
 import com.dsh.phone.jobsBadgeText
@@ -556,6 +559,27 @@ fun main() {
             jobsBadgeText(listOf(job("running", label = "  "))) ?: "null")
         check("超长名字截断", jobsBadgeText(listOf(job("running", label = "x".repeat(60))))!!.length <= 30,
             jobsBadgeText(listOf(job("running", label = "x".repeat(60))))!!.length.toString())
+    }
+
+    /* ---------- 计划清单（"任务 N 进行中 · M 待处理"） ---------- */
+
+    run {
+        val todos = listOf(
+            TodoItem("摸清现状", "completed"),
+            TodoItem("执行流水线同步", "in_progress"),
+            TodoItem("落地手术方案", "pending"),
+            TodoItem("重启验收", "pending"),
+        )
+        check("in_progress 判定", todos[1].inProgress && !todos[2].inProgress)
+        check("completed 判定", todos[0].done && !todos[1].done)
+
+        check("★ 摘要照电脑上的口径写", todoSummary(todos) == "📋 任务 1 进行中 · 2 待处理 · 1 已完成",
+            todoSummary(todos) ?: "null")
+        check("没有进行中时不编造", todoSummary(listOf(TodoItem("a", "pending"), TodoItem("b", "pending")))
+            == "📋 2 项任务 · 2 待处理", todoSummary(listOf(TodoItem("a", "pending"), TodoItem("b", "pending"))) ?: "null")
+        check("全部完成时不提待处理", todoSummary(listOf(TodoItem("a", "completed"))) == "📋 1 项任务 · 1 已完成",
+            todoSummary(listOf(TodoItem("a", "completed"))) ?: "null")
+        check("空清单 → null（卡片不出现）", todoSummary(emptyList()) == null && parseTodos(null).isEmpty())
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

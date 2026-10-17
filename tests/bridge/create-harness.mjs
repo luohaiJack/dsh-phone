@@ -128,6 +128,11 @@ const sessionController = {
             values: {
               modelSelection: { lastUsed: { provider: 'p', model: 'm' } },
               subagent: { mode: 'continuable', label: '可续谈的子代理', seq: 1 },
+              todos: [
+                { content: '摸清现状', status: 'completed' },
+                { content: '执行流水线同步', status: 'in_progress' },
+                { content: '落地手术方案', status: 'pending' },
+              ],
             },
           },
         },
@@ -472,6 +477,25 @@ check('全程零越界请求', violations.length === 0, JSON.stringify(violation
   // 对照：普通会话照样能读（别把所有人都改坏）
   const ok = await fetch(`${base}/sessions/${SID_FOR_JOBS}/history?max=20`, { headers: H })
   check('普通会话的历史照常能读', ok.status === 200, 'HTTP ' + ok.status)
+}
+
+/* ------------------------------------------------------------------ *
+ * 6c2. 计划清单（todos 投影）必须带到手机上
+ * ------------------------------------------------------------------ */
+{
+  const d = await (await fetch(`${base}/state`, { headers: H })).json()
+  const sess = (d.sessions || []).find((x) => x.id === SUBAGENT)
+  const todos = (sess && sess.todos) || []
+  check('★ 计划清单被带出来（电脑上那张"任务 N 进行中"的卡片）', todos.length === 3,
+    JSON.stringify(todos))
+  check('状态原样保留（completed/in_progress/pending）',
+    todos.map((t) => t.status).join(',') === 'completed,in_progress,pending',
+    todos.map((t) => t.status).join(','))
+  check('内容也原样', (todos[1] || {}).content === '执行流水线同步', (todos[1] || {}).content)
+
+  const plain = (d.sessions || []).find((x) => x.id === SID_FOR_JOBS)
+  check('没写过计划的会话给 null（不占地方）', !!plain && plain.todos === null,
+    JSON.stringify(plain && plain.todos))
 }
 
 /* ------------------------------------------------------------------ *

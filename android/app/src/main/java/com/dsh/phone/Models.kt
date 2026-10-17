@@ -171,6 +171,8 @@ data class SessionInfo(
     val parent: String? = null,
     val live: Boolean,
     val jobs: List<JobInfo>,
+    /** 计划清单（宿主的 todos 投影）；空 = 这个会话没写过计划。 */
+    val todos: List<TodoItem> = emptyList(),
     val goal: GoalInfo?,
     val progress: SessionProgress = SessionProgress(),
     val activity: ActivityInfo = ActivityInfo.NONE,
@@ -206,6 +208,48 @@ data class HarnessState(
 
     companion object {
         val EMPTY = HarnessState(false, 0L, null, emptyList(), emptyList(), null, 0)
+    }
+}
+
+/**
+ * 计划清单里的一条（宿主 `todos` 投影的原样）。
+ *
+ * 电脑上聊天页那张「任务 1 进行中 · 8 待处理」的卡片就是它。
+ */
+data class TodoItem(val content: String, val status: String) {
+    val inProgress: Boolean get() = status == "in_progress"
+    val done: Boolean get() = status == "completed"
+}
+
+/** 解析 `state.sessions[].todos`；不认识的条目直接丢，别让一条脏数据毁掉整张卡。 */
+fun parseTodos(arr: JSONArray?): List<TodoItem> {
+    if (arr == null) return emptyList()
+    val out = ArrayList<TodoItem>()
+    for (i in 0 until arr.length()) {
+        val o = arr.optJSONObject(i) ?: continue
+        val content = o.optString("content", "").trim()
+        if (content.isEmpty()) continue
+        out.add(TodoItem(content = content, status = o.optString("status", "pending")))
+    }
+    return out
+}
+
+/**
+ * 一行摘要：「任务 1 进行中 · 8 待处理」。
+ *
+ * 手机上这块的原则是**收起时也要一眼看出还有多少事没做** ——
+ * 所以摘要只报数字，展开才看内容（和电脑上一致）。
+ */
+fun todoSummary(todos: List<TodoItem>): String? {
+    if (todos.isEmpty()) return null
+    val prog = todos.count { it.inProgress }
+    val pend = todos.count { it.status == "pending" }
+    val done = todos.count { it.done }
+    return buildString {
+        append("📋 ")
+        if (prog > 0) append("任务 $prog 进行中") else append("${todos.size} 项任务")
+        if (pend > 0) append(" · $pend 待处理")
+        if (done > 0) append(" · $done 已完成")
     }
 }
 
@@ -347,6 +391,7 @@ internal fun parseState(root: JSONObject): HarnessState {
                     parent = o.optStringOrNull("parent"),
                     live = o.optBoolean("live", false),
                     jobs = parseJobs(o.optJSONArray("jobs")),
+                    todos = parseTodos(o.optJSONArray("todos")),
                     goal = parseGoal(if (o.isNull("goal")) null else o.optJSONObject("goal")),
                     progress = parseProgress(o.optJSONObject("progress")),
                     activity = parseActivity(o.optJSONObject("activity")),

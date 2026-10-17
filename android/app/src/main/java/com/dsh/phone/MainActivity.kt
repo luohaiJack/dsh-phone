@@ -419,6 +419,8 @@ fun AppRoot(
             activity = remember(state, openId) { sessionActivity(state, openId) },
             progress = progress,
             goal = remember(state, openId) { state.sessions.firstOrNull { it.id == openId }?.goal },
+            // 计划清单：纯计算，随 state/openId 变（state 每 5 秒已经拉了）
+            todos = remember(state, openId) { state.sessions.firstOrNull { it.id == openId }?.todos ?: emptyList() },
             onClearGoal = { vm.clearGoal() },
             onOpenSession = { vm.openSession(it) },
             onEditQueued = { id, text -> vm.editQueued(id, text) },

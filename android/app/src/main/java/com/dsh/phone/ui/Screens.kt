@@ -105,7 +105,9 @@ import com.dsh.phone.ModelCatalog
 import com.dsh.phone.WorkspaceInfo
 import com.dsh.phone.WorkspaceSession
 import com.dsh.phone.contextPercent
+import com.dsh.phone.TodoItem
 import com.dsh.phone.shortFileName
+import com.dsh.phone.todoSummary
 import com.dsh.phone.jobsBadgeText
 import com.dsh.phone.formatTokens
 import com.dsh.phone.formatClock
@@ -1181,6 +1183,8 @@ fun ChatScreen(
     activity: SessionActivity,
     progress: SessionProgress,
     goal: GoalInfo?,
+    /** 计划清单（宿主的 todos 投影）。 */
+    todos: List<TodoItem>,
     onClearGoal: () -> Unit,
     onOpenSession: (String) -> Unit,
     onEditQueued: (String, String) -> Unit,
@@ -1362,6 +1366,9 @@ fun ChatScreen(
         Column(Modifier.fillMaxSize().padding(inner).imePadding()) {
             // 仪表盘：轮/步 + 目标（有才显示）+ 上下文进度
             SessionDashboard(progress = progress, goal = goal, onClearGoal = onClearGoal)
+
+            // 计划清单：收起时一行摘要，点开才列内容（电脑上那张"任务 1 进行中 · 8 待处理"）
+            TodoCard(todos = todos)
 
             // 掉线横幅：USB 通道（adb reverse）会因拔插线/系统重协商而失效，
             // 这时聊天页如果只是空白，用户无法区分"没有消息"和"没连上"。
@@ -2356,6 +2363,70 @@ fun EditQueueDialog(
 }
 
 /* ========================= 会话里的"后台在跑什么" ========================= */
+
+/**
+ * 计划清单卡片（宿主 `todos` 投影）。
+ *
+ * 为什么要有：电脑上聊天页一直挂着「任务 1 进行中 · 8 待处理」，手机上什么都没有
+ * —— 用户在手机上看不出"还剩几件事没做"（2026-10-16 报的）。
+ *
+ * 收起时只留一行摘要（数字），点一下才列出内容：这块是"背景信息"，
+ * 不该跟提问卡/排队卡抢输入框上方那点空间。
+ */
+@Composable
+fun TodoCard(todos: List<TodoItem>) {
+    val summary = todoSummary(todos) ?: return
+    var expanded by remember { mutableStateOf(false) }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+    ) {
+        Column(Modifier.fillMaxWidth().padding(10.dp)) {
+            Row(
+                Modifier.fillMaxWidth().clickable { expanded = !expanded },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    summary,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    if (expanded) "收起 ▾" else "展开 ▸",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (expanded) {
+                Spacer(Modifier.height(6.dp))
+                todos.forEach { t ->
+                    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.Top) {
+                        Text(
+                            when {
+                                t.done -> "✓"
+                                t.inProgress -> "●"
+                                else -> "○"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (t.inProgress) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            t.content,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (t.done) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
+                            textDecoration = if (t.done) TextDecoration.LineThrough else null,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
 
 /**
  * 聊天页顶上那张"在跑什么"的卡。
