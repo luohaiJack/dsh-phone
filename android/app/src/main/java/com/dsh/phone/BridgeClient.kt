@@ -293,6 +293,18 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
     }
 
     /** 回答 harness 提出的问题（ask_user_question）。 */
+    /**
+     * 把手机端自己记的错误日志推一份到电脑上（best-effort，失败就算了）。
+     *
+     * 为什么要有：数据线一断我就完全看不到手机上发生了什么，只能靠用户描述 ——
+     * 今天为此来回猜了很多轮。这条通道让"手机上出错"变成电脑上能查的东西。
+     */
+    suspend fun reportClientLog(appVersion: String, lines: List<String>) = withContext(Dispatchers.IO) {
+        if (lines.isEmpty()) return@withContext
+        val body = JSONObject().put("app", appVersion).put("lines", JSONArray(lines))
+        runCatching { post("/phone/clientlog", body) }
+    }
+
     suspend fun answer(questionId: String, answers: List<QuestionAnswer>): Boolean = withContext(Dispatchers.IO) {
         val arr = JSONArray()
         for (a in answers) {

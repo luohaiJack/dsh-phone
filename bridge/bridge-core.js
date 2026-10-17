@@ -19,7 +19,7 @@ export function createBridge(ctx, opts) {
   const TOKEN = typeof cfg.token === 'string' ? cfg.token : ''
   const BASE = typeof cfg.base === 'string' && cfg.base ? cfg.base : '/phone'
   const NAME = 'dsh-phone-bridge'
-  const VERSION = 17
+  const VERSION = 19
 
   const webServer = ctx.get('webServer')
   if (webServer === undefined) {
@@ -35,6 +35,8 @@ export function createBridge(ctx, opts) {
   const goalsSvc = ctx.get('goals')
   /** 诊断：每个会话在 list() 里带了哪些投影（键名）。★ 必须在 buildState 之前声明（TDZ） */
   const projectionKeys = {}
+  /** 手机端推上来的错误日志（最近 60 条）。 */
+  const clientLog = []
 
   const agentsSvc = ctx.get('agents')
   /**
@@ -3437,6 +3439,8 @@ export function createBridge(ctx, opts) {
         archived: Object.keys(archivedSet()).length,
         // 诊断：list() 给每个会话带了哪些投影（排查投影里有、手机上没有）
         projectionKeys: projectionKeys,
+        // 手机端自己记的错误日志（最近 60 条）—— 数据线不通时唯一的现场
+        clientLog: clientLog,
         // 宿主事件循环忙不忙 —— 排查"页面自动重连失败"先看这里
         eventLoop: {
           tickMs: TICK_MS,
@@ -3665,6 +3669,24 @@ export function createBridge(ctx, opts) {
             sendJson(res, 200, out)
           },
         )
+      return
+    }
+
+    // POST /phone/clientlog   body: { lines: ["..."], app: "1.4" }
+    //
+    // 手机端出错时把它自己记的错误日志**推上来** —— 数据线不稳、我拿不到 logcat 时，
+    // 这是唯一能"看到手机上到底报了什么"的通道（今天为这类问题浪费了太多轮）。
+    if (seg.length === 1 && seg[0] === 'clientlog' && req.method === 'POST') {
+      parseBody(req).then(function (body) {
+        const lines = Array.isArray(body.lines) ? body.lines : []
+        for (let i = 0; i < lines.length; i += 1) {
+          const t = String(lines[i] || '').trim()
+          if (!t) continue
+          clientLog.push({ at: Date.now(), app: String(body.app || ''), text: t.slice(0, 400) })
+        }
+        while (clientLog.length > 60) clientLog.shift()
+        sendJson(res, 200, { ok: true, total: clientLog.length })
+      })
       return
     }
 

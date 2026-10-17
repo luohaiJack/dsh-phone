@@ -669,7 +669,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val next = appendErrorLog(_errorLog.value, line)
         _errorLog.value = next
         settings.writeErrorLog(next)
+        // 顺手推一份到电脑上（best-effort）：数据线一断我就看不到手机上的现场了
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                resolveClient().reportClientLog(appVersionName(), listOf(line))
+            }
+        }
     }
+
+    /** 版本名（诊断日志里带上，方便对照是哪一版报的）。 */
+    private fun appVersionName(): String = runCatching {
+        val ctx = getApplication<Application>()
+        ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: ""
+    }.getOrDefault("")
 
     fun clearErrorLog() {
         _errorLog.value = emptyList()
