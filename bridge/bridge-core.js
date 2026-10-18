@@ -19,7 +19,7 @@ export function createBridge(ctx, opts) {
   const TOKEN = typeof cfg.token === 'string' ? cfg.token : ''
   const BASE = typeof cfg.base === 'string' && cfg.base ? cfg.base : '/phone'
   const NAME = 'dsh-phone-bridge'
-  const VERSION = 19
+  const VERSION = 20
 
   const webServer = ctx.get('webServer')
   if (webServer === undefined) {
@@ -3508,7 +3508,17 @@ export function createBridge(ctx, opts) {
             sendJson(res, 200, value)
           },
           function (err) {
-            sendJson(res, 400, { ok: false, error: String((err && err.message) || err) })
+            // 宿主原话 "current turn no longer accepts steering" 对用户没有意义 ——
+            // 插话只能插在"这一轮的下一个步边界"，过了点就插不进去（绕过不了）。
+            // 关键信息是：**消息还在队列里**，还能等下一轮或撤回重发。
+            const raw = String((err && err.message) || err)
+            let text = raw
+            if (raw.indexOf('no longer accepts steering') >= 0) {
+              text = '这一轮已经过了能插话的点（或已结束），消息还在队列里 —— 可以等下一轮，或撤回后重发'
+            } else if (raw.indexOf('queue-item-not-found') >= 0) {
+              text = '这条排队消息已经不在队列里了（可能已被取走）'
+            }
+            sendJson(res, 400, { ok: false, error: text })
           },
         )
       })

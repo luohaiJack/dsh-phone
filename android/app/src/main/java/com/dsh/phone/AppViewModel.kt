@@ -566,6 +566,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 全部不可达时返回第一个端点的客户端，让错误信息指向用户预期的地址，
      * 而不是一个他看不懂的备用地址。
      */
+    /**
+     * 带"换端点重试一次"的请求包装。
+     *
+     * 为什么要：adb reverse 会随数据线/系统重协商失效（clientLog 里就出现过
+     * "Failed to connect to /127.0.0.1:3080"），而 `resolveClient()` 的探测是
+     * 在**发请求之前**做的 —— 探测过了、请求还是可能撞上刚断的那一瞬间。
+     * 这时把缓存端点清掉、重新探测一次，多半就能走 tailnet 成功。
+     */
+    private suspend fun <T> withClientRetry(block: suspend (BridgeClient) -> T): T {
+        return try {
+            block(resolveClient())
+        } catch (e: Exception) {
+            val reason = (e.message ?: "").lowercase()
+            val connectionish = e is java.io.IOException ||
+                reason.contains("failed to connect") ||
+                reason.contains("connect") && reason.contains("refused") ||
+                reason.contains("timed out") ||
+                reason.contains("unexpected end of stream")
+            if (!connectionish) throw e
+            activeBase = ""          // 强制重新探测所有端点
+            _baseUrl.value = ""
+            block(resolveClient())
+        }
+    }
+
     private fun resolveClient(): BridgeClient {
         val eps = settings.endpointList()
         val token = settings.token
@@ -1665,7 +1690,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val before = current.minOfOrNull { it.seq } ?: 0
         if (before <= 0) return 0
 
-        val page = runCatching { resolveClient().history(sid, 60, beforeSeq = before) }.getOrElse { e ->
+        // 用 withClientRetry：连接类失败（adb reverse 掉了）会自动换端点重试一次
+        val page = runCatching { withClientRetry { c -> c.history(sid, 60, beforeSeq = before) } }.getOrElse { e ->
             say("读取更早消息失败：${e.message}")
             return 0
         }
