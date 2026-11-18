@@ -51,6 +51,7 @@ import com.dsh.phone.isImageFileName
 import com.dsh.phone.isTextFileName
 import com.dsh.phone.formatByteCount
 import com.dsh.phone.safeAttachmentLeafName
+import com.dsh.phone.probeRetryDelayMs
 
 /**
  * 终端两处"纯逻辑、但错了很难看出来"的地方：
@@ -650,6 +651,20 @@ fun main() {
         val doc = DocState(path = "docs/chart.png", attachment = first, localPath = "/cache/chart.png")
         check("附件页标题用原始文件名", doc.fileName == "chart.png" && doc.isImage)
         check("还没下载完不进入图片分支", !doc.copy(localPath = null).isImage)
+    }
+
+    /* ---------- Tailscale 冷启动：有界重试，不拖住回环切换 ---------- */
+
+    run {
+        val usb = "http://127.0.0.1:3080"
+        val remote = "https://dsh-home.example.ts.net:3080"
+        check("USB 回环失败立即换路", probeRetryDelayMs(usb, 1) == 0L && probeRetryDelayMs(usb, 2) == 0L)
+        check("localhost 与模拟器回环也不等待", probeRetryDelayMs("http://localhost:3080", 1) == 0L && probeRetryDelayMs("http://10.0.2.2:3080", 1) == 0L)
+        check("★ Tailscale 第一次失败后等 400ms", probeRetryDelayMs(remote, 1) == 400L)
+        check("★ 第二次失败后等 800ms", probeRetryDelayMs(remote, 2) == 800L)
+        check("第三、四轮之间再等 1600ms", probeRetryDelayMs(remote, 3) == 1600L)
+        check("第四轮结束就交回重连循环，不无限等待", probeRetryDelayMs(remote, 4) == 0L)
+        check("主机名大小写与非法地址处理", probeRetryDelayMs("http://LOCALHOST:3080", 1) == 0L && probeRetryDelayMs("not a url", 1) == 0L)
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

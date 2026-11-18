@@ -526,6 +526,9 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
             val quick = OkHttpClient.Builder()
                 .connectTimeout(timeoutMs, TimeUnit.MILLISECONDS)
                 .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                // 重试节奏由 probeWithWarmup 统一控制，不在底层再做隐藏重试。
+                .retryOnConnectionFailure(false)
                 .build()
             return try {
                 val req = Request.Builder().url(buildUrl(baseUrl, token, "/phone/health")).get().build()
@@ -535,6 +538,24 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
             }
         }
 
-
+        /**
+         * 冷启动探活：远程端点失败后短等再试，回环端点仍一次就换路。
+         * 所有调用方本来就在 IO 线程；最多四轮，不会把 App 卡在无限重试里。
+         */
+        fun probeWithWarmup(baseUrl: String, token: String): Boolean {
+            var failed = 0
+            while (true) {
+                if (probe(baseUrl, token)) return true
+                failed += 1
+                val pause = probeRetryDelayMs(baseUrl, failed)
+                if (pause <= 0L) return false
+                try {
+                    Thread.sleep(pause)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return false
+                }
+            }
+        }
     }
 }

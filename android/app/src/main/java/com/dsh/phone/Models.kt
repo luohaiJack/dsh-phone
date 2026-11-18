@@ -74,6 +74,24 @@ fun shortFileName(name: String, max: Int = 30): String {
     return name.take(head) + "…" + name.takeLast(tail)
 }
 
+/* ------------------------------ 端点冷启动探测 ------------------------------ */
+
+/**
+ * 第 [failedAttempt] 次探活失败后，要等多久再试；0 表示不再试。
+ *
+ * Tailscale 已显示"已连接"时，App 冷启动仍可能撞上 VPN 路由/握手尚未就绪。
+ * 这种失败常常是立即返回，延长一次 connectTimeout 没用，要隔一小段再试。
+ * 回环（adb reverse）不拖延：它不在就立即换远程端点。远程总共最多四轮。
+ */
+fun probeRetryDelayMs(baseUrl: String, failedAttempt: Int, maxAttempts: Int = 4): Long {
+    if (failedAttempt <= 0 || failedAttempt >= maxAttempts || maxAttempts <= 1) return 0L
+    val host = runCatching { java.net.URI(baseUrl.trim()).host?.lowercase() }.getOrNull()
+        ?.removePrefix("[")?.removeSuffix("]")
+        ?: return 0L
+    if (host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "10.0.2.2") return 0L
+    return (400L * (1L shl (failedAttempt - 1).coerceIn(0, 2))).coerceAtMost(1600L)
+}
+
 /* ------------------------------ 错误记录 ------------------------------ */
 
 /**

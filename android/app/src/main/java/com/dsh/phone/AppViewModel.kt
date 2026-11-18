@@ -565,6 +565,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 解析出一个可用的客户端。
      *
      * 先用当前端点快速探活（2.5s）——不活就按顺序试下一个。
+     * 非回环端点会做四轮有界冷启动探测，给 Tailscale 的路由/握手留一点就绪时间。
      * 全部不可达时返回第一个端点的客户端，让错误信息指向用户预期的地址，
      * 而不是一个他看不懂的备用地址。
      */
@@ -598,11 +599,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val token = settings.token
 
         val current = activeBase
-        if (current.isNotEmpty() && eps.contains(current) && BridgeClient.probe(current, token)) {
+        if (current.isNotEmpty() && eps.contains(current) && BridgeClient.probeWithWarmup(current, token)) {
             return BridgeClient(current, token)
         }
         for (ep in eps) {
-            if (BridgeClient.probe(ep, token)) {
+            if (BridgeClient.probeWithWarmup(ep, token)) {
                 if (activeBase != ep) {
                     activeBase = ep
                     _baseUrl.value = ep
@@ -2056,7 +2057,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             val report = eps.joinToString("\n") { ep ->
                 val t0 = System.currentTimeMillis()
-                if (BridgeClient.probe(ep, token)) {
+                if (BridgeClient.probeWithWarmup(ep, token)) {
                     val dt = System.currentTimeMillis() - t0
                     "✓ $ep  (${dt}ms)"
                 } else {

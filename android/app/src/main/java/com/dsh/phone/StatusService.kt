@@ -79,11 +79,11 @@ class StatusService : Service() {
         }
     }
 
-    /** 和 App 一样：按顺序挑第一个可达的端点，于是切网后通知栏也能自己恢复。 */
+    /** 和 App 一样：按顺序挑端点；远程冷启动做有界重试，切网后通知栏能自己恢复。 */
     private fun resolve(settings: Settings): BridgeClient {
         val eps = settings.endpointList()
         for (ep in eps) {
-            if (BridgeClient.probe(ep, settings.token)) return BridgeClient(ep, settings.token)
+            if (BridgeClient.probeWithWarmup(ep, settings.token)) return BridgeClient(ep, settings.token)
         }
         return BridgeClient(eps.first(), settings.token)
     }

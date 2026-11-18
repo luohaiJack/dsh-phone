@@ -263,7 +263,7 @@ harness 的工作区（`workspaceRegistry`）就是「项目文件夹」，会�
 改完东西**别只靠眼看**，仓库里带了三层验收，从便宜到贵：
 
 ```bash
-# 1) 离线（不需要 harness / 手机，10 组 417 项）
+# 1) 离线（不需要 harness / 手机，10 组 424 项）
 #    桥接接口 / 真 PTY / 排队消息 / 附件字节 / 终端屏幕模型 / Android 纯逻辑
 scripts/test-offline.sh
 
