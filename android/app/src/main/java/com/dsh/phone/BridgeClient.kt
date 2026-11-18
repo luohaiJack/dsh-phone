@@ -87,6 +87,23 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
         }
     }
 
+    /** 按需取二进制附件；复用长超时客户端，32 MB 走 tailnet 时不被 25 秒掐断。 */
+    private fun getBytes(path: String): FileBytes {
+        val req = Request.Builder().url(url(path)).get().build()
+        uploadHttp.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) {
+                val body = resp.body?.string().orEmpty()
+                throw failure(resp.code, body)
+            }
+            val body = resp.body ?: throw BridgeException("附件响应是空的", code = resp.code)
+            val declared = body.contentLength()
+            if (declared > 32 * 1024 * 1024L) throw BridgeException("附件太大，手机预览上限 32 MB")
+            val data = body.bytes()
+            if (data.size > 32 * 1024 * 1024) throw BridgeException("附件太大，手机预览上限 32 MB")
+            return FileBytes(data, resp.header("content-type") ?: "application/octet-stream")
+        }
+    }
+
     /** 直接发原始字节（传文件用）；路径里的参数由调用方拼好。 */
     private fun postBytes(
         path: String,
@@ -268,6 +285,24 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
                 truncated = r.optBoolean("truncated", false),
             )
         }
+
+    /** present 交付的电脑文件（图片、PDF 等），相对路径仍按会话 cwd 解析。 */
+    suspend fun fileBytes(path: String, sessionId: String? = null): FileBytes = withContext(Dispatchers.IO) {
+        var q = "?path=" + URLEncoder.encode(path, "UTF-8")
+        if (!sessionId.isNullOrBlank()) q += "&sessionId=" + URLEncoder.encode(sessionId, "UTF-8")
+        getBytes("/phone/file/raw$q")
+    }
+
+    /** 会话内容块里的 durable attachment；只传引用元数据，不传电脑路径。 */
+    suspend fun attachmentBytes(a: MessageAttachment, sessionId: String): FileBytes = withContext(Dispatchers.IO) {
+        fun enc(v: String) = URLEncoder.encode(v, "UTF-8")
+        var q = "?kind=${enc(a.kind)}&attachmentId=${enc(a.attachmentId)}" +
+            "&name=${enc(a.name)}&bytes=${a.bytes}"
+        if (a.kind == "image") {
+            q += "&mediaType=${enc(a.mediaType ?: "image/png")}&width=${a.width}&height=${a.height}"
+        }
+        getBytes("/phone/attachment$q")
+    }
 
     /* ------------------------------ 模型 ------------------------------ */
 
@@ -499,5 +534,7 @@ class BridgeClient(private val baseUrl: String, private val token: String) {
                 false
             }
         }
+
+
     }
 }

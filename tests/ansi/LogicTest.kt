@@ -45,6 +45,12 @@ import com.dsh.phone.lastUserIndexBefore
 import com.dsh.phone.linesText
 import com.dsh.phone.lineText
 import com.dsh.phone.renderCells
+import com.dsh.phone.MessageAttachment
+import com.dsh.phone.DocState
+import com.dsh.phone.isImageFileName
+import com.dsh.phone.isTextFileName
+import com.dsh.phone.formatByteCount
+import com.dsh.phone.safeAttachmentLeafName
 
 /**
  * 终端两处"纯逻辑、但错了很难看出来"的地方：
@@ -618,6 +624,32 @@ fun main() {
         check("全部完成时不提待处理", todoSummary(listOf(TodoItem("a", "completed"))) == "📋 1 项任务 · 1 已完成",
             todoSummary(listOf(TodoItem("a", "completed"))) ?: "null")
         check("空清单 → null（卡片不出现）", todoSummary(emptyList()) == null && parseTodos(null).isEmpty())
+    }
+
+    /* ---------- 会话附件：类型、缓存键与安全文件名 ---------- */
+
+    run {
+        check("图片扩展名不区分大小写", isImageFileName("结果.JPG") && isImageFileName("chart.webp"))
+        check("SVG 不交给 BitmapFactory（走外部打开）", !isImageFileName("vector.svg"))
+        check("Markdown / 无扩展名文本可内读", isTextFileName("README.md") && isTextFileName("Makefile"))
+        check("PDF 不当文本读", !isTextFileName("报告.pdf"))
+        check("附件大小格式", formatByteCount(512) == "512 B" && formatByteCount(2048) == "2 KB" && formatByteCount(0).isEmpty())
+
+        val traversal = safeAttachmentLeafName("../../etc/passwd")
+        check("★ 附件名不能目录穿越", traversal == "passwd", traversal)
+        val unicode = safeAttachmentLeafName("../我的 报告.pdf")
+        check("中文文件名保留、空白与路径清理", unicode == "我的_报告.pdf", unicode)
+        val long = safeAttachmentLeafName("x".repeat(100) + ".png")
+        check("缓存叶子名有字节安全的长度且留扩展名", long.length <= 48 && long.endsWith(".png"), long)
+
+        val first = MessageAttachment(kind = "image", name = "chart.png", path = "docs/chart.png", sourceSeq = 10)
+        val again = first.copy(sourceSeq = 11)
+        check("★ 同一路径再次 present 不复用旧缓存", first.stableId != again.stableId)
+        val durable = MessageAttachment(kind = "image", attachmentId = "img-1", name = "x.png", sourceSeq = 1)
+        check("durable id 才是附件库缓存身份", durable.stableId == durable.copy(sourceSeq = 2).stableId)
+        val doc = DocState(path = "docs/chart.png", attachment = first, localPath = "/cache/chart.png")
+        check("附件页标题用原始文件名", doc.fileName == "chart.png" && doc.isImage)
+        check("还没下载完不进入图片分支", !doc.copy(localPath = null).isImage)
     }
 
     println("\n==== UI 纯逻辑验收（状态文案 / 光标 / 复制 / 会话活动 / 仪表盘）：$pass 项通过，$fail 项失败 ====")

@@ -57,6 +57,8 @@ const documented = [
   ['POST', '/fs/mkdir', { parent: '/tmp', name: 'x' }],
   ['POST', '/new', {}],
   ['GET', '/file'],
+  ['GET', '/file/raw'],
+  ['GET', '/attachment'],
   ['GET', '/sessions/s1/history'],
   ['POST', '/sessions/s1/prompt', { text: 'hi' }],
   ['POST', '/sessions/s1/cancel', {}],

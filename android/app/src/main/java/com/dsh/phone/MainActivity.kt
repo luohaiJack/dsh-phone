@@ -4,6 +4,10 @@ import android.Manifest
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.webkit.MimeTypeMap
+import android.widget.Toast
+import androidx.core.content.FileProvider
+import java.io.File
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -195,6 +199,23 @@ class MainActivity : ComponentActivity() {
 
 private data class Tab(val label: String, val icon: ImageVector)
 
+/** 私有缓存通过 FileProvider 临时授权给查看器，不暴露令牌，也不申请存储权限。 */
+private fun openCachedFile(context: android.content.Context, path: String) {
+    val file = File(path)
+    val extension = MimeTypeMap.getFileExtensionFromUrl(file.name)
+    val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.lowercase())
+        ?: "application/octet-stream"
+    val uri = FileProvider.getUriForFile(context, context.packageName + ".files", file)
+    val view = Intent(Intent.ACTION_VIEW)
+        .setDataAndType(uri, mime)
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    try {
+        context.startActivity(Intent.createChooser(view, "用其他应用打开").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    } catch (e: Exception) {
+        Toast.makeText(context, "没有找到能打开这种文件的应用", Toast.LENGTH_SHORT).show()
+    }
+}
+
 @Composable
 fun AppRoot(
     vm: AppViewModel,
@@ -321,6 +342,13 @@ fun AppRoot(
             doc = doc,
             onBack = { vm.closeDocument() },
             onOpenFile = { vm.openDocument(it) },
+            onRetry = {
+                val current = doc
+                val attachment = current?.attachment
+                if (attachment != null) vm.openAttachment(attachment)
+                else current?.path?.let(vm::openDocument)
+            },
+            onOpenExternal = { openCachedFile(context, it) },
         )
         return
     }
@@ -397,6 +425,8 @@ fun AppRoot(
             onSwitchModel = { p, m, e -> vm.switchModel(p, m, e) },
             onRefreshModels = { vm.refreshModels() },
             onOpenFile = { vm.openDocument(it) },
+            onOpenAttachment = { vm.openAttachment(it) },
+            onLoadAttachmentPreview = { vm.loadAttachmentPreview(it) },
             onToggleInjected = {
                 showInjected = it
                 vm.setShowInjected(it)

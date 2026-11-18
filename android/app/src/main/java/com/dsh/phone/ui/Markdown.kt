@@ -1,5 +1,6 @@
 package com.dsh.phone.ui
 
+import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
@@ -355,11 +356,18 @@ private fun inline(source: String, linkColor: Color): AnnotatedString {
                     val end = source.indexOf(')', mid + 2)
                     if (end > mid + 2) {
                         val label = source.substring(i + 1, mid)
-                        val url = source.substring(mid + 2, end).trim()
-                        if (isWebUrl(url)) {
-                            withLink(LinkAnnotation.Url(url, link)) { append(label) }
-                        } else {
-                            append(label)
+                        val target = source.substring(mid + 2, end).trim()
+                        val path = target.removePrefix("<").removeSuffix(">").substringBefore('#')
+                        val otherScheme = Regex("^[A-Za-z][A-Za-z0-9+.-]*:").containsMatchIn(path)
+                        when {
+                            isWebUrl(target) -> withLink(LinkAnnotation.Url(target, link)) { append(label) }
+                            // harness 的 [文件](path) / ![图片](path) 不是 web URL；
+                            // 截到文档/附件页，别再只显示一个不可点的标签。
+                            path.isNotBlank() && !otherScheme -> {
+                                val uri = FILE_SCHEME + Uri.encode(path, "/")
+                                withLink(LinkAnnotation.Url(uri, fileLink)) { append(label) }
+                            }
+                            else -> append(label)
                         }
                         i = end + 1
                         continue
@@ -426,7 +434,7 @@ fun MarkdownText(
     val handler = remember(platformHandler, onOpenFile) {
         object : UriHandler {
             override fun openUri(uri: String) {
-                if (uri.startsWith(FILE_SCHEME)) onOpenFile(uri.removePrefix(FILE_SCHEME))
+                if (uri.startsWith(FILE_SCHEME)) onOpenFile(Uri.decode(uri.removePrefix(FILE_SCHEME)))
                 else platformHandler.openUri(uri)
             }
         }

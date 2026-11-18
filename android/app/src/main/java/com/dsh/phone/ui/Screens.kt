@@ -115,6 +115,7 @@ import com.dsh.phone.formatClock
 import com.dsh.phone.formatDuration
 import com.dsh.phone.relativeTime
 import com.dsh.phone.shortPath
+import com.dsh.phone.MessageAttachment
 
 /* ============================== 通用小组件 ============================== */
 
@@ -1057,6 +1058,8 @@ fun DocumentScreen(
     doc: DocState?,
     onBack: () -> Unit,
     onOpenFile: (String) -> Unit,
+    onRetry: () -> Unit = {},
+    onOpenExternal: (String) -> Unit = {},
 ) {
     val scheme = MaterialTheme.colorScheme
     val d = doc ?: DocState(path = "")
@@ -1098,7 +1101,22 @@ fun DocumentScreen(
                         style = MaterialTheme.typography.labelSmall,
                         color = scheme.onSurfaceVariant,
                     )
+                    Spacer(Modifier.height(12.dp))
+                    FilledTonalButton(onClick = onRetry) { Text("重试") }
                 }
+
+                d.isImage && d.attachment != null && d.localPath != null -> FullScreenAttachmentImage(
+                    attachment = d.attachment,
+                    localPath = d.localPath,
+                )
+
+                d.content == null && d.localPath != null -> DownloadedFilePanel(
+                    name = d.fileName,
+                    sourcePath = d.path,
+                    description = d.attachment?.description,
+                    localPath = d.localPath,
+                    onOpenExternal = onOpenExternal,
+                )
 
                 d.content != null -> Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
                     if (d.truncated) {
@@ -1126,6 +1144,12 @@ fun DocumentScreen(
                                 )
                             }
                         }
+                    }
+                    if (d.localPath != null) {
+                        FilledTonalButton(
+                            onClick = { onOpenExternal(d.localPath) },
+                            modifier = Modifier.padding(horizontal = 16.dp).padding(bottom = 16.dp),
+                        ) { Text("用其他应用打开") }
                     }
                 }
             }
@@ -1165,6 +1189,8 @@ fun ChatScreen(
     onSwitchModel: (String, String, String?) -> Unit,
     onRefreshModels: () -> Unit,
     onOpenFile: (String) -> Unit,
+    onOpenAttachment: (MessageAttachment) -> Unit,
+    onLoadAttachmentPreview: suspend (MessageAttachment) -> String,
     onToggleInjected: (Boolean) -> Unit,
     queue: List<QueuedMessage>,
     hasMoreHistory: Boolean,
@@ -1431,7 +1457,12 @@ fun ChatScreen(
                 }
 
                 items(count = visible.size, key = { i -> msgKeys[i] }) { i ->
-                    MessageRow(visible[i], onOpenFile)
+                    MessageRow(
+                        m = visible[i],
+                        onOpenFile = onOpenFile,
+                        onOpenAttachment = onOpenAttachment,
+                        onLoadAttachmentPreview = onLoadAttachmentPreview,
+                    )
                 }
                 if (streamText.isNotEmpty() || streamReasoning.isNotEmpty()) {
                     item(key = "__stream__") {
@@ -1741,7 +1772,12 @@ private fun ModelPicker(
 }
 
 @Composable
-private fun MessageRow(m: ChatMessage, onOpenFile: (String) -> Unit) {
+private fun MessageRow(
+    m: ChatMessage,
+    onOpenFile: (String) -> Unit,
+    onOpenAttachment: (MessageAttachment) -> Unit,
+    onLoadAttachmentPreview: suspend (MessageAttachment) -> String,
+) {
     val scheme = MaterialTheme.colorScheme
     val isUser = m.role == "user"
     val isTool = m.role == "tool"
@@ -1776,6 +1812,7 @@ private fun MessageRow(m: ChatMessage, onOpenFile: (String) -> Unit) {
             val tag = when {
                 isUser -> if (m.isInjected) "注入 · ${m.source}" else "你"
                 m.role == "assistant" -> "Harness"
+                m.role == "deliverable" -> "交付文件"
                 isTool -> "工具 · ${m.name ?: ""}"
                 else -> "工具结果" + (if (m.isError) " · 失败" else "")
             }
@@ -1808,6 +1845,16 @@ private fun MessageRow(m: ChatMessage, onOpenFile: (String) -> Unit) {
             }
 
             // 工具调用的摘要行：一眼能看出干了什么，细节收在"参数"里
+            if (m.attachments.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                MessageAttachmentList(
+                    attachments = m.attachments,
+                    onOpen = onOpenAttachment,
+                    loadPreview = onLoadAttachmentPreview,
+                )
+                if (m.text.isNotBlank()) Spacer(Modifier.height(6.dp))
+            }
+
             if (isTool) {
                 val title = m.title
                 if (!title.isNullOrBlank()) {

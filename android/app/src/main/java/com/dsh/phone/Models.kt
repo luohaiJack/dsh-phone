@@ -280,6 +280,52 @@ fun jobsBadgeText(jobs: List<JobInfo>): String? {
     return "⚙ ${active.size} 个后台任务"
 }
 
+/** 会话里收到的一份图片或文件。path 与 attachmentId 必居其一（present 用 path）。 */
+data class MessageAttachment(
+    val kind: String,
+    val attachmentId: String = "",
+    val name: String,
+    val bytes: Long = 0L,
+    val mediaType: String? = null,
+    val width: Int = 0,
+    val height: Int = 0,
+    val path: String? = null,
+    val description: String? = null,
+    /** present 允许同一路径再次交付新内容；序号让缓存不把新文件换成旧文件。 */
+    val sourceSeq: Int = 0,
+) {
+    val isImage: Boolean get() = kind == "image" || isImageFileName(name)
+    val isText: Boolean get() = !isImage && isTextFileName(name)
+    val stableId: String
+        get() = path?.let { "path:$sourceSeq:$it" } ?: "attachment:$attachmentId"
+    val sizeText: String get() = formatByteCount(bytes)
+}
+
+fun isImageFileName(name: String): Boolean =
+    Regex("\\.(png|jpe?g|webp|gif)$", RegexOption.IGNORE_CASE).containsMatchIn(name)
+
+fun isTextFileName(name: String): Boolean {
+    val n = name.lowercase()
+    if (n.substringAfterLast('/').substringAfterLast('\\').contains('.').not()) return true
+    return Regex("\\.(md|markdown|txt|json|yml|yaml|toml|ini|conf|kt|java|py|js|ts|tsx|sh|bash|sql|csv|log|xml|html|css|go|rs|c|h|cpp)$")
+        .containsMatchIn(n)
+}
+
+fun formatByteCount(bytes: Long): String = when {
+    bytes <= 0L -> ""
+    bytes >= 1024 * 1024 -> "%.1f MB".format(bytes / 1024.0 / 1024.0)
+    bytes >= 1024 -> "${bytes / 1024} KB"
+    else -> "$bytes B"
+}
+
+/** 下载到 App 私有缓存时使用的叶子名；绝不让附件名带目录穿越。 */
+fun safeAttachmentLeafName(name: String): String {
+    val leaf = name.substringAfterLast('/').substringAfterLast('\\')
+        .replace(Regex("[^A-Za-z0-9._()\\-\\u4e00-\\u9fff]"), "_")
+        .trim('.', ' ')
+    return (leaf.ifBlank { "attachment.bin" }).takeLast(48)
+}
+
 /** 聊天页里的一条消息。 */
 data class ChatMessage(
     val seq: Int,
@@ -303,6 +349,8 @@ data class ChatMessage(
     val interrupted: Boolean = false,
     val usageIn: Int? = null,
     val usageOut: Int? = null,
+    /** 图片 / 文件只带元数据，字节在用户查看时按需下载。 */
+    val attachments: List<MessageAttachment> = emptyList(),
 ) {
     /** harness 注入的上下文（插件、技能目录、运行时提醒）不是人说的话。 */
     val isInjected: Boolean get() = role == "user" && !source.isNullOrBlank() && source != "user"
@@ -442,6 +490,33 @@ internal fun parseState(root: JSONObject): HarnessState {
     )
 }
 
+internal fun parseMessageAttachments(arr: JSONArray?, sourceSeq: Int = 0): List<MessageAttachment> {
+    if (arr == null) return emptyList()
+    val out = ArrayList<MessageAttachment>(arr.length())
+    for (i in 0 until arr.length()) {
+        val o = arr.optJSONObject(i) ?: continue
+        val kind = o.optString("kind", "")
+        val id = o.optString("attachmentId", "")
+        val path = o.optStringOrNull("path")
+        if ((kind != "image" && kind != "file") || (id.isBlank() && path.isNullOrBlank())) continue
+        out.add(
+            MessageAttachment(
+                kind = kind,
+                attachmentId = id,
+                name = o.optString("name", "附件").ifBlank { "附件" },
+                bytes = o.optLong("bytes", 0L),
+                mediaType = o.optStringOrNull("mediaType"),
+                width = o.optInt("width", 0),
+                height = o.optInt("height", 0),
+                path = path,
+                description = o.optStringOrNull("description"),
+                sourceSeq = sourceSeq,
+            )
+        )
+    }
+    return out
+}
+
 internal fun parseMessages(arr: JSONArray?): List<ChatMessage> {
     if (arr == null) return emptyList()
     val out = ArrayList<ChatMessage>(arr.length())
@@ -473,6 +548,7 @@ internal fun parseMessages(arr: JSONArray?): List<ChatMessage> {
                 interrupted = o.optBoolean("interrupted", false),
                 usageIn = usage?.let { if (it.isNull("input")) null else it.optInt("input") },
                 usageOut = usage?.let { if (it.isNull("output")) null else it.optInt("output") },
+                attachments = parseMessageAttachments(o.optJSONArray("attachments"), o.optInt("seq", 0)),
             )
         )
     }
@@ -769,6 +845,9 @@ internal fun parseModelCatalog(root: JSONObject): ModelCatalog {
 /** 从桥接读回来的一个文本文件。 */
 data class FileText(val path: String, val text: String, val size: Int, val truncated: Boolean)
 
+/** 从桥接读回来的原始字节（图片预览 / 下载到私有缓存）。 */
+data class FileBytes(val data: ByteArray, val mediaType: String)
+
 /** 文档阅读页的状态。 */
 data class DocState(
     val path: String,
@@ -776,8 +855,14 @@ data class DocState(
     val error: String? = null,
     val loading: Boolean = false,
     val truncated: Boolean = false,
+    /** 非空表示从消息附件打开；用于重试与判断图片/文件类型。 */
+    val attachment: MessageAttachment? = null,
+    /** 已下载到 App 私有缓存的文件，可交给 FileProvider 外部打开。 */
+    val localPath: String? = null,
+    val mediaType: String? = null,
 ) {
-    val fileName: String get() = path.substringAfterLast('/').ifBlank { path }
+    val fileName: String get() = attachment?.name ?: path.substringAfterLast('/').ifBlank { path }
+    val isImage: Boolean get() = attachment?.isImage == true && localPath != null
     val isMarkdown: Boolean
         get() {
             val n = fileName.lowercase()

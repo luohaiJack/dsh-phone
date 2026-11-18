@@ -127,6 +127,8 @@ scripts/enable-bridge.sh --revert    # 回滚，harness 回到原样
 | POST | `/phone/fs/mkdir` | 在电脑上新建文件夹 `{parent,name}` |
 | POST | `/phone/sessions/<id>/prompt` | 发消息 `{text, receiptIds?}`（带附件凭据时一起发） |
 | POST | `/phone/upload?sessionId=&name=` | 手机传文件进会话（请求体就是原始字节，返回 receiptId） |
+| GET | `/phone/attachment?kind=&attachmentId=` | 按 durable 附件引用下载图片/文件字节（元数据走历史，不走 base64） |
+| GET | `/phone/file/raw?path=&sessionId=` | 下载 `present` 交付文件；相对路径按该会话 cwd 解析 |
 | POST | `/phone/sessions/<id>/cancel` | 打断当前回合 |
 | POST | `/phone/new` | 新建会话 `{cwd?}` |
 | POST | `/phone/term/open` | 在电脑上开一个真终端（真 PTY）`{cols,rows,cwd?}` |
@@ -166,6 +168,9 @@ curl -s http://127.0.0.1:3080/phone/state | python3 -m json.tool | head -40
   还有「↑ 上一条我的提问」一键跳到你上次说的话
 - **传文件到会话**：聊天页点 **＋** 从手机里选一个文件 → 传到电脑 → 跟下一条消息一起发；
   可以只发附件不写字，发出去之前还能移除。上限 64 MB
+- **看图片和交付文件**：会话图片直接显示缩略图，点开全屏查看、双指缩放、双击复位；
+  文本/Markdown 在 App 内阅读，PDF 等格式通过 `FileProvider` 交给系统应用。
+  覆盖消息附件、`read_image` 工具结果与 `present` 交付物；接收上限 32 MB
 - **通知栏**：可选常驻，关着 App 也能看到运行中的会话与任务
 - **终端页（状态页进入）**：在手机上调这台电脑的**真 PTY**，
   而且是**真正的屏幕模型**（光标寻址 / 擦除 / 滚动区域 / 备用屏），
@@ -242,6 +247,8 @@ harness 的工作区（`workspaceRegistry`）就是「项目文件夹」，会�
 - 令牌**不进仓库**：首次挂载时生成到 `bridge/.token`（`0600`，已 gitignore），
   `scripts/install-to-phone.sh` 读它并灌进 App
 - 远程只经 `tailscale serve` 发布，且是 **tailnet only**，公网不可达
+- 收到的文件只落在 App 私有缓存；外部打开只授予对应 `content://` 的临时读权限，
+  不申请存储权限，也不把访问令牌交给查看器
 - ⚠️ 终端那一页等于把电脑的 shell 交出去，**令牌的强度就是这台电脑的强度**，
   别把它贴进聊天/截图里。怀疑泄露就删掉 `bridge/.token` 重启 harness，重新灌一次手机
 
@@ -256,8 +263,8 @@ harness 的工作区（`workspaceRegistry`）就是「项目文件夹」，会�
 改完东西**别只靠眼看**，仓库里带了三层验收，从便宜到贵：
 
 ```bash
-# 1) 离线（不需要 harness / 手机，约 25 秒，67 项）
-#    桥接终端接口（真 PTY）+ 排队消息（镜像/改/撤/插话）+ 终端屏幕模型（含真机 vim 帧）
+# 1) 离线（不需要 harness / 手机，10 组 417 项）
+#    桥接接口 / 真 PTY / 排队消息 / 附件字节 / 终端屏幕模型 / Android 纯逻辑
 scripts/test-offline.sh
 
 # 2) 在线全链路（桥接挂了没、令牌对不对、tailnet 通不通、手机认不认）
@@ -289,8 +296,8 @@ fetch / setTimeout` —— 它要能同时跑在"真 Node 进程"和"受限的�
   （表现为 App 显示未连接）。重跑 `scripts/install-to-phone.sh` 恢复即可。
   App 已做了两层兜底：状态页显示往返延迟与错误原文；聊天页在掉线时显示横幅并自动重连，
   通道恢复后由 SSE 快照自动补齐历史，不用重启 App。
-- 暂不支持从手机发图片/附件
-- 不展示 diff、文件预览与工具卡片，`tool/result` 只显示截断文本
+- 接收预览上限 32 MB；SVG、PDF 等需要专用渲染器的格式交给系统应用打开
+- 不提供 diff 专用视图；工具卡片仍以摘要 / 参数 / 结果为主
 - 未做 WebView 兜底（成本很低，需要时可加）
 - 远程延迟取决于链路：家里同网实测 240ms 直连、蜂窝 IPv6 打洞 58ms、
   走 DERP 中继则 ~300ms（中继节点都在境外，最近的洛杉矶 303ms）

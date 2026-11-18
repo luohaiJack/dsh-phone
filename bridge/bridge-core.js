@@ -19,7 +19,7 @@ export function createBridge(ctx, opts) {
   const TOKEN = typeof cfg.token === 'string' ? cfg.token : ''
   const BASE = typeof cfg.base === 'string' && cfg.base ? cfg.base : '/phone'
   const NAME = 'dsh-phone-bridge'
-  const VERSION = 20
+  const VERSION = 21
 
   const webServer = ctx.get('webServer')
   if (webServer === undefined) {
@@ -559,6 +559,60 @@ export function createBridge(ctx, opts) {
    * 4. 会话历史 / 消息归一化
    * ------------------------------------------------------------------ */
 
+  /**
+   * 把结构化附件保留下来，不再只给手机一个「[图片] / [文件]」占位符。
+   *
+   * attachmentId 是宿主附件库里的 opaque id，不是文件路径；真正的字节统一走
+   * `/phone/attachment` 按 id 读取。这里绝不把 base64 塞进历史响应 —— 那会让
+   * 每一页会话都膨胀约 33%，SSE 重连时还会重复传输。
+   */
+  function attachmentView(block) {
+    if (!block || typeof block !== 'object') return null
+    const kind = block.type === 'image' || block.type === 'file' ? block.type : ''
+    const a = block.attachment
+    if (!kind || !a || typeof a !== 'object' || typeof a.attachmentId !== 'string' || !a.attachmentId) return null
+    const out = {
+      kind: kind,
+      attachmentId: a.attachmentId,
+      name: typeof a.name === 'string' && a.name ? a.name : kind === 'image' ? '图片' : '附件',
+      bytes: typeof a.bytes === 'number' && a.bytes >= 0 ? a.bytes : 0,
+    }
+    if (kind === 'image') {
+      if (typeof a.mediaType !== 'string' || a.mediaType.indexOf('image/') !== 0) return null
+      out.mediaType = a.mediaType
+      out.width = typeof a.width === 'number' ? a.width : 0
+      out.height = typeof a.height === 'number' ? a.height : 0
+    }
+    return out
+  }
+
+  /** tool-result 还可以再包一层 content，所以递归收集；顺序与原始内容块一致。 */
+  function attachmentsFromBlocks(blocks) {
+    const out = []
+    if (!blocks || typeof blocks.length !== 'number') return out
+    for (let i = 0; i < blocks.length; i += 1) {
+      const b = blocks[i]
+      if (!b || typeof b !== 'object') continue
+      const a = attachmentView(b)
+      if (a) out.push(a)
+      if (b.type === 'tool-result') {
+        const nested = attachmentsFromBlocks(b.content)
+        for (let j = 0; j < nested.length; j += 1) out.push(nested[j])
+      }
+    }
+    return out
+  }
+
+  function pathLeaf(path) {
+    const s = String(path || '').replace(/[\\/]+$/, '')
+    const i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'))
+    return i >= 0 ? s.slice(i + 1) : s
+  }
+
+  function looksLikeImageName(name) {
+    return /\.(png|jpe?g|webp|gif)$/i.test(String(name || ''))
+  }
+
   function textFromBlocks(blocks) {
     const parts = []
     if (!blocks || typeof blocks.length !== 'number') return ''
@@ -567,8 +621,11 @@ export function createBridge(ctx, opts) {
       if (!b || typeof b !== 'object') continue
       if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text)
       else if (b.type === 'reasoning' && typeof b.text === 'string') parts.push(b.text)
-      else if (b.type === 'image') parts.push('[图片]')
-      else if (b.type === 'file') parts.push('[文件]')
+      else if (b.type === 'image') {
+        if (!attachmentView(b)) parts.push('[图片]')
+      } else if (b.type === 'file') {
+        if (!attachmentView(b)) parts.push('[文件]')
+      }
       // tool-call 块由 tool/call 事件单独呈现，这里跳过以免正文里出现重复的一行
       else if (b.type === 'tool-result') parts.push(textFromBlocks(b.content))
     }
@@ -590,8 +647,11 @@ export function createBridge(ctx, opts) {
       if (!b || typeof b !== 'object') continue
       if (b.type === 'text' && typeof b.text === 'string') text.push(b.text)
       else if (b.type === 'reasoning' && typeof b.text === 'string') reasoning.push(b.text)
-      else if (b.type === 'image') text.push('[图片]')
-      else if (b.type === 'file') text.push('[文件]')
+      else if (b.type === 'image') {
+        if (!attachmentView(b)) text.push('[图片]')
+      } else if (b.type === 'file') {
+        if (!attachmentView(b)) text.push('[文件]')
+      }
       else if (b.type === 'tool-result') text.push(textFromBlocks(b.content))
     }
     return { text: text.join('\n'), reasoning: reasoning.join('\n') }
@@ -651,17 +711,27 @@ export function createBridge(ctx, opts) {
       if (ev.type === 'user/message') {
         const msg = data.message || data
         const text = textFromBlocks(msg && msg.content)
-        if (!text) continue
-        out.push({ seq: seq, time: time, role: 'user', text: clip(text), source: sourceKind(data) })
+        const attachments = attachmentsFromBlocks(msg && msg.content)
+        if (!text && attachments.length === 0) continue
+        out.push({
+          seq: seq,
+          time: time,
+          role: 'user',
+          text: clip(text),
+          source: sourceKind(data),
+          attachments: attachments,
+        })
       } else if (ev.type === 'assistant/message') {
         const msg = data.message || data
         const parts = splitAssistantBlocks(msg && msg.content)
-        if (!parts.text && !parts.reasoning) continue
+        const attachments = attachmentsFromBlocks(msg && msg.content)
+        if (!parts.text && !parts.reasoning && attachments.length === 0) continue
         const usage = data.usage
         out.push({
           seq: seq,
           time: time,
           role: 'assistant',
+          attachments: attachments,
           // turn/step 一定要带上：手机端"累计跑了多少轮"就是取历史里最大的 turn ——
           // 这比桥接自己攒的计数可靠（桥接重载、App 重开都不影响）
           turn: typeof data.turn === 'number' ? data.turn : 0,
@@ -703,7 +773,36 @@ export function createBridge(ctx, opts) {
           isError: !!(data.error || (msg && msg.isError)),
           errorName: data.error ? String(data.error.name || '') : null,
           text: clip(text, 1500),
+          attachments: attachmentsFromBlocks(msg && msg.content),
         })
+      } else if (ev.type === 'deliverables/presented') {
+        // present 工具交付的是「电脑上的路径」，不是附件库引用。两者都投影成
+        // attachments，但 path 非空时手机走 /phone/file/raw 读取。
+        const files = Array.isArray(data.files) ? data.files : []
+        const attachments = []
+        for (let j = 0; j < files.length; j += 1) {
+          const f = files[j]
+          if (!f || typeof f.path !== 'string' || !f.path.trim()) continue
+          const name = pathLeaf(f.path) || f.path
+          attachments.push({
+            kind: looksLikeImageName(name) ? 'image' : 'file',
+            attachmentId: '',
+            name: name,
+            bytes: 0,
+            path: f.path,
+            description: typeof f.description === 'string' ? f.description : null,
+          })
+        }
+        if (attachments.length > 0) {
+          out.push({
+            seq: seq,
+            time: time,
+            role: 'deliverable',
+            turn: typeof data.turn === 'number' ? data.turn : 0,
+            text: '',
+            attachments: attachments,
+          })
+        }
       }
     }
     return out
@@ -1882,7 +1981,7 @@ export function createBridge(ctx, opts) {
               safe(function () {
                 trackEvent(sessionId, ev)
               }, undefined)
-              if (ev.type === 'user/message' || ev.type === 'assistant/message' || ev.type === 'tool/call' || ev.type === 'tool/result') {
+              if (ev.type === 'user/message' || ev.type === 'assistant/message' || ev.type === 'tool/call' || ev.type === 'tool/result' || ev.type === 'deliverables/presented') {
                 sseSend(res, 'messages', { messages: deriveMessages([frame]) })
                 markStateDirty()
               } else if (ev.type === 'request/context' || ev.type === 'turn/start' || ev.type === 'step/start') {
@@ -2178,6 +2277,198 @@ export function createBridge(ctx, opts) {
 
     if (safeAbsPath(raw) !== null) return use('')
     return sessionCwd(sessionId).then(use)
+  }
+
+  /* ------------------------ 图片 / 文件二进制预览 ------------------------ */
+
+  // 手机预览终归要把字节拿在手里，所以这里和客户端都设 32 MB 硬上限。
+  // 文本仍优先走上面的 /phone/file（默认只读 512 KB，并明确标记 truncated）。
+  const PREVIEW_MAX_BYTES = 32 * 1024 * 1024
+
+  function previewFailure(message, status) {
+    const err = new Error(message)
+    err.httpStatus = status || 400
+    return err
+  }
+
+  function mimeForName(name) {
+    const n = String(name || '').toLowerCase()
+    if (/\.png$/.test(n)) return 'image/png'
+    if (/\.jpe?g$/.test(n)) return 'image/jpeg'
+    if (/\.webp$/.test(n)) return 'image/webp'
+    if (/\.gif$/.test(n)) return 'image/gif'
+    if (/\.svg$/.test(n)) return 'image/svg+xml'
+    if (/\.pdf$/.test(n)) return 'application/pdf'
+    if (/\.zip$/.test(n)) return 'application/zip'
+    if (/\.(md|markdown)$/.test(n)) return 'text/markdown; charset=utf-8'
+    if (/\.(txt|json|yml|yaml|toml|ini|conf|kt|java|py|js|ts|tsx|sh|bash|sql|csv|log|xml|html|css|go|rs|c|h|cpp)$/.test(n)) {
+      return 'text/plain; charset=utf-8'
+    }
+    return 'application/octet-stream'
+  }
+
+  function sendBytes(res, value) {
+    const data = value.data
+    const name = String(value.name || 'attachment.bin')
+    res.writeHead(
+      200,
+      corsHeaders({
+        'content-type': String(value.mediaType || mimeForName(name)),
+        'content-length': String(data.length),
+        'content-disposition': "inline; filename*=UTF-8''" + encodeURIComponent(name),
+        'x-content-type-options': 'nosniff',
+      }),
+    )
+    res.end(data)
+  }
+
+  /** fs.readBytes 自带大小约束；与文本读取使用同一个 resolve/cwd 规则。 */
+  function doReadBinaryFile(rawPath, sessionId) {
+    const fsSvc = ctx.get('fs')
+    if (fsSvc === undefined || typeof fsSvc.resolve !== 'function' || typeof fsSvc.readBytes !== 'function') {
+      return Promise.reject(previewFailure('fs.readBytes unavailable', 503))
+    }
+    const raw = typeof rawPath === 'string' ? rawPath.trim() : ''
+    if (!raw) return Promise.reject(previewFailure('path required', 400))
+
+    const use = function (cwd) {
+      let abs = safeAbsPath(raw)
+      if (abs === null) {
+        if (!cwd) return Promise.reject(previewFailure('相对路径需要会话上下文，或请给出绝对路径', 400))
+        abs = safeAbsPath(cwd.replace(/\/+$/, '') + '/' + raw.replace(/^\.\//, ''))
+      }
+      if (abs === null) return Promise.reject(previewFailure('路径不合法', 400))
+      return fsSvc.resolve(abs, { signal: makeSignal() }).then(function (target) {
+        return fsSvc.stat(target, makeSignal()).then(function (info) {
+          if (!info) throw previewFailure('文件不存在：' + abs, 404)
+          if (info.type !== 'file') throw previewFailure('不是一个普通文件：' + abs, 400)
+          return fsSvc.readBytes(target, makeSignal(), PREVIEW_MAX_BYTES).then(function (data) {
+            return {
+              data: data,
+              path: abs,
+              name: pathLeaf(abs) || 'file.bin',
+              mediaType: mimeForName(abs),
+              bytes: data.length,
+            }
+          })
+        })
+      })
+    }
+    if (safeAbsPath(raw) !== null) return use('')
+    return sessionCwd(sessionId).then(use)
+  }
+
+  function concatBinaryChunks(chunks, total) {
+    const out = new Uint8Array(total)
+    let offset = 0
+    for (let i = 0; i < chunks.length; i += 1) {
+      out.set(chunks[i], offset)
+      offset += chunks[i].length
+    }
+    return out
+  }
+
+  /** 附件库文件按块读，但在交给手机前仍执行同一个 32 MB 总上限。 */
+  function collectAttachmentStream(stream, ref) {
+    return new Promise(function (resolve, reject) {
+      const iterator = stream && stream[Symbol.asyncIterator] ? stream[Symbol.asyncIterator]() : null
+      if (!iterator) {
+        reject(previewFailure('附件库没有返回可读字节流', 503))
+        return
+      }
+      const chunks = []
+      let total = 0
+      function step() {
+        iterator.next().then(
+          function (r) {
+            if (r.done) {
+              resolve({
+                data: concatBinaryChunks(chunks, total),
+                name: ref.name,
+                mediaType: mimeForName(ref.name),
+                bytes: total,
+              })
+              return
+            }
+            const chunk = r.value instanceof Uint8Array ? r.value : new Uint8Array(r.value)
+            total += chunk.length
+            if (total > PREVIEW_MAX_BYTES) {
+              if (typeof iterator.return === 'function') iterator.return()
+              reject(previewFailure('文件太大，手机预览上限 32 MB', 413))
+              return
+            }
+            chunks.push(chunk)
+            step()
+          },
+          function (err) {
+            reject(err)
+          },
+        )
+      }
+      step()
+    })
+  }
+
+  /** 按 durable ref 读附件；元数据来自历史里原始 attachment，不接受裸路径代替。 */
+  function doReadAttachment(query) {
+    const store = ctx.get('attachments')
+    if (!store) return Promise.reject(previewFailure('attachments service unavailable', 503))
+    const kind = String(query.kind || '')
+    const attachmentId = String(query.attachmentId || '')
+    if (!attachmentId || (kind !== 'image' && kind !== 'file')) {
+      return Promise.reject(previewFailure('kind 与 attachmentId 必填', 400))
+    }
+    const bytes = Number(query.bytes || 0)
+    if (!isFinite(bytes) || bytes < 0) return Promise.reject(previewFailure('bytes 不合法', 400))
+    if (bytes > PREVIEW_MAX_BYTES) return Promise.reject(previewFailure('文件太大，手机预览上限 32 MB', 413))
+
+    if (kind === 'image') {
+      if (typeof store.readImage !== 'function') return Promise.reject(previewFailure('attachments.readImage unavailable', 503))
+      const mediaType = String(query.mediaType || '')
+      const width = Number(query.width || 0)
+      const height = Number(query.height || 0)
+      if (mediaType.indexOf('image/') !== 0 || width <= 0 || height <= 0) {
+        return Promise.reject(previewFailure('图片附件元数据不完整', 400))
+      }
+      const ref = {
+        attachmentId: attachmentId,
+        mediaType: mediaType,
+        bytes: bytes,
+        width: width,
+        height: height,
+      }
+      if (query.name) ref.name = String(query.name)
+      return Promise.resolve()
+        .then(function () {
+          return store.readImage(ref, makeSignal())
+        })
+        .then(function (stored) {
+          if (!stored || !(stored.data instanceof Uint8Array)) throw previewFailure('图片附件没有可读字节', 404)
+          if (stored.data.length > PREVIEW_MAX_BYTES) throw previewFailure('图片太大，手机预览上限 32 MB', 413)
+          return {
+            data: stored.data,
+            name: String(query.name || 'image'),
+            mediaType: mediaType,
+            bytes: stored.data.length,
+          }
+        })
+    }
+
+    if (typeof store.readFileStream !== 'function') {
+      return Promise.reject(previewFailure('attachments.readFileStream unavailable', 503))
+    }
+    const ref = {
+      attachmentId: attachmentId,
+      name: String(query.name || 'attachment.bin'),
+      bytes: bytes,
+    }
+    return Promise.resolve()
+      .then(function () {
+        return store.readFileStream(ref, makeSignal())
+      })
+      .then(function (stream) {
+        return collectAttachmentStream(stream, ref)
+      })
   }
 
   /* ------------------------------ 模型 ------------------------------ */
@@ -3591,6 +3882,40 @@ export function createBridge(ctx, opts) {
     if (seg.length === 3 && seg[0] === 'term' && seg[2] === 'close') {
       termClose(seg[1], 'phone request')
       sendJson(res, 200, { ok: true })
+      return
+    }
+
+    // GET /phone/file/raw?path=<p>&sessionId=<id>
+    // present 交付的图片 / PDF 等二进制文件；与文本接口共用 cwd 解析和令牌鉴权。
+    if (seg.length === 2 && seg[0] === 'file' && seg[1] === 'raw') {
+      doReadBinaryFile(query.path, query.sessionId).then(
+        function (value) {
+          sendBytes(res, value)
+        },
+        function (err) {
+          sendJson(res, err && err.httpStatus ? err.httpStatus : 404, {
+            ok: false,
+            error: String((err && err.message) || err),
+          })
+        },
+      )
+      return
+    }
+
+    // GET /phone/attachment?kind=image|file&attachmentId=<id>&...
+    // 会话内容块里的 durable attachment。只传元数据，字节按需从这里取。
+    if (seg.length === 1 && seg[0] === 'attachment') {
+      doReadAttachment(query).then(
+        function (value) {
+          sendBytes(res, value)
+        },
+        function (err) {
+          sendJson(res, err && err.httpStatus ? err.httpStatus : 400, {
+            ok: false,
+            error: String((err && err.message) || err),
+          })
+        },
+      )
       return
     }
 

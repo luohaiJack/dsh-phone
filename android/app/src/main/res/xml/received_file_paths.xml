@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 只共享收到的附件缓存，不把整个 App 私有目录暴露给其他应用。 -->
+<paths>
+    <cache-path
+        name="received_attachments"
+        path="received-attachments/" />
+</paths>

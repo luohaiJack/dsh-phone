@@ -13,6 +13,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.Call
 import org.json.JSONObject
 
@@ -1157,19 +1159,127 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         settings.setDraft(_openSessionId.value, _draft.value)
     }
 
+    /** 同一附件可能被缩略图和大图同时请求：按会话 + id 合并成一次下载。 */
+    private val attachmentLocks = HashMap<String, Mutex>()
+
+    private fun attachmentMutex(key: String): Mutex = synchronized(attachmentLocks) {
+        attachmentLocks.getOrPut(key) { Mutex() }
+    }
+
+    /**
+     * 把附件落到私有缓存并返回本地文件。目录用 sha256，不用会话 id / 附件名，
+     * 所以不会出现路径穿越；文件名只保留一个安全的叶子名供外部 App 识别扩展名。
+     */
+    private suspend fun cacheAttachment(a: MessageAttachment, sessionId: String): File {
+        val key = sessionId + "\n" + a.stableId
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(key.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+            .take(32)
+        val dir = File(getApplication<Application>().cacheDir, "received-attachments/$digest")
+        val target = File(dir, safeAttachmentLeafName(a.name))
+        return attachmentMutex(key).withLock {
+            if (target.isFile && target.length() > 0L && (a.bytes <= 0L || target.length() == a.bytes)) {
+                return@withLock target
+            }
+            val downloaded = withClientRetry { client ->
+                val path = a.path
+                if (!path.isNullOrBlank()) client.fileBytes(path, sessionId)
+                else client.attachmentBytes(a, sessionId)
+            }
+            dir.mkdirs()
+            val tmp = File(dir, target.name + ".part-" + System.nanoTime())
+            try {
+                tmp.outputStream().use { it.write(downloaded.data) }
+                if (!tmp.renameTo(target)) {
+                    tmp.copyTo(target, overwrite = true)
+                    tmp.delete()
+                }
+            } finally {
+                if (tmp.exists()) tmp.delete()
+            }
+            target
+        }
+    }
+
+    /** 给内联缩略图用：返回私有缓存路径，UI 只按显示尺寸解码，不持有完整原图。 */
+    suspend fun loadAttachmentPreview(a: MessageAttachment): String = withContext(Dispatchers.IO) {
+        cacheAttachment(a, _openSessionId.value).absolutePath
+    }
+
+    private fun readTextPrefix(file: File): Pair<String, Boolean> {
+        val cap = 512 * 1024
+        val bytes = ByteArray(cap)
+        val n = file.inputStream().use { input ->
+            var offset = 0
+            while (offset < bytes.size) {
+                val read = input.read(bytes, offset, bytes.size - offset)
+                if (read < 0) break
+                offset += read
+            }
+            offset
+        }
+        val truncated = file.length() > cap
+        var text = String(bytes, 0, n, Charsets.UTF_8)
+        // 截断点可能刚好落在一个 UTF-8 汉字中间；解码器会在末尾放 U+FFFD。
+        if (truncated) text = text.trimEnd('\uFFFD')
+        return text to truncated
+    }
+
+    /** 打开消息里的图片 / 文件：统一下载到私有缓存，再按类型预览或外部打开。 */
+    fun openAttachment(a: MessageAttachment) {
+        val sid = _openSessionId.value
+        _doc.value = DocState(path = a.path ?: a.name, loading = true, attachment = a)
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val file = cacheAttachment(a, sid)
+                val content = if (!a.isImage && a.isText) readTextPrefix(file) else null
+                file to content
+            }.onSuccess { (file, content) ->
+                // 用户等待期间可能已经点了另一份附件，旧请求不能覆盖新页面。
+                if (_doc.value?.attachment?.stableId != a.stableId) return@onSuccess
+                _doc.value = DocState(
+                    path = a.path ?: a.name,
+                    content = content?.first,
+                    truncated = content?.second == true,
+                    attachment = a,
+                    localPath = file.absolutePath,
+                    mediaType = a.mediaType,
+                )
+            }.onFailure { e ->
+                if (_doc.value?.attachment?.stableId != a.stableId) return@onFailure
+                recordError("预览附件失败：${e.message}")
+                _doc.value = DocState(path = a.path ?: a.name, error = e.message, attachment = a)
+            }
+        }
+    }
+
     /**
      * 打开一个文档：从电脑读回来，交给文档页渲染。
      *
      * 相对路径由桥接按**当前会话的 cwd** 解析 —— 正文里点的通常是
-     * docs/xxx.md 这种相对写法。
+     * docs/xxx.md 这种相对写法。图片与非文本文件走附件缓存路径。
      */
     fun openDocument(path: String) {
         if (path.isBlank()) return
+        val name = path.substringAfterLast('/').ifBlank { path }
+        if (isImageFileName(name) || !isTextFileName(name)) {
+            openAttachment(
+                MessageAttachment(
+                    kind = if (isImageFileName(name)) "image" else "file",
+                    name = name,
+                    path = path,
+                    sourceSeq = (System.currentTimeMillis() and Int.MAX_VALUE.toLong()).toInt(),
+                )
+            )
+            return
+        }
         _doc.value = DocState(path = path, loading = true)
         val sid = _openSessionId.value
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { resolveClient().fileText(path, sid) }
+            runCatching { withClientRetry { c -> c.fileText(path, sid) } }
                 .onSuccess { f ->
+                    if (_doc.value?.path != path) return@onSuccess
                     _doc.value = DocState(
                         path = f.path.ifBlank { path },
                         content = f.text,
@@ -1177,6 +1287,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
                 .onFailure { e ->
+                    if (_doc.value?.path != path) return@onFailure
                     _doc.value = DocState(path = path, error = e.message)
                 }
         }
